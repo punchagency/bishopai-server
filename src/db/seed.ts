@@ -1,0 +1,213 @@
+// Demo seed — populates the whole cockpit offline, with NO external creds.
+// Uses the mock LLM (unless a real provider key is configured) so
+// ingest → extract → render works without an API key.
+// Idempotent: clears prior 'Seed …' rows first, so re-running is safe.
+//
+//   npm run seed
+import 'dotenv/config';
+import { pool } from './pool';
+import { llmConfig } from '../llm/config';
+import { ingestConversation } from '../conversations/ingest';
+import { processConversation } from '../session/process';
+import { projectRefills } from '../refills/project';
+import { detectCheckout, approveAndCharge } from '../checkout/machine';
+
+// LLM provider auto-resolves to `mock` when no key is configured (see
+// llm/config.ts), so seeding needs no credentials.
+
+const DAY = 86_400_000;
+const iso = (msFromNow: number) => new Date(Date.now() + msFromNow).toISOString();
+const dateOnly = (msFromNow: number) => new Date(Date.now() + msFromNow).toISOString().slice(0, 10);
+
+interface SeedClient {
+  name: string;
+  transcript: string;
+  // appointment offset (ms from now); negative = past (gets a note), positive = upcoming.
+  appointmentOffset: number;
+  supplements: { name: string; dose: string; qty: number | null; startOffset: number }[];
+}
+
+const CLIENTS: SeedClient[] = [
+  {
+    name: 'Seed Maya Chen',
+    appointmentOffset: -2 * DAY,
+    transcript:
+      "Maya's been having trouble sleeping and low energy for weeks. We talked through her stress at work. " +
+      "Let's start magnesium glycinate at night and add a B-complex in the morning. Recheck in 4 weeks.",
+    supplements: [
+      { name: 'Magnesium glycinate', dose: '2 caps nightly', qty: 60, startOffset: -25 * DAY },
+      { name: 'B-complex', dose: '1 cap daily', qty: 30, startOffset: -25 * DAY },
+    ],
+  },
+  {
+    name: 'Seed David Osei',
+    appointmentOffset: -5 * DAY,
+    transcript:
+      "David reports bloating and digestive discomfort after meals, plus some joint aches. " +
+      "We'll continue his omega-3 and introduce a probiotic. Follow-up in 6 weeks.",
+    supplements: [
+      { name: 'Omega-3', dose: '2 softgels daily', qty: 60, startOffset: -50 * DAY },
+      { name: 'Probiotic', dose: '1 cap daily', qty: 30, startOffset: -10 * DAY },
+    ],
+  },
+  {
+    name: 'Seed Lena Petrov',
+    appointmentOffset: -1 * DAY,
+    transcript:
+      "Lena's main concern is anxiety and feeling overwhelmed. Sleep is also disrupted. " +
+      "Let's begin ashwagandha twice daily and keep the vitamin D going. Recheck in 8 weeks.",
+    supplements: [
+      { name: 'Ashwagandha', dose: '1 cap twice daily', qty: 60, startOffset: -3 * DAY },
+      { name: 'Vitamin D3', dose: '1 softgel daily', qty: 90, startOffset: -3 * DAY },
+    ],
+  },
+  {
+    name: 'Seed Priya Nair',
+    appointmentOffset: 3 * DAY, // upcoming — shows in Overview, no note yet
+    transcript: '',
+    supplements: [{ name: 'Zinc', dose: '1 cap daily', qty: 30, startOffset: -28 * DAY }],
+  },
+];
+
+async function clearSeed(): Promise<void> {
+  // FKs cascade from clients → appointments/supplements/refills/protocols/etc.
+  await pool.query(
+    `DELETE FROM refill_orders WHERE client_id IN (SELECT id FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %')`,
+  );
+  await pool.query(`DELETE FROM conversations WHERE bee_id LIKE 'seed-%'`);
+  await pool.query(`DELETE FROM checkout WHERE pb_appointment_id LIKE 'seed-appt-%'`);
+  await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'seed-appt-%'`);
+  await pool.query(`DELETE FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %'`);
+  await pool.query(`DELETE FROM leads WHERE source = 'seed'`); // cascades lead_activity + messages
+}
+
+async function main(): Promise<void> {
+  console.log(`Seeding demo data (LLM provider: ${llmConfig.provider})…`);
+  await clearSeed();
+
+  let matched = 0;
+  for (const c of CLIENTS) {
+    const clientId = (await pool.query<{ id: string }>(`INSERT INTO clients (name) VALUES ($1) RETURNING id`, [c.name]))
+      .rows[0].id;
+
+    // Appointment (1h window).
+    const apptStart = c.appointmentOffset;
+    const apptEnd = apptStart + 60 * 60 * 1000;
+    // pb_id tagged 'seed-…' so clearSeed can remove appointments across re-runs
+    // (they don't cascade from clients — client_id is ON DELETE SET NULL).
+    await pool.query(
+      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status) VALUES ($1,$2,$3,$4,$5)`,
+      [clientId, `seed-appt-${clientId}`, iso(apptStart), iso(apptEnd), apptStart < 0 ? 'completed' : 'confirmed'],
+    );
+
+    // Supplements (drive refill projection).
+    for (const s of c.supplements) {
+      await pool.query(
+        `INSERT INTO supplements (client_id, name, dose, qty, start_date, source) VALUES ($1,$2,$3,$4,$5,'notes')`,
+        [clientId, s.name, s.dose, s.qty, dateOnly(s.startOffset)],
+      );
+    }
+
+    // Past appointments get a Bee conversation overlapping the window → matched
+    // → extraction (mock) → draft sheet + protocol land in the review queue.
+    if (apptStart < 0 && c.transcript) {
+      const { conversationId, correlation } = await ingestConversation({
+        bee_id: `seed-${clientId}`,
+        starts_at: iso(apptStart + 5 * 60 * 1000),
+        ends_at: iso(apptEnd - 5 * 60 * 1000),
+        transcript: c.transcript,
+      });
+      if (correlation.status === 'matched') {
+        matched++;
+        await processConversation(conversationId);
+      }
+    }
+  }
+
+  // --- WF3 leads + site activity (Engagement view) --------------------------
+  interface SeedLead {
+    email: string;
+    status: string;
+    ageDays: number;
+    sent: string[];
+    activity: { type: string; path?: string; detail?: string; agoHours: number }[];
+  }
+  const LEADS: SeedLead[] = [
+    { email: 'sarah.m@example.com', status: 'new', ageDays: 1, sent: [],
+      activity: [ { type: 'page_view', path: '/services', agoHours: 2 }, { type: 'form_open', path: '/book-a-consult', agoHours: 1 } ] },
+    { email: 'james.t@example.com', status: 'contacted', ageDays: 5, sent: ['welcome'],
+      activity: [ { type: 'page_view', path: '/about', agoHours: 30 }, { type: 'email_open', detail: 'welcome', agoHours: 20 } ] },
+    { email: 'nadia.k@example.com', status: 'cancelled', ageDays: 9, sent: [],
+      activity: [ { type: 'booked', detail: 'cancelled by client', agoHours: 200 } ] },
+    { email: 'tom.b@example.com', status: 'booked', ageDays: 3, sent: ['welcome'],
+      activity: [ { type: 'form_submit', path: '/book-a-consult', agoHours: 70 } ] },
+    { email: 'cold.lead@example.com', status: 'nurturing', ageDays: 200, sent: ['welcome', 'nudge_3d', 'nudge_7d', 'final_14d'],
+      activity: [ { type: 'page_view', path: '/', agoHours: 24 * 160 } ] },
+  ];
+  for (const l of LEADS) {
+    const leadId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO leads (source, email, status, sequence_state, last_touch, created_at)
+              VALUES ('seed', $1, $2, $3, $4, $5) RETURNING id`,
+        [
+          l.email,
+          l.status,
+          JSON.stringify({ sent: l.sent }),
+          // last_touch trails the lead's age so a long-cold lead can deactivate.
+          l.sent.length ? iso(-Math.max(1, l.ageDays - 2) * DAY) : null,
+          iso(-l.ageDays * DAY),
+        ],
+      )
+    ).rows[0].id;
+    for (const a of l.activity) {
+      await pool.query(
+        `INSERT INTO lead_activity (lead_id, type, path, detail, occurred_at) VALUES ($1,$2,$3,$4,$5)`,
+        [leadId, a.type, a.path ?? null, a.detail ?? null, iso(-a.agoHours * 3600 * 1000)],
+      );
+    }
+  }
+
+  // --- WF2 checkouts (Checkout view) ----------------------------------------
+  // Detect a checkout for each completed (past) appointment; take one all the
+  // way through the dry-run charge so the view shows both an awaiting-approval
+  // and a closed example.
+  const pastAppts = await pool.query<{ id: string }>(
+    `SELECT a.id FROM appointments a JOIN clients c ON c.id = a.client_id
+      WHERE c.name LIKE 'Seed %' AND a.starts_at < now() ORDER BY a.starts_at`,
+  );
+  let firstCheckoutId: string | null = null;
+  for (const { id } of pastAppts.rows) {
+    const d = await detectCheckout(id);
+    if (d && !firstCheckoutId) firstCheckoutId = d.checkoutId;
+  }
+  // Push the first one through approve → charge (dry-run) → PB_MARKED.
+  if (firstCheckoutId) await approveAndCharge(firstCheckoutId, 'nicole');
+
+  // One unmatched conversation (no overlapping appointment) → Unmatched view.
+  await ingestConversation({
+    bee_id: 'seed-unmatched-1',
+    starts_at: iso(-9 * DAY),
+    ends_at: iso(-9 * DAY + 40 * 60 * 1000),
+    transcript: 'Walk-in style chat about general wellness — no booking on the calendar for this one.',
+  });
+
+  const projection = await projectRefills();
+
+  const counts = await pool.query(`
+    SELECT
+      (SELECT count(*) FROM clients            WHERE name LIKE 'Seed %')            AS clients,
+      (SELECT count(*) FROM appointment_sheets WHERE status IN ('draft','in_review')) AS sheets,
+      (SELECT count(*) FROM protocols          WHERE status IN ('draft','in_review')) AS protocols,
+      (SELECT count(*) FROM refills            WHERE due_date IS NOT NULL)          AS refills,
+      (SELECT count(*) FROM conversations      WHERE appointment_id IS NULL)        AS unmatched,
+      (SELECT count(*) FROM leads              WHERE source = 'seed')               AS leads,
+      (SELECT count(*) FROM checkout           WHERE pb_appointment_id LIKE 'seed-appt-%') AS checkouts
+  `);
+  console.log('Seed complete:', { matched, projection, ...counts.rows[0] });
+  await pool.end();
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
