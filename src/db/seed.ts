@@ -11,6 +11,8 @@ import { ingestConversation } from '../conversations/ingest';
 import { processConversation } from '../session/process';
 import { projectRefills } from '../refills/project';
 import { detectCheckout, approveAndCharge } from '../checkout/machine';
+import { enrollMaintenanceClients } from '../reengagement/maintenance';
+import { enrollFirstAppointmentClients } from '../reengagement/firstAppointment';
 
 // LLM provider auto-resolves to `mock` when no key is configured (see
 // llm/config.ts), so seeding needs no credentials.
@@ -21,6 +23,7 @@ const dateOnly = (msFromNow: number) => new Date(Date.now() + msFromNow).toISOSt
 
 interface SeedClient {
   name: string;
+  email: string; // so a cancellation can re-engage them (WF3 cancelled cadence)
   transcript: string;
   // appointment offset (ms from now); negative = past (gets a note), positive = upcoming.
   appointmentOffset: number;
@@ -30,6 +33,7 @@ interface SeedClient {
 const CLIENTS: SeedClient[] = [
   {
     name: 'Seed Maya Chen',
+    email: 'maya.chen@example.com',
     appointmentOffset: -2 * DAY,
     transcript:
       "Maya's been having trouble sleeping and low energy for weeks. We talked through her stress at work. " +
@@ -41,6 +45,7 @@ const CLIENTS: SeedClient[] = [
   },
   {
     name: 'Seed David Osei',
+    email: 'david.osei@example.com',
     appointmentOffset: -5 * DAY,
     transcript:
       "David reports bloating and digestive discomfort after meals, plus some joint aches. " +
@@ -52,6 +57,7 @@ const CLIENTS: SeedClient[] = [
   },
   {
     name: 'Seed Lena Petrov',
+    email: 'lena.petrov@example.com',
     appointmentOffset: -1 * DAY,
     transcript:
       "Lena's main concern is anxiety and feeling overwhelmed. Sleep is also disrupted. " +
@@ -63,9 +69,24 @@ const CLIENTS: SeedClient[] = [
   },
   {
     name: 'Seed Priya Nair',
+    email: 'priya.nair@example.com',
     appointmentOffset: 3 * DAY, // upcoming — shows in Overview, no note yet
     transcript: '',
     supplements: [{ name: 'Zinc', dose: '1 cap daily', qty: 30, startOffset: -28 * DAY }],
+  },
+  {
+    name: 'Seed Quiet Client',
+    email: 'quiet.client@example.com',
+    appointmentOffset: -120 * DAY, // maintenance-phase: no visit in months, no rebooking
+    transcript: '',
+    supplements: [{ name: 'Multivitamin', dose: '1 cap daily', qty: 30, startOffset: -120 * DAY }],
+  },
+  {
+    name: 'Seed One Visit',
+    email: 'one.visit@example.com',
+    appointmentOffset: -30 * DAY, // came once a month ago, never rebooked → first-appointment track
+    transcript: '',
+    supplements: [],
   },
 ];
 
@@ -78,7 +99,11 @@ async function clearSeed(): Promise<void> {
   await pool.query(`DELETE FROM checkout WHERE pb_appointment_id LIKE 'seed-appt-%'`);
   await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'seed-appt-%'`);
   await pool.query(`DELETE FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %'`);
-  await pool.query(`DELETE FROM leads WHERE source = 'seed'`); // cascades lead_activity + messages
+  // Seed leads, plus any re-engagement leads (maintenance / cancellation) that a
+  // prior seed run generated for a seed client email. Cascades lead_activity + messages.
+  await pool.query(`DELETE FROM leads WHERE source = 'seed' OR email = ANY($1)`, [
+    CLIENTS.map((c) => c.email),
+  ]);
 }
 
 async function main(): Promise<void> {
@@ -87,8 +112,9 @@ async function main(): Promise<void> {
 
   let matched = 0;
   for (const c of CLIENTS) {
-    const clientId = (await pool.query<{ id: string }>(`INSERT INTO clients (name) VALUES ($1) RETURNING id`, [c.name]))
-      .rows[0].id;
+    const clientId = (
+      await pool.query<{ id: string }>(`INSERT INTO clients (name, email) VALUES ($1, $2) RETURNING id`, [c.name, c.email])
+    ).rows[0].id;
 
     // Appointment (1h window).
     const apptStart = c.appointmentOffset;
@@ -122,6 +148,18 @@ async function main(): Promise<void> {
         await processConversation(conversationId);
       }
     }
+  }
+
+  // Give the quiet client a second, older completed session so it reads as an
+  // established maintenance-phase client (2+ sessions) rather than a one-visit
+  // first-appointment case.
+  const quiet = await pool.query<{ id: string }>(`SELECT id FROM clients WHERE name = 'Seed Quiet Client'`);
+  if (quiet.rowCount) {
+    await pool.query(
+      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
+            VALUES ($1, 'seed-appt-quiet-2', now() - interval '200 days', now() - interval '200 days' + interval '1 hour', 'completed')`,
+      [quiet.rows[0].id],
+    );
   }
 
   // --- WF3 leads + site activity (Engagement view) --------------------------
@@ -192,6 +230,10 @@ async function main(): Promise<void> {
   });
 
   const projection = await projectRefills();
+  // WF3 reactivation passes: first-appointment (one-visit clients) + maintenance
+  // (established clients gone quiet). Disjoint by session count.
+  const firstAppointment = await enrollFirstAppointmentClients();
+  const maintenance = await enrollMaintenanceClients();
 
   const counts = await pool.query(`
     SELECT
@@ -203,7 +245,7 @@ async function main(): Promise<void> {
       (SELECT count(*) FROM leads              WHERE source = 'seed')               AS leads,
       (SELECT count(*) FROM checkout           WHERE pb_appointment_id LIKE 'seed-appt-%') AS checkouts
   `);
-  console.log('Seed complete:', { matched, projection, ...counts.rows[0] });
+  console.log('Seed complete:', { matched, projection, firstAppointment, maintenance, ...counts.rows[0] });
   await pool.end();
 }
 

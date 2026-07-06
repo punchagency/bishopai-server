@@ -21,6 +21,64 @@ export interface EmailResult {
   error?: string;
 }
 
+// A normalized inbound message from the mailbox, for the WF3 inbox poller.
+export interface InboundMessage {
+  id: string;
+  from: string; // sender email address
+  subject: string;
+  receivedDateTime: string; // ISO 8601
+  preview?: string;
+  headers?: { name: string; value: string }[]; // selected internet message headers (for spam/loop guards)
+}
+
+interface GraphMessage {
+  id?: string;
+  subject?: string;
+  bodyPreview?: string;
+  receivedDateTime?: string;
+  from?: { emailAddress?: { address?: string } };
+  internetMessageHeaders?: { name?: string; value?: string }[];
+}
+
+/**
+ * Read inbox messages received after `sinceIso` (exclusive), oldest first, via
+ * Microsoft Graph. Returns [] when Outlook isn't configured — the poller treats
+ * that as a no-op, mirroring the dry-run send path. `sinceIso` null pulls the
+ * most recent page (first run / no cursor yet).
+ */
+export async function fetchInboxMessages(sinceIso: string | null): Promise<InboundMessage[]> {
+  if (!isOutlookConfigured()) return [];
+  const { token, sender, baseUrl } = outlookConfig();
+  const params = new URLSearchParams({
+    $select: 'id,subject,from,receivedDateTime,bodyPreview,internetMessageHeaders',
+    $orderby: 'receivedDateTime asc',
+    $top: '50',
+  });
+  if (sinceIso) params.set('$filter', `receivedDateTime gt ${sinceIso}`);
+  const url = `${baseUrl}/users/${encodeURIComponent(sender)}/mailFolders/inbox/messages?${params.toString()}`;
+
+  const res = await fetchJson<{ value?: GraphMessage[] }>(url, {
+    headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
+  });
+  return (res.value ?? [])
+    .map((m): InboundMessage | null => {
+      const from = m.from?.emailAddress?.address?.trim();
+      if (!m.id || !from || !m.receivedDateTime) return null;
+      const headers = (m.internetMessageHeaders ?? [])
+        .filter((h): h is { name: string; value: string } => !!h.name && h.value != null)
+        .map((h) => ({ name: h.name, value: h.value }));
+      return {
+        id: m.id,
+        from,
+        subject: m.subject ?? '',
+        receivedDateTime: m.receivedDateTime,
+        preview: m.bodyPreview,
+        headers,
+      };
+    })
+    .filter((m): m is InboundMessage => m !== null);
+}
+
 export async function sendEmail(input: EmailInput): Promise<EmailResult> {
   if (!isOutlookConfigured()) {
     logEvent('info', 'outlook.send', '[dry-run] would send email', { to: input.to, subject: input.subject });

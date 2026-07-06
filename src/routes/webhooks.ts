@@ -7,6 +7,9 @@ import { logError, logEvent } from '../observability/logger';
 import { requireWebhookSecret, requirePbSignature } from './webhookAuth';
 import { classifyPbEvent, appointmentStatusFor } from '../integrations/pb/events';
 import { detectCheckout } from '../checkout/machine';
+import { ingestLead } from '../reengagement/intake';
+import { runReengagementForLead } from '../reengagement/runner';
+import { enrollCancelledAppointment } from '../reengagement/cancellations';
 
 export const webhooksRouter = Router();
 
@@ -18,6 +21,7 @@ const bookingSchema = z.object({
   pb_appointment_id: z.string().min(1),
   pb_client_id: z.string().min(1),
   client_name: z.string().min(1),
+  client_email: z.string().email().optional(), // stored so a cancellation can re-engage them
   starts_at: z.string().datetime(),
   ends_at: z.string().datetime(),
   status: z.string().default('confirmed'),
@@ -34,11 +38,13 @@ webhooksRouter.post('/pb/booking', requireWebhookSecret('PB_WEBHOOK_SECRET'), as
     await db.query('BEGIN');
 
     const clientRes = await db.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id)
-            VALUES ($1, $2)
-       ON CONFLICT (pb_id) DO UPDATE SET name = EXCLUDED.name
+      `INSERT INTO clients (name, pb_id, email)
+            VALUES ($1, $2, $3)
+       ON CONFLICT (pb_id) DO UPDATE
+            SET name  = EXCLUDED.name,
+                email = COALESCE(EXCLUDED.email, clients.email)
          RETURNING id`,
-      [b.client_name, b.pb_client_id],
+      [b.client_name, b.pb_client_id, b.client_email ?? null],
     );
     const clientId = clientRes.rows[0].id;
 
@@ -73,8 +79,8 @@ webhooksRouter.post('/pb/booking', requireWebhookSecret('PB_WEBHOOK_SECRET'), as
 // PB-Signature. Exact event-type names are confirmed once we have beta access
 // (GET /webhooks/subscription/event/types); `classifyPbEvent` maps tolerantly
 // until then. On a completed/cancelled event we reflect the status onto the
-// matching appointment (by pb_id). TODO: session-complete also drives WF2
-// checkout (blocked on QB Payments); cancelled feeds the WF3 cancelled cadence.
+// matching appointment (by pb_id). Session-complete drives WF2 checkout;
+// cancelled enrolls the client into the WF3 cancelled cadence (both off-path).
 // ---------------------------------------------------------------------------
 webhooksRouter.post('/pb/session', requirePbSignature('PB_SIGNING_SECRET'), async (req, res) => {
   const ev = classifyPbEvent(req.body);
@@ -97,6 +103,14 @@ webhooksRouter.post('/pb/session', requirePbSignature('PB_SIGNING_SECRET'), asyn
           const apptId = r.rows[0].id;
           void detectCheckout(apptId).catch((e) =>
             logError('checkout.detect', 'auto-detect failed', e, { appointment_id: apptId }),
+          );
+        }
+        // Cancelled → enroll the client in the WF3 cancelled cadence (7d/14d),
+        // off the request path. No-op when we have no email on file for them.
+        if (ev.kind === 'session_cancelled' && ev.objectId) {
+          const pbId = ev.objectId;
+          void enrollCancelledAppointment(pbId).catch((e) =>
+            logError('reengagement.cancelled', 'enroll failed', e, { pb_appointment_id: pbId }),
           );
         }
       }
@@ -138,6 +152,47 @@ webhooksRouter.post('/bee/conversation', requireWebhookSecret('BEE_WEBHOOK_SECRE
     res.status(200).json({ conversation_id: conversationId, correlation });
   } catch (err) {
     await logError('webhook.bee_conversation', 'ingest failed', err, { bee_id: parsed.data.bee_id });
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Lead intake (WF3) — a new inquiry from the website contact/booking form, or
+// an Outlook inbox message forwarded here. Lands a `leads` row (idempotent by
+// email) and fires the automated first response off the request path, so a new
+// lead is greeted "within minutes" rather than on the next hourly cadence tick.
+// Nicole is never the first touchpoint. Shared-secret guarded like the others.
+// ---------------------------------------------------------------------------
+const leadSchema = z.object({
+  email: z.string().email(),
+  name: z.string().optional(),
+  source: z.string().optional(), // 'website' | 'outlook' | ...
+  path: z.string().optional(), // e.g. '/book-a-consult'
+  message: z.string().optional(),
+});
+
+webhooksRouter.post('/lead', requireWebhookSecret('LEAD_WEBHOOK_SECRET'), async (req, res) => {
+  const parsed = leadSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
+  }
+  const d = parsed.data;
+  try {
+    const { leadId, created } = await ingestLead({
+      email: d.email,
+      name: d.name ?? null,
+      source: d.source ?? 'website',
+      path: d.path ?? null,
+      detail: d.message ?? null,
+      activityType: d.source === 'outlook' ? 'inquiry' : 'form_submit',
+    });
+    // Automated first response, off the request path so intake returns fast.
+    void runReengagementForLead(leadId).catch((err) =>
+      logError('lead.intake', 'first response failed', err, { lead_id: leadId }),
+    );
+    res.status(200).json({ lead_id: leadId, created });
+  } catch (err) {
+    await logError('webhook.lead', 'lead intake failed', err, { email: d.email });
     res.status(500).json({ error: 'internal error' });
   }
 });

@@ -70,9 +70,52 @@ const CANCELLED_STEPS: CadenceStep[] = [
   },
 ];
 
+// Maintenance track: an established client who's gone quiet (identified by
+// session-gap). Mirrors the cancelled cadence's 7/14-day timing, with copy that
+// nudges a maintenance booking rather than a reschedule.
+const MAINTENANCE_STEPS: CadenceStep[] = [
+  {
+    step: 'maintenance_7d',
+    afterDays: 7,
+    subject: 'Time for a check-in?',
+    body: "It's been a while since your last visit — a maintenance session can help keep your progress on track. Want to book one?",
+  },
+  {
+    step: 'maintenance_14d',
+    afterDays: 14,
+    subject: 'Still here when you’re ready',
+    body: 'No pressure at all — whenever you’d like a tune-up, just reply and we’ll find a time that works.',
+  },
+];
+
+// First-appointment track: a client who came once and hasn't rebooked. Mirrors
+// the cancelled cadence's 7/14-day timing; the 14-day step carries an incentive
+// to encourage them to return or commit to a plan.
+const FIRST_APPOINTMENT_STEPS: CadenceStep[] = [
+  {
+    step: 'first_appt_7d',
+    afterDays: 7,
+    subject: 'How are you feeling after your first session?',
+    body: "It was great meeting you! Booking your follow-up is the best way to build on what we started — want to find a time?",
+  },
+  {
+    step: 'first_appt_14d',
+    afterDays: 14,
+    subject: 'A little something to get you started',
+    body: "To help you commit to your plan, here's 15% off your next visit if you book this month. Just reply and we'll set it up.",
+  },
+];
+
+// Statuses that pin a lead to a fixed re-engagement track (not the inquiry
+// new→contacted→nurturing progression). Exported so the runner keeps them.
+export const FIXED_TRACK_STATUSES = new Set(['cancelled', 'maintenance', 'first_appointment']);
+
 /** The step sequence a lead is on, by status. */
 export function trackFor(status: string): CadenceStep[] {
-  return status === 'cancelled' ? CANCELLED_STEPS : INQUIRY_STEPS;
+  if (status === 'cancelled') return CANCELLED_STEPS;
+  if (status === 'maintenance') return MAINTENANCE_STEPS;
+  if (status === 'first_appointment') return FIRST_APPOINTMENT_STEPS;
+  return INQUIRY_STEPS;
 }
 
 const STOP_STATUSES = new Set(['booked', 'replied', 'closed']);

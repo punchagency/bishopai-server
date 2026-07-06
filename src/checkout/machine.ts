@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg';
 import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
 import { chargeCard } from '../integrations/quickbooks';
+import { publishApproved } from '../session/publish';
 
 // WF2 checkout state machine (§6). The one money flow, so every transition is an
 // atomic guarded UPDATE (never restarts a charge), the charge carries a stable
@@ -136,12 +137,12 @@ export interface ApproveResult {
  * coupled to the PB write: a PB-mark failure leaves the charge captured.
  */
 export async function approveAndCharge(checkoutId: string, approvedBy = 'nicole'): Promise<ApproveResult> {
-  const row = await pool.query<{ status: string; summary_snapshot: CheckoutSummary | null }>(
-    `SELECT status, summary_snapshot FROM checkout WHERE id = $1`,
+  const row = await pool.query<{ status: string; summary_snapshot: CheckoutSummary | null; appointment_id: string | null }>(
+    `SELECT status, summary_snapshot, appointment_id FROM checkout WHERE id = $1`,
     [checkoutId],
   );
   if (row.rowCount === 0) return { status: 'not_found' };
-  const { status, summary_snapshot } = row.rows[0];
+  const { status, summary_snapshot, appointment_id } = row.rows[0];
   if (status !== 'AWAITING_APPROVAL') return { status, error: 'not awaiting approval' };
   if (!summary_snapshot) return { status, error: 'no summary to approve' };
 
@@ -195,12 +196,22 @@ export async function approveAndCharge(checkoutId: string, approvedBy = 'nicole'
     charge.txnId ?? null,
   ]);
 
-  // Docs update (Drive) then PB mark — both dry-run until their creds land.
-  // Money state is already CHARGED; neither of these can un-capture it.
+  // Docs update (Drive) — publishApproved is dry-run until Drive is configured.
+  // Money state is already CHARGED; a Drive failure does not un-capture it.
+  const apptRows = await pool.query<{ sheet_id: string | null; protocol_id: string | null }>(
+    `SELECT
+       (SELECT id FROM appointment_sheets WHERE appointment_id = $1 LIMIT 1) AS sheet_id,
+       (SELECT id FROM protocols WHERE appointment_id = $1 LIMIT 1) AS protocol_id`,
+    [appointment_id],
+  );
+  const { sheet_id, protocol_id } = apptRows.rows[0] ?? {};
+  await Promise.allSettled([
+    sheet_id ? publishApproved('appointment_sheets', sheet_id) : Promise.resolve(),
+    protocol_id ? publishApproved('protocols', protocol_id) : Promise.resolve(),
+  ]);
   await transition(pool, checkoutId, 'CHARGED', 'DOCS_UPDATED');
-  logEvent('info', 'checkout.docs', '[dry-run] would update Appointment Sheet + Protocol in Drive', {
-    checkout_id: checkoutId,
-  });
+
+  // PB billing write-back — dry-run until PB REST API beta is confirmed (Open Item #2).
   await transition(pool, checkoutId, 'DOCS_UPDATED', 'PB_MARKED');
   logEvent('info', 'checkout.pb', '[dry-run] would mark billing complete via PB REST API', {
     checkout_id: checkoutId,

@@ -25,10 +25,18 @@ refillsRouter.get('/digest', async (_req, res) => {
       `SELECT rf.id, rf.due_date, rf.status,
               (rf.due_date - current_date) AS days_left,
               c.id AS client_id, c.name AS client_name,
-              s.name AS supplement_name, s.dose, s.qty
+              s.name AS supplement_name, s.dose, s.qty,
+              o.fullscript_order_id AS fullscript_plan_id, o.invitation_url
          FROM refills rf
     LEFT JOIN clients c ON c.id = rf.client_id
     LEFT JOIN supplements s ON s.id = rf.supplement_id
+    LEFT JOIN LATERAL (
+           SELECT fullscript_order_id, invitation_url
+             FROM refill_orders ro
+            WHERE ro.refill_id = rf.id AND ro.status = 'sent'
+         ORDER BY ro.sent_at DESC NULLS LAST
+            LIMIT 1
+         ) o ON true
         WHERE rf.status IN ('pending', 'notified', 'snoozed')
           AND rf.due_date IS NOT NULL
      ORDER BY rf.due_date ASC`,
@@ -113,14 +121,19 @@ refillsRouter.post('/orders', async (req, res) => {
   const batchId = randomUUID();
 
   try {
-    // Resolve the refills into order lines (client + supplement names).
+    // Resolve the refills into order lines (client + supplement + patient email
+    // + dose/qty for the Fullscript dosage).
     const info = await pool.query<{
       id: string;
       client_id: string | null;
       client_name: string | null;
+      client_email: string | null;
       supplement_name: string | null;
+      dose: string | null;
+      qty: number | null;
     }>(
-      `SELECT rf.id, rf.client_id, c.name AS client_name, s.name AS supplement_name
+      `SELECT rf.id, rf.client_id, c.name AS client_name, c.email AS client_email,
+              s.name AS supplement_name, s.dose, s.qty
          FROM refills rf
     LEFT JOIN clients c ON c.id = rf.client_id
     LEFT JOIN supplements s ON s.id = rf.supplement_id
@@ -144,19 +157,22 @@ refillsRouter.post('/orders', async (req, res) => {
       lines.push({
         orderId: ins.rows[0].id,
         clientName: row.client_name ?? 'Unknown client',
+        clientEmail: row.client_email,
         supplementName: row.supplement_name ?? 'supplement',
+        dose: row.dose,
+        qty: row.qty,
       });
     }
 
-    // Forward the batch (dry-run until Fullscript is configured).
-    const results = await sendBulkRefillOrders(lines);
+    // Forward the batch as Fullscript treatment plans (dry-run until configured).
+    const results = await sendBulkRefillOrders(lines, { batchId });
 
     // Persist each order's outcome + flip successfully-sent refills to 'notified'.
     for (const r of results) {
       if (r.ok) {
         await pool.query(
-          `UPDATE refill_orders SET status = 'sent', fullscript_order_id = $2, sent_at = now() WHERE id = $1`,
-          [r.orderId, r.fullscriptOrderId ?? null],
+          `UPDATE refill_orders SET status = 'sent', fullscript_order_id = $2, invitation_url = $3, sent_at = now() WHERE id = $1`,
+          [r.orderId, r.fullscriptPlanId ?? null, r.invitationUrl ?? null],
         );
       } else {
         await pool.query(`UPDATE refill_orders SET status = 'failed', error = $2 WHERE id = $1`, [
@@ -182,9 +198,26 @@ refillsRouter.post('/orders', async (req, res) => {
       [JSON.stringify({ batch_id: batchId, count: lines.length }), approved_by || 'nicole'],
     );
 
+    // Enrich each result with the refill/client/supplement it came from, so the
+    // dashboard can show per-refill outcomes (and the Fullscript plan link).
+    const metaByRefill = new Map(info.rows.map((r) => [r.id, r]));
+    const enriched = results.map((r) => {
+      const refillId = orderToRefill.get(r.orderId);
+      const meta = refillId ? metaByRefill.get(refillId) : undefined;
+      return {
+        refill_id: refillId ?? null,
+        client_name: meta?.client_name ?? null,
+        supplement_name: meta?.supplement_name ?? null,
+        ok: r.ok,
+        error: r.error ?? null,
+        invitation_url: r.invitationUrl ?? null,
+        fullscript_plan_id: r.fullscriptPlanId ?? null,
+      };
+    });
+
     const ok = results.filter((r) => r.ok).length;
     logEvent('info', 'refills.orders', 'bulk refill send', { batch_id: batchId, count: lines.length, ok });
-    return res.json({ batch_id: batchId, sent: ok, failed: results.length - ok, results });
+    return res.json({ batch_id: batchId, sent: ok, failed: results.length - ok, results: enriched });
   } catch (err) {
     logError('refills.orders', 'bulk send failed', err, { batch_id: batchId });
     return res.status(500).json({ error: 'internal error' });

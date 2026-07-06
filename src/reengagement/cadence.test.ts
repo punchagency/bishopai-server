@@ -53,6 +53,40 @@ describe('nextCadenceAction — cancelled track', () => {
   });
 });
 
+describe('nextCadenceAction — maintenance track', () => {
+  it('sends the 7-day maintenance nudge (mirrors the cancelled cadence)', () => {
+    const a = nextCadenceAction(lead({ status: 'maintenance', created_at: daysAgo(8) }), NOW);
+    expect(a).toMatchObject({ kind: 'send', step: 'maintenance_7d' });
+  });
+
+  it('advances to the 14-day nudge once the first is sent', () => {
+    const a = nextCadenceAction(
+      lead({ status: 'maintenance', created_at: daysAgo(15), sentSteps: ['maintenance_7d'] }),
+      NOW,
+    );
+    expect(a).toMatchObject({ kind: 'send', step: 'maintenance_14d' });
+  });
+
+  it('does nothing before the first nudge is due', () => {
+    expect(nextCadenceAction(lead({ status: 'maintenance', created_at: daysAgo(3) }), NOW).kind).toBe('none');
+  });
+});
+
+describe('nextCadenceAction — first-appointment track', () => {
+  it('sends the 7-day follow-up nudge', () => {
+    const a = nextCadenceAction(lead({ status: 'first_appointment', created_at: daysAgo(8) }), NOW);
+    expect(a).toMatchObject({ kind: 'send', step: 'first_appt_7d' });
+  });
+
+  it('advances to the 14-day incentive once the first is sent', () => {
+    const a = nextCadenceAction(
+      lead({ status: 'first_appointment', created_at: daysAgo(15), sentSteps: ['first_appt_7d'] }),
+      NOW,
+    );
+    expect(a).toMatchObject({ kind: 'send', step: 'first_appt_14d' });
+  });
+});
+
 describe('nextCadenceAction — deactivation', () => {
   it('deactivates a cold lead past the window with all steps sent', () => {
     const a = nextCadenceAction(

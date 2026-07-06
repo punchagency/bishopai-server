@@ -1,67 +1,134 @@
-import { fetchJson } from '../http';
 import { logEvent } from '../../observability/logger';
-import { fullscriptConfig, isFullscriptConfigured } from './config';
+import { isFullscriptConfigured } from './config';
+import { httpFullscriptClient, type FullscriptClient, type PlanRecommendation } from './client';
+import { parseFullscriptDosage } from './dosage';
 
-export { isFullscriptConfigured, fullscriptConfig } from './config';
+export { isFullscriptConfigured, fullscriptConfig, fullscriptApiBase } from './config';
+export { getFullscriptAccessToken } from './oauth';
+export { verifyFullscriptSignature, requireFullscriptSignature } from './webhooks';
+export { httpFullscriptClient, type FullscriptClient } from './client';
 
-// WF4 bulk send: forward approved refill orders to Fullscript in one action.
-// Dry-run gated exactly like Drive (src/integrations/drive) — until
-// FULLSCRIPT_API_TOKEN is set, sends log what they would do and return a
-// synthetic order id, so the bulk-refill path is exercisable before the
-// integration path is confirmed, and flips to real calls with no wiring change.
+// WF4 bulk send: turn approved refills into Fullscript treatment plans. Verified
+// against the Fullscript Partner API OpenAPI (2026-07). Real flow per patient:
+//   1. find-or-create the patient (by email),
+//   2. map each supplement name → a catalog variant id,
+//   3. create ONE draft treatment plan with those product recommendations.
+// Plans are created as drafts (activation needs Fullscript commercial approval);
+// the practitioner/patient completes purchase via the plan's invitation_url.
+// Dry-run until OAuth is configured.
 
 export interface RefillOrderLine {
   /** Our refill_orders row id — echoed back so the caller can update status. */
   orderId: string;
   clientName: string;
+  /** Patient email — required to create/find the Fullscript patient. */
+  clientEmail?: string | null;
   supplementName: string;
+  /** Free-text dose ("2 caps twice daily") → structured Fullscript dosage. */
+  dose?: string | null;
+  /** Bottle size (units per bottle) → drives the dosage duration (days supply). */
+  qty?: number | null;
 }
 
 export interface OrderSendResult {
   orderId: string;
   ok: boolean;
-  fullscriptOrderId?: string;
+  fullscriptPlanId?: string;
+  invitationUrl?: string;
   error?: string;
 }
 
-interface FullscriptOrderResponse {
-  id: string;
+export interface BulkSendOptions {
+  client?: FullscriptClient; // injectable for tests
+  /** Our reference id stamped onto each plan's metadata (traceability). */
+  batchId?: string;
+}
+
+/** Split a full name into first/last for Fullscript patient creation. */
+function splitName(name: string): { firstName: string; lastName: string } {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { firstName: 'Patient', lastName: 'Patient' };
+  if (parts.length === 1) return { firstName: parts[0], lastName: parts[0] };
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
 }
 
 /**
- * Send a batch of refill orders to Fullscript. Best-effort per line — one
- * failed order doesn't sink the batch; each line's outcome comes back so the
- * caller can persist per-order status. Dry-run when unconfigured.
+ * Create one draft treatment plan per unique patient (grouped by email) with a
+ * recommendation for each supplement that maps to a catalog variant. Every line
+ * for a patient shares the plan's outcome; lines with no email, or a supplement
+ * with no catalog match, fail with a reason. Best-effort per patient — one
+ * failure doesn't sink the batch. Dry-run when OAuth isn't configured.
  */
-export async function sendBulkRefillOrders(lines: RefillOrderLine[]): Promise<OrderSendResult[]> {
+export async function sendBulkRefillOrders(
+  lines: RefillOrderLine[],
+  opts: BulkSendOptions = {},
+): Promise<OrderSendResult[]> {
   if (!isFullscriptConfigured()) {
-    logEvent('info', 'fullscript.bulk', '[dry-run] would send refill orders to Fullscript', {
-      count: lines.length,
-      clients: [...new Set(lines.map((l) => l.clientName))].length,
+    logEvent('info', 'fullscript.bulk', '[dry-run] would create Fullscript treatment plans', {
+      lines: lines.length,
+      patients: [...new Set(lines.map((l) => (l.clientEmail ?? l.clientName).toLowerCase()))].length,
     });
-    return lines.map((l) => ({ orderId: l.orderId, ok: true, fullscriptOrderId: `dry-run-${l.orderId}` }));
+    return lines.map((l) => ({ orderId: l.orderId, ok: true, fullscriptPlanId: `dry-run-${l.orderId}` }));
   }
 
-  const { apiToken, baseUrl } = fullscriptConfig();
+  const client = opts.client ?? httpFullscriptClient();
   const results: OrderSendResult[] = [];
+
+  // Group lines by patient email; lines without an email can't be placed.
+  const byEmail = new Map<string, RefillOrderLine[]>();
   for (const line of lines) {
+    const email = line.clientEmail?.trim();
+    if (!email) {
+      results.push({ orderId: line.orderId, ok: false, error: 'no client email on file' });
+      continue;
+    }
+    const list = byEmail.get(email.toLowerCase()) ?? [];
+    list.push(line);
+    byEmail.set(email.toLowerCase(), list);
+  }
+
+  for (const [email, group] of byEmail) {
     try {
-      const res = await fetchJson<FullscriptOrderResponse>(new URL('/v1/orders', baseUrl).toString(), {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${apiToken}`,
-          'content-type': 'application/json',
-          accept: 'application/json',
-        },
-        body: JSON.stringify({ client_name: line.clientName, supplement: line.supplementName }),
+      const patientId =
+        (await client.findPatientByEmail(email)) ??
+        (await client.createPatient({ email, ...splitName(group[0].clientName) }));
+
+      // Map each line's supplement to a catalog variant + structured dosage.
+      const recs: PlanRecommendation[] = [];
+      const placed: RefillOrderLine[] = [];
+      for (const line of group) {
+        const variantId = await client.findVariantId(line.supplementName);
+        if (!variantId) {
+          results.push({ orderId: line.orderId, ok: false, error: `no Fullscript product match for "${line.supplementName}"` });
+          continue;
+        }
+        // One bottle per refill (units_to_purchase); dose/qty drive the dosage.
+        recs.push({ variantId, unitsToPurchase: 1, dosage: parseFullscriptDosage(line.dose, line.qty) });
+        placed.push(line);
+      }
+      if (recs.length === 0) continue; // every supplement unmatched — all already failed
+
+      const { planId, invitationUrl } = await client.createTreatmentPlan(patientId, recs, {
+        metadataId: opts.batchId,
       });
-      results.push({ orderId: line.orderId, ok: true, fullscriptOrderId: res.id });
+      logEvent('info', 'fullscript.bulk', 'created draft treatment plan', {
+        patient: email,
+        plan_id: planId,
+        recommendations: recs.length,
+      });
+      for (const line of placed) {
+        results.push({ orderId: line.orderId, ok: true, fullscriptPlanId: planId, invitationUrl });
+      }
     } catch (err) {
-      results.push({ orderId: line.orderId, ok: false, error: err instanceof Error ? err.message : String(err) });
+      const error = err instanceof Error ? err.message : String(err);
+      // Fail only the lines we hadn't already resolved for this patient.
+      const done = new Set(results.filter((r) => group.some((l) => l.orderId === r.orderId)).map((r) => r.orderId));
+      for (const line of group) if (!done.has(line.orderId)) results.push({ orderId: line.orderId, ok: false, error });
     }
   }
-  logEvent('info', 'fullscript.bulk', 'sent refill orders to Fullscript', {
-    count: lines.length,
+
+  logEvent('info', 'fullscript.bulk', 'fullscript bulk send complete', {
+    lines: lines.length,
     ok: results.filter((r) => r.ok).length,
   });
   return results;

@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../db/pool';
-import { logError } from '../observability/logger';
+import { logError, logEvent } from '../observability/logger';
 import { coerceSessionNote, renderAppointmentSheet, renderProtocol } from '../session/render';
 import { processConversation } from '../session/process';
 import { publishApproved } from '../session/publish';
+import { syncClientSupplements } from '../session/supplements';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
 // session extraction, with edit + approve. (No auth yet — approved_by is a
@@ -214,6 +215,23 @@ function approveOne(table: Table, approvalType: string) {
               VALUES ($1, $2, 'approved', $3, now())`,
         [approvalType, JSON.stringify({ [`${approvalType}_id`]: req.params.id }), approvedBy],
       );
+      // Approving a Protocol commits its supplement changes into the shared
+      // `supplements` plan (atomic with the approval) — this is what feeds WF2
+      // checkout summaries and WF4 refill projection with real data.
+      if (table === 'protocols' && r.rows[0].client_id) {
+        const appt = await db.query<{ starts_at: string | null }>(
+          `SELECT starts_at FROM appointments WHERE id = $1`,
+          [r.rows[0].appointment_id],
+        );
+        const startDate = appt.rows[0]?.starts_at
+          ? new Date(appt.rows[0].starts_at).toISOString().slice(0, 10)
+          : null;
+        const sync = await syncClientSupplements(db, r.rows[0].client_id, startDate, r.rows[0].content_json);
+        logEvent('info', 'review.protocol_sync', 'synced supplements from approved protocol', {
+          id: req.params.id,
+          ...sync,
+        });
+      }
       await db.query('COMMIT');
       // WF1 final step: render + write to the client's Drive folder, off the
       // request path (best-effort; dry-run until Google OAuth is configured).
