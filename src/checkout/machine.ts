@@ -2,8 +2,18 @@ import crypto from 'node:crypto';
 import type { PoolClient } from 'pg';
 import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
-import { chargeCard } from '../integrations/quickbooks';
+import {
+  chargeCard,
+  isQuickbooksConfigured,
+  queryInvoices,
+  type CardDetails,
+  type Invoice,
+} from '../integrations/quickbooks';
+import { fetchSessionSupplementChanges, isFullscriptConfigured } from '../integrations/fullscript';
 import { publishApproved } from '../session/publish';
+import { enqueueReconciliation, reconcileCheckout } from './reconcile';
+import { resolveQboCustomerId } from './customerMap';
+import { recordCheckoutOutcome } from './docWriteback';
 
 // WF2 checkout state machine (§6). The one money flow, so every transition is an
 // atomic guarded UPDATE (never restarts a charge), the charge carries a stable
@@ -39,8 +49,87 @@ export function summaryHash(s: CheckoutSummary): string {
   return crypto.createHash('sha256').update(canon).digest('hex');
 }
 
-/** Assemble a frozen summary from the appointment's client + supplements (mock
- *  QB invoice + Fullscript changes). This is what Nicole approves — not a live re-pull. */
+/** Choose the invoice a session's charge settles: the most recent UNPAID invoice
+ *  for the customer (a session just rendered → newest open invoice), falling back
+ *  to the most recent overall. Pure — exported for tests. */
+export function pickTargetInvoice(invoices: Invoice[]): Invoice | null {
+  if (invoices.length === 0) return null;
+  const byRecent = [...invoices].sort((a, b) => (b.txnDate ?? '').localeCompare(a.txnDate ?? ''));
+  return byRecent.find((i) => i.balanceCents > 0) ?? byRecent[0];
+}
+
+/** Build the frozen summary from a real QBO invoice. Total comes from the
+ *  authoritative TotalAmt (NOT summed lines); synthetic subtotal rows were already
+ *  filtered by the invoice reader. Pure — exported for tests. */
+export function summaryFromInvoice(inv: Invoice, fullscriptChanges: string[]): CheckoutSummary {
+  return {
+    currency: inv.currency ?? 'USD',
+    qb_invoice_id: inv.id,
+    line_items: inv.lines.map((l) => ({
+      label: l.description ?? l.itemName ?? 'Item',
+      amount_cents: l.amountCents,
+    })),
+    total_cents: inv.totalCents,
+    fullscript_changes: fullscriptChanges,
+  };
+}
+
+// QBO Customer.Ids are numeric strings; guard the value we splice into a QBO
+// query to avoid any query-string breakage/injection.
+const SAFE_CUSTOMER_ID = /^[A-Za-z0-9-]+$/;
+
+/** Try to source the summary from the client's real QuickBooks invoice. Returns
+ *  null (caller falls back to the computed summary) if QB isn't configured, the
+ *  client has no QBO customer mapping, or no invoice can be read. */
+async function trySummaryFromQbo(
+  clientId: string | null,
+  fullscriptChanges: string[],
+): Promise<CheckoutSummary | null> {
+  if (!isQuickbooksConfigured()) return null;
+  const customerId = await resolveQboCustomerId(clientId);
+  if (!customerId || !SAFE_CUSTOMER_ID.test(customerId)) return null;
+  try {
+    const invoices = await queryInvoices(`CustomerRef = '${customerId}'`);
+    const target = pickTargetInvoice(invoices);
+    if (!target) return null;
+    logEvent('info', 'checkout.summary', 'sourced summary from QBO invoice', {
+      invoice_id: target.id,
+      total_cents: target.totalCents,
+    });
+    return summaryFromInvoice(target, fullscriptChanges);
+  } catch (err) {
+    logError('checkout.summary', 'QBO invoice read failed; falling back to computed summary', err, {
+      customer_id: customerId,
+    });
+    return null;
+  }
+}
+
+/** Live Fullscript read of the session's supplement changes, or null to fall
+ *  back to the local plan. Best-effort — a Fullscript error never blocks checkout. */
+async function tryFullscriptChanges(appointmentId: string): Promise<string[] | null> {
+  if (!isFullscriptConfigured()) return null;
+  const r = await pool.query<{ email: string | null; starts_at: string | null }>(
+    `SELECT c.email, a.starts_at FROM appointments a LEFT JOIN clients c ON c.id = a.client_id WHERE a.id = $1`,
+    [appointmentId],
+  );
+  const email = r.rows[0]?.email;
+  const startsAt = r.rows[0]?.starts_at;
+  if (!email || !startsAt) return null;
+  try {
+    return await fetchSessionSupplementChanges(email, new Date(startsAt).toISOString());
+  } catch (err) {
+    logError('checkout.summary', 'Fullscript session-change read failed; using local plan', err, { appointment_id: appointmentId });
+    return null;
+  }
+}
+
+/**
+ * Assemble the frozen summary Nicole approves (not a live re-pull at charge
+ * time). Prefer the client's real QuickBooks invoice (line items + authoritative
+ * total); fall back to a computed summary from the appointment's supplements when
+ * QuickBooks isn't configured or no invoice is resolvable (offline demo / dry-run).
+ */
 export async function assembleSummary(appointmentId: string): Promise<CheckoutSummary | null> {
   const appt = await pool.query<{ client_id: string | null }>(
     `SELECT client_id FROM appointments WHERE id = $1`,
@@ -52,7 +141,16 @@ export async function assembleSummary(appointmentId: string): Promise<CheckoutSu
   const supps = clientId
     ? (await pool.query<{ name: string }>(`SELECT name FROM supplements WHERE client_id = $1 ORDER BY name`, [clientId])).rows
     : [];
+  // Prefer a live Fullscript read of what changed THIS session; fall back to the
+  // local plan (supplements table) when Fullscript isn't configured / no patient.
+  const fullscript_changes = (await tryFullscriptChanges(appointmentId)) ?? supps.map((s) => s.name);
 
+  // Prefer the real QuickBooks invoice.
+  const fromQbo = await trySummaryFromQbo(clientId, fullscript_changes);
+  if (fromQbo) return fromQbo;
+
+  // Fallback: computed summary (mock invoice id → reconciliation dead-letters in
+  // live mode rather than posting a payment against a fabricated invoice).
   const line_items: LineItem[] = [
     { label: 'Consultation', amount_cents: SESSION_FEE_CENTS },
     ...supps.map((s) => ({ label: s.name, amount_cents: SUPPLEMENT_CENTS })),
@@ -63,7 +161,7 @@ export async function assembleSummary(appointmentId: string): Promise<CheckoutSu
     qb_invoice_id: `mock-inv-${appointmentId.slice(0, 8)}`,
     line_items,
     total_cents,
-    fullscript_changes: supps.map((s) => s.name),
+    fullscript_changes,
   };
 }
 
@@ -130,19 +228,37 @@ export interface ApproveResult {
   error?: string;
 }
 
+export interface ApproveOptions {
+  approvedBy?: string;
+  /**
+   * Payment source for the charge (Option A — backend tokenizes). Provide a
+   * one-time `token` (preferred, e.g. tokenized client-side) or raw `card`
+   * details, which are tokenized here and never stored or logged. Optional in
+   * dry-run; required once QuickBooks is live or the charge fails.
+   */
+  card?: CardDetails;
+  token?: string;
+}
+
 /**
  * Nicole's Approve → the system half (charge → docs → PB mark). Writes the
  * approval (bound to the summary hash), claims the charge with a stable
  * idempotency key, then walks the automated states. Money state is never
  * coupled to the PB write: a PB-mark failure leaves the charge captured.
  */
-export async function approveAndCharge(checkoutId: string, approvedBy = 'nicole'): Promise<ApproveResult> {
-  const row = await pool.query<{ status: string; summary_snapshot: CheckoutSummary | null; appointment_id: string | null }>(
-    `SELECT status, summary_snapshot, appointment_id FROM checkout WHERE id = $1`,
+export async function approveAndCharge(checkoutId: string, opts: ApproveOptions = {}): Promise<ApproveResult> {
+  const approvedBy = opts.approvedBy ?? 'nicole';
+  const row = await pool.query<{
+    status: string;
+    summary_snapshot: CheckoutSummary | null;
+    appointment_id: string | null;
+    client_id: string | null;
+  }>(
+    `SELECT status, summary_snapshot, appointment_id, client_id FROM checkout WHERE id = $1`,
     [checkoutId],
   );
   if (row.rowCount === 0) return { status: 'not_found' };
-  const { status, summary_snapshot, appointment_id } = row.rows[0];
+  const { status, summary_snapshot, appointment_id, client_id } = row.rows[0];
   if (status !== 'AWAITING_APPROVAL') return { status, error: 'not awaiting approval' };
   if (!summary_snapshot) return { status, error: 'no summary to approve' };
 
@@ -183,6 +299,8 @@ export async function approveAndCharge(checkoutId: string, approvedBy = 'nicole'
     currency: summary_snapshot.currency,
     idempotencyKey,
     invoiceId: summary_snapshot.qb_invoice_id,
+    token: opts.token,
+    card: opts.card, // tokenized inside chargeCard; never persisted/logged
   });
 
   if (!charge.ok) {
@@ -191,10 +309,54 @@ export async function approveAndCharge(checkoutId: string, approvedBy = 'nicole'
     return { status: 'CHARGE_FAILED', error: charge.error };
   }
 
-  await pool.query(`UPDATE checkout SET qb_txn_id = $2, status = 'CHARGED' WHERE id = $1 AND status = 'CHARGING'`, [
-    checkoutId,
-    charge.txnId ?? null,
-  ]);
+  // Mark CHARGED and enqueue the reconciliation intent in ONE transaction, so a
+  // captured charge can never exist without its durable "record this payment in
+  // QuickBooks" outbox row. The customer id is resolved from the mapping table
+  // (may be null now — the reconciler re-resolves and dead-letters if still
+  // missing in live mode).
+  const qboCustomerId = await resolveQboCustomerId(client_id);
+  const cdb = await pool.connect();
+  try {
+    await cdb.query('BEGIN');
+    await cdb.query(`UPDATE checkout SET qb_txn_id = $2, status = 'CHARGED' WHERE id = $1 AND status = 'CHARGING'`, [
+      checkoutId,
+      charge.txnId ?? null,
+    ]);
+    await enqueueReconciliation(cdb, {
+      checkoutId,
+      invoiceId: summary_snapshot.qb_invoice_id,
+      customerId: qboCustomerId,
+      amountCents: summary_snapshot.total_cents,
+      currency: summary_snapshot.currency,
+      providerTxnId: charge.txnId ?? null,
+    });
+    await cdb.query('COMMIT');
+  } catch (err) {
+    await cdb.query('ROLLBACK');
+    // The charge already captured; surface but don't lose it — the row will be
+    // re-enqueued on a later approve replay is not possible (state moved), so log loudly.
+    logError('checkout.charged', 'failed to persist CHARGED + reconciliation intent', err, { checkout_id: checkoutId });
+    throw err;
+  } finally {
+    cdb.release();
+  }
+
+  // Best-effort inline reconciliation (invoice shows paid promptly in the happy
+  // path). Failure is fine — the durable row + scheduler guarantee completion.
+  await reconcileCheckout(checkoutId).catch((err) =>
+    logError('checkout.reconcile', 'inline reconcile failed (will retry via job)', err, { checkout_id: checkoutId }),
+  );
+
+  // Record the checkout outcome onto the docs (billing block on the internal
+  // sheet; refreshed supplements on the client protocol) BEFORE publishing, so
+  // the Drive render includes them. Best-effort — money is already CHARGED.
+  await recordCheckoutOutcome(appointment_id, {
+    status: charge.dryRun ? 'dry-run' : 'paid',
+    amountCents: summary_snapshot.total_cents,
+    currency: summary_snapshot.currency,
+    qbTxnId: charge.txnId ?? null,
+    qbInvoiceId: summary_snapshot.qb_invoice_id,
+  }).catch((err) => logError('checkout.docs', 'failed to record outcome on docs', err, { checkout_id: checkoutId }));
 
   // Docs update (Drive) — publishApproved is dry-run until Drive is configured.
   // Money state is already CHARGED; a Drive failure does not un-capture it.

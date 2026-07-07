@@ -28,6 +28,8 @@ export interface RefillOrderLine {
   dose?: string | null;
   /** Bottle size (units per bottle) → drives the dosage duration (days supply). */
   qty?: number | null;
+  /** Bottles to order (adherence bundling / multi-month). Defaults to 1. */
+  months?: number | null;
 }
 
 export interface OrderSendResult {
@@ -59,6 +61,24 @@ function splitName(name: string): { firstName: string; lastName: string } {
  * with no catalog match, fail with a reason. Best-effort per patient — one
  * failure doesn't sink the batch. Dry-run when OAuth isn't configured.
  */
+/**
+ * Read the supplement/product names Fullscript shows as assigned to a client
+ * since `sinceISO` (i.e. what changed this session). Returns null when Fullscript
+ * isn't configured or the patient isn't found — callers fall back to the local
+ * supplements table.
+ */
+export async function fetchSessionSupplementChanges(
+  email: string,
+  sinceISO: string,
+  opts: { client?: FullscriptClient } = {},
+): Promise<string[] | null> {
+  if (!isFullscriptConfigured()) return null;
+  const client = opts.client ?? httpFullscriptClient();
+  const patientId = await client.findPatientByEmail(email);
+  if (!patientId) return null;
+  return client.listRecentSupplements(patientId, sinceISO);
+}
+
 export async function sendBulkRefillOrders(
   lines: RefillOrderLine[],
   opts: BulkSendOptions = {},
@@ -102,8 +122,9 @@ export async function sendBulkRefillOrders(
           results.push({ orderId: line.orderId, ok: false, error: `no Fullscript product match for "${line.supplementName}"` });
           continue;
         }
-        // One bottle per refill (units_to_purchase); dose/qty drive the dosage.
-        recs.push({ variantId, unitsToPurchase: 1, dosage: parseFullscriptDosage(line.dose, line.qty) });
+        // Bottles per refill = adherence-suggested months (default 1); dose/qty drive the dosage.
+        const bottles = line.months && line.months > 0 ? Math.floor(line.months) : 1;
+        recs.push({ variantId, unitsToPurchase: bottles, dosage: parseFullscriptDosage(line.dose, line.qty) });
         placed.push(line);
       }
       if (recs.length === 0) continue; // every supplement unmatched — all already failed

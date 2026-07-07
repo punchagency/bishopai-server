@@ -1,20 +1,44 @@
 import { fetchJson } from '../http';
 import { logEvent } from '../../observability/logger';
 import { isQuickbooksConfigured, quickbooksConfig } from './config';
+import { getQuickbooksAccessToken } from './oauth';
 
 export { isQuickbooksConfigured, quickbooksConfig } from './config';
+export { getQuickbooksAccessToken, _resetQuickbooksTokenCache } from './oauth';
+export * from './invoice';
+export * from './payment';
+export * from './customer';
 
-// WF2 charging via QuickBooks Payments. The critical guarantee is idempotency:
-// the caller passes a stable idempotencyKey (`checkout:{id}:charge`) sent as QB's
-// request-id, so a retry/timeout/crash replays the SAME key and QB returns the
-// original charge — never a second one. Dry-run gated like every other
-// integration: no money moves until QB is configured, but the state machine and
-// the idempotency contract are fully exercised.
+// WF2 charging via QuickBooks Payments. Idempotency: the caller passes a stable
+// idempotencyKey (`checkout:{id}:charge`) sent as QB's Request-Id header, so a
+// retry/timeout/crash replays the SAME key and QB returns the original charge —
+// never a second one. Dry-run gated like every other integration: no money moves
+// until QB is configured, but the state machine + idempotency contract are fully
+// exercised.
+//
+// Card source: a charge MUST carry a token, card, or cardOnFile (per Intuit
+// docs). We take the PCI-preferred path — tokenize the card (one-time,
+// single-use, 15-min) then charge with the token — and never send raw PAN to the
+// charges endpoint. Callers should pass a pre-minted `token` (ideally tokenized
+// client-side); passing raw `card` is supported but tokenizes it here first.
+
+export interface CardDetails {
+  number: string;
+  expMonth: string;
+  expYear: string;
+  cvc: string;
+  name?: string;
+  address?: Record<string, string>;
+}
 
 export interface ChargeInput {
   amountCents: number;
   currency: string;
   idempotencyKey: string;
+  /** Preferred: a one-time Payments token (from createToken / client-side tokenization). */
+  token?: string;
+  /** Fallback: raw card details, tokenized here before charging. */
+  card?: CardDetails;
   invoiceId?: string;
 }
 
@@ -22,7 +46,36 @@ export interface ChargeResult {
   ok: boolean;
   dryRun?: boolean;
   txnId?: string;
+  /** QB charge status: AUTHORIZED | CAPTURED | DECLINED | ... */
+  status?: string;
   error?: string;
+}
+
+// A charge is money-good only in these states. A DECLINED charge comes back 200
+// with an id, so we MUST inspect status rather than trust the HTTP code.
+const CAPTURABLE = new Set(['CAPTURED', 'AUTHORIZED', 'SETTLED']);
+
+async function paymentsHeaders(requestId?: string): Promise<Record<string, string>> {
+  const token = await getQuickbooksAccessToken();
+  const h: Record<string, string> = {
+    authorization: `Bearer ${token}`,
+    'content-type': 'application/json',
+    accept: 'application/json',
+  };
+  if (requestId) h['request-id'] = requestId;
+  return h;
+}
+
+/** Create a one-time Payments token from raw card details (PCI-preferred charge path). */
+export async function createToken(card: CardDetails, requestId: string): Promise<string> {
+  const { paymentsBase } = quickbooksConfig();
+  const res = await fetchJson<{ value?: string }>(`${paymentsBase}/quickbooks/v4/payments/tokens`, {
+    method: 'POST',
+    headers: await paymentsHeaders(requestId),
+    body: JSON.stringify({ card }),
+  });
+  if (!res.value) throw new Error('QuickBooks token creation returned no value');
+  return res.value;
 }
 
 export async function chargeCard(input: ChargeInput): Promise<ChargeResult> {
@@ -34,28 +87,45 @@ export async function chargeCard(input: ChargeInput): Promise<ChargeResult> {
     });
     // Deterministic synthetic txn id keyed on the idempotency key, so a replay
     // yields the same id — mirroring QB's real idempotent behaviour.
-    return { ok: true, dryRun: true, txnId: `dry-run-txn-${input.idempotencyKey}` };
+    return { ok: true, dryRun: true, status: 'CAPTURED', txnId: `dry-run-txn-${input.idempotencyKey}` };
   }
 
-  const { accessToken, realmId, baseUrl } = quickbooksConfig();
+  const { paymentsBase } = quickbooksConfig();
   try {
-    const res = await fetchJson<{ id: string }>(`${baseUrl}/payments/charges`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        'content-type': 'application/json',
-        'request-id': input.idempotencyKey, // QB idempotency
-        'company-id': realmId,
+    // Resolve a token; never charge raw card at the charges endpoint.
+    let token = input.token;
+    if (!token && input.card) token = await createToken(input.card, `${input.idempotencyKey}:token`);
+    if (!token) return { ok: false, error: 'no payment token or card supplied' };
+
+    const res = await fetchJson<{ id: string; status?: string }>(
+      `${paymentsBase}/quickbooks/v4/payments/charges`,
+      {
+        method: 'POST',
+        headers: await paymentsHeaders(input.idempotencyKey),
+        body: JSON.stringify({
+          token,
+          amount: (input.amountCents / 100).toFixed(2),
+          currency: input.currency,
+          context: { mobile: 'false', isEcommerce: 'true' },
+        }),
       },
-      body: JSON.stringify({
-        amount: (input.amountCents / 100).toFixed(2),
-        currency: input.currency,
-        context: { mobile: false, isEcommerce: true },
-      }),
-    });
-    logEvent('info', 'quickbooks.charge', 'charged card', { txn_id: res.id, amount_cents: input.amountCents });
-    return { ok: true, txnId: res.id };
+    );
+    return interpretChargeResponse(res, input.amountCents);
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/** Pure: turn a charge response into a result, honouring `status`. Exported for tests. */
+export function interpretChargeResponse(
+  res: { id: string; status?: string },
+  amountCents?: number,
+): ChargeResult {
+  const status = res.status ?? 'UNKNOWN';
+  if (!CAPTURABLE.has(status)) {
+    logEvent('warn', 'quickbooks.charge', 'charge not captured', { txn_id: res.id, status });
+    return { ok: false, txnId: res.id, status, error: `charge ${status.toLowerCase()}` };
+  }
+  logEvent('info', 'quickbooks.charge', 'charged card', { txn_id: res.id, status, amount_cents: amountCents });
+  return { ok: true, txnId: res.id, status };
 }

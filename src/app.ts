@@ -6,6 +6,7 @@ import { refillsRouter } from './routes/refills';
 import { engagementRouter } from './routes/engagement';
 import { checkoutRouter } from './routes/checkout';
 import { dashboardRouter } from './routes/dashboard';
+import { consentsRouter } from './routes/consents';
 import { authRouter } from './routes/auth';
 import { requireAuth } from './auth/middleware';
 
@@ -41,6 +42,7 @@ export function createApp(): express.Express {
   app.use('/engagement', requireAuth, engagementRouter);
   app.use('/checkout', requireAuth, checkoutRouter);
   app.use('/dashboard', requireAuth, dashboardRouter);
+  app.use('/consents', requireAuth, consentsRouter);
 
   return app;
 }

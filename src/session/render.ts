@@ -4,9 +4,36 @@ import { type SessionNote, SessionNoteSchema } from './extract';
 // internal Appointment Sheet and a client-facing Protocol. Pure and
 // deterministic — the Drive *write* is Zapier's connector step (§5.4–5.5).
 
+export interface BillingBlock {
+  status: string; // paid | dry-run | failed
+  amount_cents: number;
+  currency: string;
+  qb_txn_id?: string | null;
+  qb_invoice_id?: string | null;
+  paid_at?: string | null;
+  note?: string | null;
+}
+
 export interface RenderContext {
   clientName: string;
   appointmentDate: string;
+  /** Checkout outcome, stamped onto the internal sheet after WF2 charge. */
+  billing?: BillingBlock | null;
+}
+
+function renderBilling(b: BillingBlock): string {
+  const amount = new Intl.NumberFormat('en-US', { style: 'currency', currency: b.currency || 'USD' }).format(
+    b.amount_cents / 100,
+  );
+  const lines = [
+    `- **Status:** ${b.status}`,
+    `- **Amount:** ${amount}`,
+    b.qb_txn_id ? `- **Payment ref:** ${b.qb_txn_id}` : null,
+    b.qb_invoice_id ? `- **Invoice:** ${b.qb_invoice_id}` : null,
+    b.paid_at ? `- **Recorded:** ${b.paid_at.slice(0, 10)}` : null,
+    b.note ? `- **Note:** ${b.note}` : null,
+  ].filter(Boolean);
+  return lines.join('\n');
 }
 
 /** Coerce stored/edited content_json into a SessionNote, tolerating partial edits. */
@@ -62,6 +89,9 @@ export function renderAppointmentSheet(note: SessionNote, ctx: RenderContext): s
     '',
     '## Follow-ups',
     bullets(note.follow_ups),
+    '',
+    '## Billing',
+    ctx.billing ? renderBilling(ctx.billing) : '_Not checked out._',
     '',
   ].join('\n');
 }

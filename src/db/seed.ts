@@ -219,7 +219,7 @@ async function main(): Promise<void> {
     if (d && !firstCheckoutId) firstCheckoutId = d.checkoutId;
   }
   // Push the first one through approve → charge (dry-run) → PB_MARKED.
-  if (firstCheckoutId) await approveAndCharge(firstCheckoutId, 'nicole');
+  if (firstCheckoutId) await approveAndCharge(firstCheckoutId, { approvedBy: 'nicole' });
 
   // One unmatched conversation (no overlapping appointment) → Unmatched view.
   await ingestConversation({

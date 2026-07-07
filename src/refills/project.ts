@@ -83,6 +83,39 @@ export interface ProjectionResult {
   scanned: number;
   projected: number; // rows we could compute a due_date for and upserted
   skipped: number; // missing qty/start_date
+  deduped: number; // duplicate rows (same client+supplement across sources) collapsed
+}
+
+export interface SupplementRow {
+  id: string;
+  client_id: string;
+  name: string;
+  dose: string | null;
+  qty: number | null;
+  start_date: string | null;
+  source: string | null;
+}
+
+// Source authority for reconciliation: the practitioner's note beats a vendor
+// feed. Lower rank wins; ties break on the more recent start_date.
+const SOURCE_RANK: Record<string, number> = { notes: 0, fullscript: 1, pb: 2 };
+const rankOf = (s: string | null): number => SOURCE_RANK[s ?? ''] ?? 3;
+const normName = (n: string): string => n.trim().toLowerCase();
+
+/**
+ * Pure: from all of one client's supplement rows with the same normalized name
+ * (the "same supplement seen across sources"), pick the single timeline to keep
+ * — most authoritative source, then most recent start_date. Returns the winner
+ * id and the ids to collapse. Exported for tests.
+ */
+export function pickSupplementWinner(group: SupplementRow[]): { winner: SupplementRow; loserIds: string[] } {
+  const sorted = [...group].sort((a, b) => {
+    const r = rankOf(a.source) - rankOf(b.source);
+    if (r !== 0) return r;
+    return (b.start_date ?? '').localeCompare(a.start_date ?? '');
+  });
+  const winner = sorted[0];
+  return { winner, loserIds: sorted.slice(1).map((s) => s.id) };
 }
 
 /**
@@ -92,19 +125,35 @@ export interface ProjectionResult {
  * (notified/snoozed/closed keep their status).
  */
 export async function projectRefills(): Promise<ProjectionResult> {
-  const { rows } = await pool.query<{
-    id: string;
-    client_id: string;
-    dose: string | null;
-    qty: number | null;
-    start_date: string | null;
-  }>(`SELECT id, client_id, dose, qty, start_date FROM supplements`);
+  const { rows } = await pool.query<SupplementRow>(
+    `SELECT id, client_id, name, dose, qty, start_date, source FROM supplements`,
+  );
+
+  // Multi-source reconciliation: collapse the same supplement (client + name)
+  // seen across sources into one timeline before projecting, so the digest shows
+  // one refill per supplement rather than a duplicate per source.
+  const groups = new Map<string, SupplementRow[]>();
+  for (const s of rows) {
+    const key = `${s.client_id}|${normName(s.name)}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)!).push(s);
+  }
 
   let projected = 0;
   let skipped = 0;
+  let deduped = 0;
 
-  for (const s of rows) {
-    const { dueDate } = computeRunOut(s);
+  for (const group of groups.values()) {
+    const { winner, loserIds } = pickSupplementWinner(group);
+    deduped += loserIds.length;
+
+    // Close any stale refills tied to the collapsed duplicates.
+    if (loserIds.length > 0) {
+      await pool
+        .query(`UPDATE refills SET status = 'closed' WHERE supplement_id = ANY($1::uuid[]) AND status = 'pending'`, [loserIds])
+        .catch((err) => logError('refills.project', 'dedupe close failed', err, { loser_ids: loserIds }));
+    }
+
+    const { dueDate } = computeRunOut(winner);
     if (dueDate === null) {
       skipped++;
       continue;
@@ -115,11 +164,11 @@ export async function projectRefills(): Promise<ProjectionResult> {
               VALUES ($1, $2, $3, 'pending')
          ON CONFLICT (supplement_id) WHERE supplement_id IS NOT NULL
            DO UPDATE SET due_date = EXCLUDED.due_date`,
-        [s.client_id, s.id, dueDate],
+        [winner.client_id, winner.id, dueDate],
       );
       projected++;
     } catch (err) {
-      logError('refills.project', 'upsert failed', err, { supplement_id: s.id });
+      logError('refills.project', 'upsert failed', err, { supplement_id: winner.id });
     }
   }
 
@@ -127,6 +176,7 @@ export async function projectRefills(): Promise<ProjectionResult> {
     scanned: rows.length,
     projected,
     skipped,
+    deduped,
   });
-  return { scanned: rows.length, projected, skipped };
+  return { scanned: rows.length, projected, skipped, deduped };
 }

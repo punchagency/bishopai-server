@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { pool } from '../db/pool';
 import { logError, logEvent } from '../observability/logger';
 import { sendBulkRefillOrders, isFullscriptConfigured, type RefillOrderLine } from '../integrations/fullscript';
+import { computeAdherence, suggestedMonths } from '../refills/adherence';
 
 // WF4 dashboard surface: the daily refill digest (who's running low, tiered by
 // urgency) plus Nicole's actions — snooze, skip, or bulk-send the orders to
@@ -146,6 +147,7 @@ refillsRouter.post('/orders', async (req, res) => {
     // refill each order came from so we can flip the right ones to 'notified'.
     const lines: RefillOrderLine[] = [];
     const orderToRefill = new Map<string, string>();
+    const monthsCache = new Map<string, number>(); // client_id → suggested bottles
     for (const row of info.rows) {
       const ins = await pool.query<{ id: string }>(
         `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status)
@@ -154,6 +156,14 @@ refillsRouter.post('/orders', async (req, res) => {
         [batchId, row.client_id, row.id, row.supplement_name],
       );
       orderToRefill.set(ins.rows[0].id, row.id);
+
+      // Adherence bundling: proven, reliable clients default to a multi-month order.
+      let months = 1;
+      if (row.client_id) {
+        if (!monthsCache.has(row.client_id)) monthsCache.set(row.client_id, suggestedMonths(await computeAdherence(row.client_id)));
+        months = monthsCache.get(row.client_id)!;
+      }
+
       lines.push({
         orderId: ins.rows[0].id,
         clientName: row.client_name ?? 'Unknown client',
@@ -161,6 +171,7 @@ refillsRouter.post('/orders', async (req, res) => {
         supplementName: row.supplement_name ?? 'supplement',
         dose: row.dose,
         qty: row.qty,
+        months,
       });
     }
 

@@ -31,6 +31,8 @@ export interface FullscriptClient {
     recommendations: PlanRecommendation[],
     opts?: { metadataId?: string; sendToPatient?: boolean },
   ): Promise<CreatedPlan>;
+  /** Product names on treatment plans created at/after `sinceISO` (session-change read). */
+  listRecentSupplements(patientId: string, sinceISO: string): Promise<string[]>;
 }
 
 interface SearchPatientsResponse {
@@ -45,6 +47,13 @@ interface SearchProductsResponse {
 }
 interface TreatmentPlanResponse {
   treatment_plan?: { id: string; invitation_url?: string };
+}
+interface TreatmentPlansListResponse {
+  treatment_plans?: {
+    id: string;
+    created_at?: string;
+    recommendations?: { name?: string; product?: { name?: string }; variant?: { product?: { name?: string } } }[];
+  }[];
 }
 
 async function req<T>(
@@ -116,6 +125,22 @@ export function httpFullscriptClient(): FullscriptClient {
       const planId = res.treatment_plan?.id;
       if (!planId) throw new Error('Fullscript createTreatmentPlan returned no id');
       return { planId, invitationUrl: res.treatment_plan?.invitation_url };
+    },
+
+    async listRecentSupplements(patientId, sinceISO) {
+      const token = await getFullscriptAccessToken();
+      const res = await req<TreatmentPlansListResponse>('GET', `/clinic/patients/${patientId}/treatment_plans`, { token });
+      const since = new Date(sinceISO).getTime();
+      const names = new Set<string>();
+      for (const plan of res.treatment_plans ?? []) {
+        const created = plan.created_at ? new Date(plan.created_at).getTime() : NaN;
+        if (Number.isNaN(created) || created < since) continue;
+        for (const rec of plan.recommendations ?? []) {
+          const name = rec.product?.name ?? rec.variant?.product?.name ?? rec.name;
+          if (name) names.add(name);
+        }
+      }
+      return [...names];
     },
   };
 }

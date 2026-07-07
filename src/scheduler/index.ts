@@ -6,11 +6,21 @@ import { refillsJob } from './jobs/refills';
 import { maintenanceJob } from './jobs/maintenance';
 import { firstAppointmentJob } from './jobs/firstAppointment';
 import { inboxPollerJob } from './jobs/inboxPoller';
+import { reconcileJob } from './jobs/reconcile';
+import { refillRemindersJob } from './jobs/refillReminders';
 
 // In-process scheduler for the WF3/WF4 cadences (§14). Opt-in via
 // SCHEDULER_ENABLED=true so dev/tests don't run background jobs. Each tick is
 // wrapped so one failing job never takes down the timer or the process.
-const jobs: Job[] = [reengagementJob, refillsJob, maintenanceJob, firstAppointmentJob, inboxPollerJob];
+const jobs: Job[] = [
+  reengagementJob,
+  refillsJob,
+  maintenanceJob,
+  firstAppointmentJob,
+  inboxPollerJob,
+  reconcileJob,
+  refillRemindersJob,
+];
 let tasks: ScheduledTask[] = [];
 
 export function startScheduler(): void {

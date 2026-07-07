@@ -46,6 +46,9 @@ function fakeClient(over: Partial<FullscriptClient> = {}): { client: FullscriptC
       calls.plans.push({ patientId, recs, metadataId: o?.metadataId });
       return { planId: `tp_${patientId}`, invitationUrl: `https://fs/plan/${patientId}` };
     },
+    async listRecentSupplements() {
+      return [];
+    },
     ...over,
   };
   return { client, calls };

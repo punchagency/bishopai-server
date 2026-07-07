@@ -8,6 +8,7 @@ import { requireWebhookSecret, requirePbSignature } from './webhookAuth';
 import { classifyPbEvent, appointmentStatusFor } from '../integrations/pb/events';
 import { detectCheckout } from '../checkout/machine';
 import { ingestLead } from '../reengagement/intake';
+import { ingestSiteEvent, SITE_EVENT_TYPES } from '../reengagement/analytics';
 import { runReengagementForLead } from '../reengagement/runner';
 import { enrollCancelledAppointment } from '../reengagement/cancellations';
 
@@ -163,6 +164,35 @@ webhooksRouter.post('/bee/conversation', requireWebhookSecret('BEE_WEBHOOK_SECRE
 // lead is greeted "within minutes" rather than on the next hourly cadence tick.
 // Nicole is never the first touchpoint. Shared-secret guarded like the others.
 // ---------------------------------------------------------------------------
+// Site-behavior analytics ingest (WF3): page views / form opens / submits from
+// the website into lead_activity, attributed to a lead by email when known.
+const analyticsSchema = z.object({
+  email: z.string().email().optional(),
+  type: z.enum(SITE_EVENT_TYPES),
+  path: z.string().max(500).optional(),
+  detail: z.string().max(1000).optional(),
+  occurred_at: z.string().optional(),
+});
+
+webhooksRouter.post('/analytics', requireWebhookSecret('ANALYTICS_WEBHOOK_SECRET'), async (req, res) => {
+  const parsed = analyticsSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'invalid payload' });
+  const d = parsed.data;
+  try {
+    const { activityId, leadId } = await ingestSiteEvent({
+      email: d.email ?? null,
+      type: d.type,
+      path: d.path ?? null,
+      detail: d.detail ?? null,
+      occurredAt: d.occurred_at ?? null,
+    });
+    res.status(200).json({ activity_id: activityId, lead_id: leadId });
+  } catch (err) {
+    await logError('webhook.analytics', 'analytics ingest failed', err);
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
 const leadSchema = z.object({
   email: z.string().email(),
   name: z.string().optional(),
