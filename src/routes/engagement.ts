@@ -4,7 +4,7 @@ import { pool } from '../db/pool';
 import { logError, logEvent } from '../observability/logger';
 import { nextCadenceAction, type LeadState } from '../reengagement/cadence';
 import { runReengagement } from '../reengagement/runner';
-import { isOutlookConfigured } from '../integrations/outlook';
+import { getOutlookConnection } from '../integrations/outlook';
 
 // WF3 dashboard surface: the lead list with each lead's next cadence step, the
 // live site-activity feed (lead_activity), and Nicole's actions — stop the
@@ -40,7 +40,8 @@ engagementRouter.get('/leads', async (_req, res) => {
         next_step: action.kind === 'send' ? action.step : null,
       };
     });
-    res.json({ outlook_configured: isOutlookConfigured(), leads });
+    const outlook = await getOutlookConnection();
+    res.json({ outlook_configured: outlook.connected, outlook_sender: outlook.sender, leads });
   } catch (err) {
     logError('engagement.leads', 'leads query failed', err);
     res.status(500).json({ error: 'internal error' });

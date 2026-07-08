@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
 import { pool } from '../src/db/pool';
 import { ingestSiteEvent } from '../src/reengagement/analytics';
 import { recordConsent, listConsents, hasConsent } from '../src/consent/service';
@@ -13,6 +13,13 @@ const suite = dbUp ? describe : describe.skip;
 suite('WF3 analytics ingest + WF1 consent & drive folder (integration)', () => {
   const clientIds: string[] = [];
   const leadIds: string[] = [];
+  // The publish test asserts Drive's dry-run path, so keep Drive unconfigured even
+  // if a developer has GOOGLE_* creds in .env.
+  beforeEach(() => {
+    delete process.env.GOOGLE_CLIENT_ID;
+    delete process.env.GOOGLE_CLIENT_SECRET;
+    delete process.env.GOOGLE_REFRESH_TOKEN;
+  });
   afterEach(async () => {
     for (const id of leadIds.splice(0)) await pool.query(`DELETE FROM leads WHERE id = $1`, [id]);
     for (const id of clientIds.splice(0)) await pool.query(`DELETE FROM clients WHERE id = $1`, [id]);

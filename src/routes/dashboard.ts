@@ -18,10 +18,9 @@ dashboardRouter.get('/overview', async (_req, res) => {
            (SELECT count(*) FROM appointments  WHERE starts_at > now())                   AS upcoming,
            (SELECT count(*) FROM approvals     WHERE approved_at::date = now()::date)     AS approved_today,
            (SELECT count(*) FROM refills
-             WHERE due_date IS NOT NULL AND status IN ('pending','notified','snoozed')
-               AND due_date <= current_date + 14)                                         AS refills_due,
-           (SELECT count(*) FROM leads   WHERE status IN ('new','contacted','nurturing','cancelled')) AS leads_active,
-           (SELECT count(*) FROM checkout WHERE status = 'AWAITING_APPROVAL')             AS checkouts_awaiting`,
+             WHERE status IN ('pending','notified','snoozed'))                            AS refills_due,
+           (SELECT count(*) FROM leads   WHERE status IN ('new','contacted','nurturing')) AS leads_active,
+           (SELECT count(*) FROM checkout WHERE status NOT IN ('CLOSED','CHARGE_FAILED')) AS checkouts_awaiting`,
       ),
       pool.query(
         `SELECT ts, kind, text FROM (

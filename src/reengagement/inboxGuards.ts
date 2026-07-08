@@ -19,12 +19,17 @@ function header(msg: InboundMessage, name: string): string | undefined {
 
 /**
  * Reason to NOT treat this message as a new-lead inquiry, or null if it's safe.
- * `mailbox` is our own address (never welcome ourselves).
+ * `mailbox` is our own address(es) — one string, or the set of all connected
+ * mailboxes — so we never welcome ourselves.
  */
-export function intakeSkipReason(msg: InboundMessage, mailbox: string): string | null {
+export function intakeSkipReason(msg: InboundMessage, mailbox: string | Iterable<string>): string | null {
   const from = msg.from.trim().toLowerCase();
   if (!from || !from.includes('@')) return 'no-sender';
-  if (from === mailbox.trim().toLowerCase()) return 'self';
+  const selves =
+    typeof mailbox === 'string'
+      ? new Set([mailbox.trim().toLowerCase()].filter(Boolean))
+      : new Set([...mailbox].map((m) => m.trim().toLowerCase()).filter(Boolean));
+  if (selves.has(from)) return 'self';
 
   const localPart = from.split('@')[0];
   if (AUTOMATED_LOCALPARTS.test(localPart)) return 'automated-sender';

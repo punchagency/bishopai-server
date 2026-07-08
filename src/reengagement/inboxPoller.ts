@@ -1,4 +1,4 @@
-import { fetchInboxMessages, type InboundMessage } from '../integrations/outlook';
+import { fetchInboxMessages, getOutlookConnection, type InboundMessage } from '../integrations/outlook';
 import { getState, setState } from '../db/state';
 import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
@@ -28,55 +28,81 @@ export interface InboxPollResult {
 }
 
 export interface PollInboxOptions {
-  /** Injectable for tests; defaults to the real Graph fetch. */
-  fetchMessages?: (sinceIso: string | null) => Promise<InboundMessage[]>;
+  /** Injectable for tests; defaults to the real Graph fetch. `mailbox` names the inbox. */
+  fetchMessages?: (sinceIso: string | null, mailbox?: string) => Promise<InboundMessage[]>;
   /** Injectable clock for tests. */
   now?: () => Date;
+  /** Override the mailbox list (tests); defaults to every connected account. */
+  mailboxes?: string[];
 }
 
 export async function pollInbox(opts: PollInboxOptions = {}): Promise<InboxPollResult> {
   const fetchMessages = opts.fetchMessages ?? fetchInboxMessages;
   const now = opts.now ?? (() => new Date());
-  const mailbox = process.env.MS_GRAPH_SENDER ?? '';
   const empty: InboxPollResult = { checked: 0, replied: 0, newLeads: 0 };
 
-  let cursor: string | null;
-  try {
-    cursor = await getState(CURSOR_KEY);
-  } catch (err) {
-    logError('inbox.poll', 'failed to read cursor', err);
-    return empty;
-  }
-
-  // First run: start watching from now, don't crawl mailbox history.
-  if (!cursor) {
-    try {
-      await setState(CURSOR_KEY, now().toISOString());
-    } catch (err) {
-      logError('inbox.poll', 'failed to initialize cursor', err);
+  // Which mailboxes to poll, and each one's OWN cursor key. With connected OAuth
+  // accounts we read every inbox; the single-mailbox fallback keeps the original
+  // cursor key (and is the shape the injected-fetcher tests exercise).
+  let boxes: { sender: string; cursorKey: string }[];
+  if (opts.mailboxes) {
+    boxes = opts.mailboxes.map((s) => ({ sender: s, cursorKey: `${CURSOR_KEY}:${s.toLowerCase()}` }));
+  } else {
+    const conn = await getOutlookConnection().catch(() => null);
+    if (conn && conn.accounts.length > 0) {
+      boxes = conn.accounts.map((a) => ({ sender: a.sender, cursorKey: `${CURSOR_KEY}:${a.sender.toLowerCase()}` }));
+    } else {
+      boxes = [{ sender: process.env.MS_GRAPH_SENDER ?? conn?.sender ?? '', cursorKey: CURSOR_KEY }];
     }
-    return empty;
   }
 
-  let messages: InboundMessage[];
-  try {
-    messages = await fetchMessages(cursor);
-  } catch (err) {
-    logError('inbox.poll', 'failed to fetch inbox messages', err);
-    return empty;
-  }
-  if (messages.length === 0) return empty;
+  // All our own addresses back the self-loop guard (never re-ingest our sends).
+  const selves = new Set(boxes.map((b) => b.sender.toLowerCase()).filter(Boolean));
 
-  // Most recent message per sender (for the activity/intake detail); advance the
-  // cursor by max receivedDateTime, not position, so an out-of-order page can't
-  // rewind us.
+  // Fetch each mailbox against its own cursor; first run initializes without
+  // sweeping history. Collect all new mail; remember each cursor's new high-water.
+  const collected: InboundMessage[] = [];
+  const cursorUpdates: { key: string; value: string }[] = [];
+  for (const box of boxes) {
+    let cursor: string | null;
+    try {
+      cursor = await getState(box.cursorKey);
+    } catch (err) {
+      logError('inbox.poll', 'failed to read cursor', err, { mailbox: box.sender });
+      continue;
+    }
+    if (!cursor) {
+      try {
+        await setState(box.cursorKey, now().toISOString());
+      } catch (err) {
+        logError('inbox.poll', 'failed to initialize cursor', err, { mailbox: box.sender });
+      }
+      continue; // first run: start watching from now, don't crawl history
+    }
+    let messages: InboundMessage[];
+    try {
+      messages = await fetchMessages(cursor, box.sender || undefined);
+    } catch (err) {
+      logError('inbox.poll', 'failed to fetch inbox messages', err, { mailbox: box.sender });
+      continue;
+    }
+    let maxReceived = cursor;
+    for (const m of messages) {
+      collected.push(m);
+      if (m.receivedDateTime > maxReceived) maxReceived = m.receivedDateTime;
+    }
+    if (maxReceived !== cursor) cursorUpdates.push({ key: box.cursorKey, value: maxReceived });
+  }
+
+  if (collected.length === 0) return empty;
+
+  // Most recent message per sender (for the activity/intake detail), merged
+  // across all polled inboxes.
   const latestBySender = new Map<string, InboundMessage>();
-  let maxReceived = cursor;
-  for (const m of messages) {
+  for (const m of collected) {
     const key = m.from.toLowerCase();
     const prev = latestBySender.get(key);
     if (!prev || m.receivedDateTime > prev.receivedDateTime) latestBySender.set(key, m);
-    if (m.receivedDateTime > maxReceived) maxReceived = m.receivedDateTime;
   }
 
   let replied = 0;
@@ -108,7 +134,7 @@ export async function pollInbox(opts: PollInboxOptions = {}): Promise<InboxPollR
         continue;
       } else {
         // No lead, or only closed → candidate for a fresh inquiry. Guard first.
-        const reason = intakeSkipReason(msg, mailbox);
+        const reason = intakeSkipReason(msg, selves);
         if (reason) {
           logEvent('info', 'inbox.poll', 'skipped inbound (not an inquiry)', { from: email, reason });
           continue;
@@ -131,25 +157,27 @@ export async function pollInbox(opts: PollInboxOptions = {}): Promise<InboxPollR
     }
   } catch (err) {
     logError('inbox.poll', 'failed to process senders', err);
-    return { checked: messages.length, replied, newLeads };
+    return { checked: collected.length, replied, newLeads };
   }
 
-  // Advance the cursor. Re-processing on a save failure is harmless: replied
-  // leads are excluded from active-match, and intake reuses an existing active
-  // lead rather than re-welcoming.
-  try {
-    if (maxReceived !== cursor) await setState(CURSOR_KEY, maxReceived);
-  } catch (err) {
-    logError('inbox.poll', 'failed to save cursor', err);
+  // Advance each mailbox's cursor. Re-processing on a save failure is harmless:
+  // replied leads are excluded from active-match, and intake reuses an existing
+  // active lead rather than re-welcoming.
+  for (const u of cursorUpdates) {
+    try {
+      await setState(u.key, u.value);
+    } catch (err) {
+      logError('inbox.poll', 'failed to save cursor', err, { key: u.key });
+    }
   }
 
   logEvent('info', 'inbox.poll', 'inbox poll complete', {
-    checked: messages.length,
+    checked: collected.length,
     replied,
     newLeads,
-    cursor: maxReceived,
+    mailboxes: boxes.length,
   });
-  return { checked: messages.length, replied, newLeads };
+  return { checked: collected.length, replied, newLeads };
 }
 
 /** Mark one active lead replied + record the reply activity, atomically. */

@@ -1,11 +1,18 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { isDriveConfigured, driveConfig, publishDocument } from './index';
 
-afterEach(() => {
-  vi.restoreAllMocks();
+// Hermetic: these assert Drive's UNCONFIGURED (dry-run) behavior, so clear any
+// GOOGLE_* creds a developer may have in .env before each test — otherwise a
+// real .env flips isDriveConfigured() true and the dry-run assertions fail.
+function clearDriveEnv() {
   delete process.env.GOOGLE_CLIENT_ID;
   delete process.env.GOOGLE_CLIENT_SECRET;
   delete process.env.GOOGLE_REFRESH_TOKEN;
+}
+beforeEach(clearDriveEnv);
+afterEach(() => {
+  vi.restoreAllMocks();
+  clearDriveEnv();
 });
 
 describe('drive config gating', () => {

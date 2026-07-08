@@ -102,6 +102,58 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     expect(cur.rows[0].value).toBe('2026-07-06T13:50:00Z'); // max received in the batch
   });
 
+  it('polls multiple mailboxes with independent cursors and a shared self-guard', async () => {
+    const BOX1 = 'hello@innerlumehealing.com';
+    const BOX2 = 'nicole@innerlumehealing.com';
+    const c1 = `${CURSOR_KEY}:${BOX1.toLowerCase()}`;
+    const c2 = `${CURSOR_KEY}:${BOX2.toLowerCase()}`;
+    const STRANGER = 'multi-stranger-it@example.test';
+    await pool.query(`DELETE FROM integration_state WHERE key = ANY($1)`, [[c1, c2]]);
+    await pool.query(`DELETE FROM leads WHERE lower(email) = $1`, [STRANGER]);
+
+    // First run per mailbox: initialize both cursors, sweep nothing.
+    const init = await pollInbox({
+      mailboxes: [BOX1, BOX2],
+      fetchMessages: async () => [msg(STRANGER, 'old', '2000-01-01T00:00:00Z')],
+      now: () => new Date('2026-07-08T09:00:00Z'),
+    });
+    expect(init).toEqual({ checked: 0, replied: 0, newLeads: 0 });
+    for (const k of [c1, c2]) {
+      const cur = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [k]);
+      expect(cur.rows[0].value).toBe('2026-07-08T09:00:00.000Z');
+    }
+
+    // Second run: each inbox returns its own mail. A message "from" BOX2 landing
+    // in BOX1's inbox must be ignored (self-guard spans all connected mailboxes).
+    const perBox: Record<string, InboundMessage[]> = {
+      [BOX1]: [
+        msg(STRANGER, 'Do you have space?', '2026-07-08T10:00:00Z'), // → new lead
+        msg(BOX2, 'fwd', '2026-07-08T10:05:00Z'), // our own other mailbox → skipped as self
+      ],
+      [BOX2]: [msg(STRANGER, 'ping in box2', '2026-07-08T11:00:00Z')], // same person, other inbox
+    };
+    const res = await pollInbox({
+      mailboxes: [BOX1, BOX2],
+      fetchMessages: async (_since, mailbox) => perBox[mailbox ?? ''] ?? [],
+    });
+    expect(res.newLeads).toBe(1); // one lead for the stranger, not two
+    expect(res.checked).toBe(3);
+
+    const created = await pool.query(`SELECT 1 FROM leads WHERE lower(email) = lower($1)`, [STRANGER]);
+    expect(created.rowCount).toBe(1);
+    const self = await pool.query(`SELECT 1 FROM leads WHERE lower(email) = lower($1)`, [BOX2]);
+    expect(self.rowCount, 'our own mailbox must never become a lead').toBe(0);
+
+    // Cursors advanced independently to each inbox's high-water mark.
+    const cur1 = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [c1]);
+    const cur2 = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [c2]);
+    expect(cur1.rows[0].value).toBe('2026-07-08T10:05:00Z');
+    expect(cur2.rows[0].value).toBe('2026-07-08T11:00:00Z');
+
+    await pool.query(`DELETE FROM leads WHERE lower(email) = $1`, [STRANGER]);
+    await pool.query(`DELETE FROM integration_state WHERE key = ANY($1)`, [[c1, c2]]);
+  });
+
   it('is idempotent — re-delivered mail from settled leads does nothing', async () => {
     const fetchMessages = async () => [
       msg(LEAD_EMAIL, 'Re: your consult again', '2026-07-06T14:00:00Z'), // already replied → no-op

@@ -18,3 +18,7 @@ export async function setState(key: string, value: string): Promise<void> {
     [key, value],
   );
 }
+
+export async function delState(key: string): Promise<void> {
+  await pool.query(`DELETE FROM integration_state WHERE key = $1`, [key]);
+}

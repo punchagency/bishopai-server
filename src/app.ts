@@ -8,6 +8,7 @@ import { checkoutRouter } from './routes/checkout';
 import { dashboardRouter } from './routes/dashboard';
 import { consentsRouter } from './routes/consents';
 import { authRouter } from './routes/auth';
+import { outlookRouter } from './routes/outlook';
 import { requireAuth } from './auth/middleware';
 
 // Build the Express app (routes + middleware) without listening. server.ts adds
@@ -35,6 +36,9 @@ export function createApp(): express.Express {
   app.use('/health', healthRouter);
   app.use('/webhooks', webhooksRouter); // inbound webhooks carry their own secret/signature
   app.use('/auth', authRouter);
+  // Outlook connect flow — open: the OAuth handshake is driven by the system
+  // browser (no dashboard token), and the refresh token stays server-side.
+  app.use('/auth/outlook', outlookRouter);
   // The dashboard API is guarded by requireAuth — a pass-through when Nicole has
   // login turned off (default), token-gated when she turns it on in Settings.
   app.use('/review', requireAuth, reviewRouter);

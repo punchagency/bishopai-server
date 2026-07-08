@@ -1,13 +1,32 @@
 import { fetchJson } from '../http';
 import { logEvent } from '../../observability/logger';
-import { isOutlookConfigured, outlookConfig } from './config';
+import { resolveOutlookAccess } from './oauth';
 
-export { isOutlookConfigured, outlookConfig } from './config';
+export {
+  isOutlookAppConfigured,
+  isStaticOutlookConfigured,
+  graphBaseUrl,
+  outlookAppConfig,
+} from './config';
+export {
+  buildAuthorizeUrl,
+  exchangeCodeForTokens,
+  disconnectOutlook,
+  setPrimarySender,
+  getOutlookConnection,
+  getOutlookAccessToken,
+  resolveOutlookAccess,
+  resolveAllOutlookAccess,
+  _resetOutlookTokenCache,
+  type OutlookConnection,
+  type OutlookAccount,
+} from './oauth';
 
 // WF3 email sender via Microsoft Graph. Dry-run gated exactly like Drive and
-// Fullscript — until MS_GRAPH_TOKEN/SENDER are set, sends log what they would do
-// and report success, so the whole re-engagement cadence is exercisable offline
-// and flips to real sends with no wiring change.
+// Fullscript — until Outlook is connected (delegated OAuth) or a static token is
+// set, sends log what they would do and report success, so the whole
+// re-engagement cadence is exercisable offline and flips to real sends with no
+// wiring change. Token + sender are resolved by resolveOutlookAccess (oauth.ts).
 
 export interface EmailInput {
   to: string;
@@ -46,16 +65,18 @@ interface GraphMessage {
  * that as a no-op, mirroring the dry-run send path. `sinceIso` null pulls the
  * most recent page (first run / no cursor yet).
  */
-export async function fetchInboxMessages(sinceIso: string | null): Promise<InboundMessage[]> {
-  if (!isOutlookConfigured()) return [];
-  const { token, sender, baseUrl } = outlookConfig();
+/** Read a mailbox's inbox. `sender` names it (else the primary); [] if not configured. */
+export async function fetchInboxMessages(sinceIso: string | null, sender?: string): Promise<InboundMessage[]> {
+  const access = await resolveOutlookAccess(sender);
+  if (!access) return [];
+  const { token, sender: mailbox, graphBase } = access;
   const params = new URLSearchParams({
     $select: 'id,subject,from,receivedDateTime,bodyPreview,internetMessageHeaders',
     $orderby: 'receivedDateTime asc',
     $top: '50',
   });
   if (sinceIso) params.set('$filter', `receivedDateTime gt ${sinceIso}`);
-  const url = `${baseUrl}/users/${encodeURIComponent(sender)}/mailFolders/inbox/messages?${params.toString()}`;
+  const url = `${graphBase}/users/${encodeURIComponent(mailbox)}/mailFolders/inbox/messages?${params.toString()}`;
 
   const res = await fetchJson<{ value?: GraphMessage[] }>(url, {
     headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
@@ -80,14 +101,15 @@ export async function fetchInboxMessages(sinceIso: string | null): Promise<Inbou
 }
 
 export async function sendEmail(input: EmailInput): Promise<EmailResult> {
-  if (!isOutlookConfigured()) {
+  const access = await resolveOutlookAccess();
+  if (!access) {
     logEvent('info', 'outlook.send', '[dry-run] would send email', { to: input.to, subject: input.subject });
     return { ok: true, dryRun: true };
   }
 
-  const { token, sender, baseUrl } = outlookConfig();
+  const { token, sender, graphBase } = access;
   try {
-    await fetchJson(`${baseUrl}/users/${encodeURIComponent(sender)}/sendMail`, {
+    await fetchJson(`${graphBase}/users/${encodeURIComponent(sender)}/sendMail`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({
