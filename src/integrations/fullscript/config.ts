@@ -1,93 +1,26 @@
-// Fullscript connection config. Hosts/URLs are the canonical values from
-// Fullscript's integration-environments.json (production = *.fullscript.com,
-// sandbox = *.fullscript.io; api_base includes the `/api` prefix). Auth is OAuth2
-// authorization-code flow: run the one-time authorize→code→token exchange for the
-// practitioner account, put the refresh_token in FULLSCRIPT_REFRESH_TOKEN, and
-// this backend mints ~2h access tokens from it.
+// Fullscript connection model — via Practice Better, NOT a direct API.
+//
+// We cannot hold Fullscript credentials: Fullscript's Partner API is gated to
+// approved EHR/tech partners, and this client reaches Fullscript only through the
+// native Fullscript integration she enabled *inside* Practice Better. So this
+// backend holds ZERO Fullscript secrets. Everything automatable rides on the PB
+// API (`src/integrations/pb/`):
+//   - WRITE (create a recommendation): no API path exists. Nicole publishes a PB
+//     protocol containing the supplements; PB auto-creates the Fullscript plan
+//     when her PB Fullscript setting `autoCreateTreatmentPlans` is on. WF4 is
+//     therefore prepare-and-hand-off (digest → she publishes → we reconcile).
+//   - READ (plan status): a PB protocol read exposes the Fullscript plan's
+//     `externalId` + failure flags (`fullscriptTreatmentPlanCreationFailed`,
+//     `hasFailedDispensaryRecommendations`) — but NOT the plan's product
+//     contents. So "what supplements changed this session" comes from our local
+//     WF1-synced plan, never from Fullscript.
+//
+// The only Fullscript value we keep is the public dispensary storefront URL — a
+// client-facing deep-link for refill emails, not a secret.
 
-export type FullscriptRegion = 'us' | 'ca';
-export type FullscriptEnv = 'production' | 'sandbox';
+const DEFAULT_DISPENSARY_URL = 'https://us.fullscript.com/welcome/innerlume';
 
-interface EnvUrls {
-  apiBase: string; // includes /api
-  tokenUrl: string;
-  authorizeUrl: string;
-  revokeUrl: string;
-}
-
-const ENVIRONMENTS: Record<FullscriptRegion, Record<FullscriptEnv, EnvUrls>> = {
-  us: {
-    production: {
-      apiBase: 'https://api-us.fullscript.com/api',
-      tokenUrl: 'https://api-us.fullscript.com/api/oauth/token',
-      authorizeUrl: 'https://api-us.fullscript.com/api/oauth/authorize',
-      revokeUrl: 'https://api-us.fullscript.com/api/oauth/revoke',
-    },
-    sandbox: {
-      apiBase: 'https://api-us-snd.fullscript.io/api',
-      tokenUrl: 'https://api-us-snd.fullscript.io/api/oauth/token',
-      authorizeUrl: 'https://api-us-snd.fullscript.io/api/oauth/authorize',
-      revokeUrl: 'https://api-us-snd.fullscript.io/api/oauth/revoke',
-    },
-  },
-  ca: {
-    production: {
-      apiBase: 'https://api-ca.fullscript.com/api',
-      tokenUrl: 'https://api-ca.fullscript.com/api/oauth/token',
-      authorizeUrl: 'https://api-ca.fullscript.com/api/oauth/authorize',
-      revokeUrl: 'https://api-ca.fullscript.com/api/oauth/revoke',
-    },
-    sandbox: {
-      apiBase: 'https://api-ca-snd.fullscript.io/api',
-      tokenUrl: 'https://api-ca-snd.fullscript.io/api/oauth/token',
-      authorizeUrl: 'https://api-ca-snd.fullscript.io/api/oauth/authorize',
-      revokeUrl: 'https://api-ca-snd.fullscript.io/api/oauth/revoke',
-    },
-  },
-};
-
-export interface FullscriptConfig extends EnvUrls {
-  clientId: string;
-  clientSecret: string;
-  refreshToken: string;
-}
-
-function region(): FullscriptRegion {
-  return process.env.FULLSCRIPT_REGION === 'ca' ? 'ca' : 'us';
-}
-function env(): FullscriptEnv {
-  return process.env.FULLSCRIPT_ENV === 'production' ? 'production' : 'sandbox';
-}
-
-/** API base (incl. /api) for the configured region/env; override with FULLSCRIPT_API_BASE_URL. */
-export function fullscriptApiBase(): string {
-  return process.env.FULLSCRIPT_API_BASE_URL ?? ENVIRONMENTS[region()][env()].apiBase;
-}
-
-/** OAuth is fully configured when we can mint access tokens from a refresh token. */
-export function isFullscriptConfigured(): boolean {
-  return !!(
-    process.env.FULLSCRIPT_CLIENT_ID &&
-    process.env.FULLSCRIPT_CLIENT_SECRET &&
-    process.env.FULLSCRIPT_REFRESH_TOKEN
-  );
-}
-
-export function fullscriptConfig(): FullscriptConfig {
-  const clientId = process.env.FULLSCRIPT_CLIENT_ID;
-  const clientSecret = process.env.FULLSCRIPT_CLIENT_SECRET;
-  const refreshToken = process.env.FULLSCRIPT_REFRESH_TOKEN;
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error('Fullscript not configured — set FULLSCRIPT_CLIENT_ID / _SECRET / _REFRESH_TOKEN');
-  }
-  const urls = ENVIRONMENTS[region()][env()];
-  return {
-    clientId,
-    clientSecret,
-    refreshToken,
-    apiBase: fullscriptApiBase(),
-    tokenUrl: process.env.FULLSCRIPT_OAUTH_TOKEN_URL ?? urls.tokenUrl,
-    authorizeUrl: process.env.FULLSCRIPT_OAUTH_AUTHORIZE_URL ?? urls.authorizeUrl,
-    revokeUrl: urls.revokeUrl,
-  };
+/** Nicole's public Fullscript dispensary link (client-facing; not a credential). */
+export function fullscriptDispensaryUrl(): string {
+  return process.env.FULLSCRIPT_DISPENSARY_URL || DEFAULT_DISPENSARY_URL;
 }

@@ -20,6 +20,7 @@ describe.skipIf(!dbUp)('routes (integration)', () => {
   let base = '';
 
   beforeAll(async () => {
+    await pool.query('INSERT INTO auth_config (id, enabled) VALUES (true, false) ON CONFLICT DO NOTHING;');
     await updateAuthConfig({ enabled: false }); // known state: login off
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));

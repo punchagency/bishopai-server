@@ -3,8 +3,9 @@ import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { pool } from '../db/pool';
 import { logError, logEvent } from '../observability/logger';
-import { sendBulkRefillOrders, isFullscriptConfigured, type RefillOrderLine } from '../integrations/fullscript';
+import { fullscriptDispensaryUrl } from '../integrations/fullscript';
 import { computeAdherence, suggestedMonths } from '../refills/adherence';
+import { sendEmail, resolveOutlookAccess } from '../integrations/outlook';
 
 // WF4 dashboard surface: the daily refill digest (who's running low, tiered by
 // urgency) plus Nicole's actions — snooze, skip, or bulk-send the orders to
@@ -46,7 +47,9 @@ refillsRouter.get('/digest', async (_req, res) => {
       ...row,
       tier: tierFor(row.days_left),
     }));
-    res.json({ fullscript_configured: isFullscriptConfigured(), refills: items });
+    const outlookAccess = await resolveOutlookAccess().catch(() => null);
+    const isConfigured = !!outlookAccess;
+    res.json({ fullscript_configured: isConfigured, refills: items });
   } catch (err) {
     logError('refills.digest', 'digest query failed', err);
     res.status(500).json({ error: 'internal error' });
@@ -143,31 +146,53 @@ refillsRouter.post('/orders', async (req, res) => {
     );
     if (info.rowCount === 0) return res.status(404).json({ error: 'no matching refills' });
 
-    // Stage one refill_orders row per refill (status 'queued'). Track which
-    // refill each order came from so we can flip the right ones to 'notified'.
-    const lines: RefillOrderLine[] = [];
-    const orderToRefill = new Map<string, string>();
-    const monthsCache = new Map<string, number>(); // client_id → suggested bottles
-    for (const row of info.rows) {
-      const ins = await pool.query<{ id: string }>(
-        `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status)
-              VALUES ($1, $2, $3, $4, 'queued')
-           RETURNING id`,
-        [batchId, row.client_id, row.id, row.supplement_name],
-      );
-      orderToRefill.set(ins.rows[0].id, row.id);
+    // Group the refills by client email so we can send consolidated emails.
+    // For clients with no email, we fail them.
+    type GroupedClientRefills = {
+      clientId: string | null;
+      clientName: string;
+      clientEmail: string | null;
+      refills: Array<{
+        refillId: string;
+        supplementName: string;
+        dose: string | null;
+        qty: number | null;
+        months: number;
+      }>;
+    };
 
-      // Adherence bundling: proven, reliable clients default to a multi-month order.
+    const groupedByEmail = new Map<string, GroupedClientRefills>();
+    const noEmailRefills: typeof info.rows = [];
+    const monthsCache = new Map<string, number>();
+
+    for (const row of info.rows) {
+      if (!row.client_email) {
+        noEmailRefills.push(row);
+        continue;
+      }
+      const emailKey = row.client_email.trim().toLowerCase();
+      let group = groupedByEmail.get(emailKey);
+      if (!group) {
+        group = {
+          clientId: row.client_id,
+          clientName: row.client_name ?? 'Client',
+          clientEmail: row.client_email,
+          refills: [],
+        };
+        groupedByEmail.set(emailKey, group);
+      }
+
+      // Adherence bundling: default to multi-month based on adherence history.
       let months = 1;
       if (row.client_id) {
-        if (!monthsCache.has(row.client_id)) monthsCache.set(row.client_id, suggestedMonths(await computeAdherence(row.client_id)));
+        if (!monthsCache.has(row.client_id)) {
+          monthsCache.set(row.client_id, suggestedMonths(await computeAdherence(row.client_id)));
+        }
         months = monthsCache.get(row.client_id)!;
       }
 
-      lines.push({
-        orderId: ins.rows[0].id,
-        clientName: row.client_name ?? 'Unknown client',
-        clientEmail: row.client_email,
+      group.refills.push({
+        refillId: row.id,
         supplementName: row.supplement_name ?? 'supplement',
         dose: row.dose,
         qty: row.qty,
@@ -175,30 +200,97 @@ refillsRouter.post('/orders', async (req, res) => {
       });
     }
 
-    // Forward the batch as Fullscript treatment plans (dry-run until configured).
-    const results = await sendBulkRefillOrders(lines, { batchId });
+    const results: Array<{
+      refill_id: string;
+      client_name: string;
+      supplement_name: string;
+      ok: boolean;
+      error?: string;
+      invitation_url?: string;
+    }> = [];
 
-    // Persist each order's outcome + flip successfully-sent refills to 'notified'.
-    for (const r of results) {
-      if (r.ok) {
-        await pool.query(
-          `UPDATE refill_orders SET status = 'sent', fullscript_order_id = $2, invitation_url = $3, sent_at = now() WHERE id = $1`,
-          [r.orderId, r.fullscriptPlanId ?? null, r.invitationUrl ?? null],
-        );
-      } else {
-        await pool.query(`UPDATE refill_orders SET status = 'failed', error = $2 WHERE id = $1`, [
-          r.orderId,
-          r.error ?? 'unknown error',
-        ]);
+    const dispensaryUrl = fullscriptDispensaryUrl();
+
+    // 1. Process refills for clients with no email
+    for (const row of noEmailRefills) {
+      await pool.query(
+        `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status, error)
+              VALUES ($1, $2, $3, $4, 'failed', 'no client email on file')`,
+        [batchId, row.client_id, row.id, row.supplement_name],
+      );
+      results.push({
+        refill_id: row.id,
+        client_name: row.client_name ?? 'Unknown client',
+        supplement_name: row.supplement_name ?? 'supplement',
+        ok: false,
+        error: 'no client email on file',
+      });
+    }
+
+    // 2. Process grouped clients (send one consolidated email per client)
+    for (const [email, group] of groupedByEmail.entries()) {
+      const suppStrings = group.refills.map(r => {
+        const bottles = r.months && r.months > 0 ? Math.floor(r.months) : 1;
+        const bottleStr = `${bottles} bottle${bottles > 1 ? 's' : ''}`;
+        return `• ${r.supplementName} - ${r.dose ?? 'dosage not specified'} (Recommended: ${bottleStr})`;
+      }).join('\n');
+
+      const clientFirst = group.clientName.split(' ')[0] || 'there';
+      const emailBody = `Hi ${clientFirst},\n\nThis is a friendly reminder from Innerlume Healing that the following supplement(s) from your protocol are running low:\n\n${suppStrings}\n\nTo purchase your refills, please place an order via your Practice Better client portal or visit our Fullscript dispensary at:\n${dispensaryUrl}\n\nBest regards,\nNicole & the Innerlume Healing Team`;
+
+      let sendOk = false;
+      let sendError = '';
+      try {
+        const emailRes = await sendEmail({
+          to: email,
+          subject: 'Refill Reminder: Your Innerlume Supplements',
+          body: emailBody,
+        });
+        sendOk = emailRes.ok;
+        sendError = emailRes.error ?? '';
+      } catch (err) {
+        sendOk = false;
+        sendError = err instanceof Error ? err.message : String(err);
+      }
+
+      for (const r of group.refills) {
+        if (sendOk) {
+          await pool.query(
+            `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status, invitation_url, sent_at)
+                  VALUES ($1, $2, $3, $4, 'sent', $5, now())`,
+            [batchId, group.clientId, r.refillId, r.supplementName, dispensaryUrl],
+          );
+          results.push({
+            refill_id: r.refillId,
+            client_name: group.clientName,
+            supplement_name: r.supplementName,
+            ok: true,
+            invitation_url: dispensaryUrl,
+          });
+        } else {
+          await pool.query(
+            `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status, error)
+                  VALUES ($1, $2, $3, $4, 'failed', $5)`,
+            [batchId, group.clientId, r.refillId, r.supplementName, sendError || 'email delivery failed'],
+          );
+          results.push({
+            refill_id: r.refillId,
+            client_name: group.clientName,
+            supplement_name: r.supplementName,
+            ok: false,
+            error: sendError || 'email delivery failed',
+          });
+        }
       }
     }
+
     const sentRefillIds = results
       .filter((r) => r.ok)
-      .map((r) => orderToRefill.get(r.orderId))
-      .filter((v): v is string => !!v);
+      .map((r) => r.refill_id);
+
     if (sentRefillIds.length > 0) {
       await pool.query(`UPDATE refills SET status = 'notified' WHERE id = ANY($1::uuid[])`, [
-        [...new Set(sentRefillIds)],
+        sentRefillIds,
       ]);
     }
 
@@ -206,29 +298,12 @@ refillsRouter.post('/orders', async (req, res) => {
     await pool.query(
       `INSERT INTO approvals (type, payload_json, status, approved_by, approved_at)
             VALUES ('refill_bulk_send', $1, 'approved', $2, now())`,
-      [JSON.stringify({ batch_id: batchId, count: lines.length }), approved_by || 'nicole'],
+      [JSON.stringify({ batch_id: batchId, count: info.rows.length }), approved_by || 'nicole'],
     );
 
-    // Enrich each result with the refill/client/supplement it came from, so the
-    // dashboard can show per-refill outcomes (and the Fullscript plan link).
-    const metaByRefill = new Map(info.rows.map((r) => [r.id, r]));
-    const enriched = results.map((r) => {
-      const refillId = orderToRefill.get(r.orderId);
-      const meta = refillId ? metaByRefill.get(refillId) : undefined;
-      return {
-        refill_id: refillId ?? null,
-        client_name: meta?.client_name ?? null,
-        supplement_name: meta?.supplement_name ?? null,
-        ok: r.ok,
-        error: r.error ?? null,
-        invitation_url: r.invitationUrl ?? null,
-        fullscript_plan_id: r.fullscriptPlanId ?? null,
-      };
-    });
-
     const ok = results.filter((r) => r.ok).length;
-    logEvent('info', 'refills.orders', 'bulk refill send', { batch_id: batchId, count: lines.length, ok });
-    return res.json({ batch_id: batchId, sent: ok, failed: results.length - ok, results: enriched });
+    logEvent('info', 'refills.orders', 'bulk refill send via email', { batch_id: batchId, count: info.rows.length, ok });
+    return res.json({ batch_id: batchId, sent: ok, failed: results.length - ok, results });
   } catch (err) {
     logError('refills.orders', 'bulk send failed', err, { batch_id: batchId });
     return res.status(500).json({ error: 'internal error' });

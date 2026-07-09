@@ -8,11 +8,11 @@ import { listProtocols } from '../integrations/pb/reads';
 // Dry-run (no-op + log) until PB_CLIENT_ID/PB_CLIENT_SECRET are set — same
 // pattern as every other integration gate in this codebase.
 //
-// PbProtocol doesn't expose supplement line-items in the list endpoint (the
-// beta API is still expanding); for now we sync the protocol metadata and
-// record the supplement names from the protocol name field as a best-effort
-// seed. The full supplement detail will be wired once the beta confirms the
-// shape of nested supplement data.
+// The protocol schema carries `supplementRecommendations[]` (name + dosages), so
+// real supplement seeding is possible — but confirm the LIST endpoint returns
+// them (vs. only the single-protocol detail GET) and the opaque `supplement`
+// object's name field against live data before wiring per-line upserts. For now
+// we sync the protocol metadata by client.
 
 export interface SyncResult {
   dryRun?: boolean;
@@ -37,15 +37,12 @@ export async function syncProtocolsFromPb(): Promise<SyncResult> {
 
   if (protocols.length === 0) return { protocols: 0, upserted: 0 };
 
-  // For each protocol, find the matching client by pb_id embedded in the
-  // protocol's clientRecord (shape TBD from live data — tolerant lookup).
+  // For each protocol, find the matching client by the PB record id embedded in
+  // the protocol's clientRecord (confirmed shape).
   let upserted = 0;
   for (const proto of protocols) {
     try {
-      const pbClientId = (proto as unknown as Record<string, unknown>).clientRecord
-        ? ((proto as unknown as Record<string, unknown>).clientRecord as Record<string, unknown>)?.id
-        : null;
-
+      const pbClientId = proto.clientRecord?.id;
       if (!pbClientId) continue;
 
       const clientRes = await pool.query<{ id: string }>(

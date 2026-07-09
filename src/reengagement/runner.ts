@@ -51,11 +51,13 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
     }
     if (action.kind === 'send') {
       if (!row.email) return 'skipped';
-      await sendEmail({ to: row.email, subject: action.subject, body: action.body });
+      // Inject available booking slots into emails that reference scheduling.
+      const body = await appendSlotSuggestions(action.body, row.id);
+      await sendEmail({ to: row.email, subject: action.subject, body });
       await pool.query(
         `INSERT INTO messages (lead_id, channel, body, sent_at, status)
               VALUES ($1, 'email', $2, now(), 'sent')`,
-        [row.id, `${action.subject}\n\n${action.body}`],
+        [row.id, `${action.subject}\n\n${body}`],
       );
       // Advance sequence state + status, and stamp last_touch. Fixed-track
       // leads (cancelled/maintenance) keep their status so they stay on that
@@ -121,4 +123,38 @@ export async function runReengagementForLead(leadId: string, now: Date = new Dat
   );
   if (rows.length === 0) return 'none';
   return processLead(rows[0], now);
+}
+
+// ---------------------------------------------------------------------------
+// Slot injection — appends available booking suggestions to re-engagement
+// emails whose body references scheduling keywords. Best-effort: on any
+// failure the original body is returned unchanged so the send still goes out.
+// ---------------------------------------------------------------------------
+
+const BOOKING_KEYWORDS = /\b(book|reschedule|find a time|schedule|appointment|session|visit|consult)\b/i;
+
+async function appendSlotSuggestions(body: string, leadId: string): Promise<string> {
+  if (!BOOKING_KEYWORDS.test(body)) return body;
+  try {
+    // Import helpers lazily to avoid circular dep at module load time.
+    const { fetchUpcoming, deriveAvailableSlots, loadOfficeHours } = await import('../routes/appointments');
+    const oh = await (loadOfficeHours as () => Promise<import('../routes/appointments').OfficeHours>)();
+    const booked = await fetchUpcoming(oh);
+    const slots = deriveAvailableSlots(booked, oh);
+    if (slots.length === 0) return body;
+
+    const { signBookingToken } = await import('./bookingToken');
+    const baseUrl = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
+    const slotLines = slots.map((s) => {
+      const token = signBookingToken(leadId, s.starts_at);
+      const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+      const bookUrl = `${baseUrl}/webhooks/appointments/book?leadId=${leadId}&slot=${encodeURIComponent(s.starts_at)}${tokenParam}`;
+      return `  • ${s.label} — Confirm & book: ${bookUrl}`;
+    }).join('\n');
+
+    return `${body}\n\nSome available times that work for me:\n${slotLines}\n\nClick one of the links above to confirm your booking, or reply with your preferred slot and I'll get you booked in!`;
+  } catch (err) {
+    logError('reengagement.slots', 'slot injection failed — sending without slots', err);
+    return body;
+  }
 }

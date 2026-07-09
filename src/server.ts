@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { pool } from './db/pool';
 import { createApp } from './app';
 import { startScheduler, stopScheduler } from './scheduler';
+import { checkFullscriptPbReadiness } from './integrations/pb';
 import { shutdownLogger, logError } from './observability/logger';
 
 const app = createApp();
@@ -9,6 +10,11 @@ const port = Number(process.env.PORT ?? 3000);
 const server = app.listen(port, () => {
   console.log(`bishopAI backend listening on :${port}`);
   startScheduler(); // WF3/WF4 cadences (opt-in via SCHEDULER_ENABLED)
+  // Fire-and-forget: warn if Nicole's Fullscript-in-PB levers would silently
+  // break WF4 hand-offs. Never blocks startup; no-op until PB is configured.
+  void checkFullscriptPbReadiness().catch((err) =>
+    logError('server.startup', 'Fullscript readiness check failed', err),
+  );
 });
 
 // A listen failure (e.g. EADDRINUSE) emits an 'error' event; without a handler

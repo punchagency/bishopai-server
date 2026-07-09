@@ -4,5 +4,7 @@
 export { isPbConfigured, pbConfig } from './config';
 export { pbRequest, resetPbToken } from './client';
 export * from './reads';
+export * from './dispensary';
+export * from './readiness';
 export * from './webhooks';
 export type * from './types';

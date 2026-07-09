@@ -2,11 +2,9 @@ import { describe, it, expect, afterEach, afterAll } from 'vitest';
 import { pool } from '../src/db/pool';
 import { recordCheckoutOutcome } from '../src/checkout/docWriteback';
 import { renderAppointmentSheet } from '../src/session/render';
-import { fetchSessionSupplementChanges } from '../src/integrations/fullscript';
-import type { FullscriptClient } from '../src/integrations/fullscript';
 
 // WF2 doc write-backs: billing stamped on the internal sheet, protocol supplements
-// refreshed from the plan; plus the Fullscript session-change read wrapper.
+// refreshed from the plan.
 
 describe('renderAppointmentSheet billing (pure)', () => {
   const note = { concerns: [], assessments: [], protocol_changes: [], supplements: [], follow_ups: [] };
@@ -62,50 +60,5 @@ suite('recordCheckoutOutcome (integration)', () => {
     const proto = (await pool.query(`SELECT content_json FROM protocols WHERE appointment_id = $1`, [appt])).rows[0].content_json;
     expect(proto.supplements.map((s: { name: string }) => s.name).sort()).toEqual(['Magnesium', 'Zinc']);
     expect(proto.supplements.find((s: { name: string }) => s.name === 'Magnesium')).toMatchObject({ dose: '2 caps', quantity: 60, change: 'continue' });
-  });
-});
-
-describe('fetchSessionSupplementChanges', () => {
-  const saved = { ...process.env };
-  afterEach(() => {
-    process.env = { ...saved };
-  });
-
-  const fake = (over: Partial<FullscriptClient> = {}): FullscriptClient => ({
-    async findPatientByEmail() {
-      return 'pat-1';
-    },
-    async createPatient() {
-      return 'pat-1';
-    },
-    async findVariantId() {
-      return null;
-    },
-    async createTreatmentPlan() {
-      return { planId: 'tp' };
-    },
-    async listRecentSupplements() {
-      return ['Magnesium', 'Omega-3'];
-    },
-    ...over,
-  });
-
-  it('returns null when Fullscript is not configured', async () => {
-    delete process.env.FULLSCRIPT_CLIENT_ID;
-    expect(await fetchSessionSupplementChanges('a@x.com', new Date().toISOString(), { client: fake() })).toBeNull();
-  });
-
-  it('returns the recent supplement names when configured', async () => {
-    process.env.FULLSCRIPT_CLIENT_ID = 'c';
-    process.env.FULLSCRIPT_CLIENT_SECRET = 's';
-    process.env.FULLSCRIPT_REFRESH_TOKEN = 'r';
-    expect(await fetchSessionSupplementChanges('a@x.com', new Date().toISOString(), { client: fake() })).toEqual(['Magnesium', 'Omega-3']);
-  });
-
-  it('returns null when the patient is not found', async () => {
-    process.env.FULLSCRIPT_CLIENT_ID = 'c';
-    process.env.FULLSCRIPT_CLIENT_SECRET = 's';
-    process.env.FULLSCRIPT_REFRESH_TOKEN = 'r';
-    expect(await fetchSessionSupplementChanges('a@x.com', new Date().toISOString(), { client: fake({ async findPatientByEmail() { return null; } }) })).toBeNull();
   });
 });

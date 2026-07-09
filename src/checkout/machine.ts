@@ -9,7 +9,6 @@ import {
   type CardDetails,
   type Invoice,
 } from '../integrations/quickbooks';
-import { fetchSessionSupplementChanges, isFullscriptConfigured } from '../integrations/fullscript';
 import { publishApproved } from '../session/publish';
 import { enqueueReconciliation, reconcileCheckout } from './reconcile';
 import { resolveQboCustomerId } from './customerMap';
@@ -105,25 +104,6 @@ async function trySummaryFromQbo(
   }
 }
 
-/** Live Fullscript read of the session's supplement changes, or null to fall
- *  back to the local plan. Best-effort — a Fullscript error never blocks checkout. */
-async function tryFullscriptChanges(appointmentId: string): Promise<string[] | null> {
-  if (!isFullscriptConfigured()) return null;
-  const r = await pool.query<{ email: string | null; starts_at: string | null }>(
-    `SELECT c.email, a.starts_at FROM appointments a LEFT JOIN clients c ON c.id = a.client_id WHERE a.id = $1`,
-    [appointmentId],
-  );
-  const email = r.rows[0]?.email;
-  const startsAt = r.rows[0]?.starts_at;
-  if (!email || !startsAt) return null;
-  try {
-    return await fetchSessionSupplementChanges(email, new Date(startsAt).toISOString());
-  } catch (err) {
-    logError('checkout.summary', 'Fullscript session-change read failed; using local plan', err, { appointment_id: appointmentId });
-    return null;
-  }
-}
-
 /**
  * Assemble the frozen summary Nicole approves (not a live re-pull at charge
  * time). Prefer the client's real QuickBooks invoice (line items + authoritative
@@ -141,9 +121,12 @@ export async function assembleSummary(appointmentId: string): Promise<CheckoutSu
   const supps = clientId
     ? (await pool.query<{ name: string }>(`SELECT name FROM supplements WHERE client_id = $1 ORDER BY name`, [clientId])).rows
     : [];
-  // Prefer a live Fullscript read of what changed THIS session; fall back to the
-  // local plan (supplements table) when Fullscript isn't configured / no patient.
-  const fullscript_changes = (await tryFullscriptChanges(appointmentId)) ?? supps.map((s) => s.name);
+  // The client's current plan (supplements table), synced from the approved
+  // Protocol in WF1. This is the authoritative source: Fullscript is reached only
+  // through PB, and PB does not expose a plan's product contents (only its
+  // externalId + failure flags) — so there is no live "what changed this session"
+  // read to prefer over the local plan.
+  const fullscript_changes = supps.map((s) => s.name);
 
   // Prefer the real QuickBooks invoice.
   const fromQbo = await trySummaryFromQbo(clientId, fullscript_changes);
