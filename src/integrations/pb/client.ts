@@ -22,15 +22,18 @@ async function getAccessToken(): Promise<string> {
   if (cached && cached.expiresAt > Date.now() + 30_000) return cached.token;
 
   const { clientId, clientSecret, tokenUrl } = pbConfig();
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
   const res = await fetchJson<TokenResponse>(tokenUrl, {
     method: 'POST',
     headers: {
-      authorization: `Basic ${basic}`,
       'content-type': 'application/x-www-form-urlencoded',
       accept: 'application/json',
     },
-    body: new URLSearchParams({ grant_type: 'client_credentials', scope: 'read write' }).toString(),
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
+      scope: 'read write',
+    }).toString(),
   });
 
   const ttlMs = (res.expires_in ?? 3600) * 1000;

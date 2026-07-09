@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type RequestHandler } from 'express';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { pool } from '../db/pool';
@@ -6,7 +6,7 @@ import { isPbConfigured } from '../integrations/pb/config';
 import { verifyBookingToken } from '../reengagement/bookingToken';
 import { ingestConversation } from '../conversations/ingest';
 import { processConversation } from '../session/process';
-import { logError, logEvent } from '../observability/logger';
+import { logError, logEvent, logWarn } from '../observability/logger';
 import { requireWebhookSecret, requirePbSignature } from './webhookAuth';
 import { classifyPbEvent, appointmentStatusFor } from '../integrations/pb/events';
 import { detectCheckout } from '../checkout/machine';
@@ -182,23 +182,80 @@ webhooksRouter.post('/bee/conversation', requireWebhookSecret('BEE_WEBHOOK_SECRE
 // lead is greeted "within minutes" rather than on the next hourly cadence tick.
 // Nicole is never the first touchpoint. Shared-secret guarded like the others.
 // ---------------------------------------------------------------------------
+// In-memory rate limiting store
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+
+function rateLimiter(limit: number, windowMs: number): RequestHandler {
+  return (req, res, next) => {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const entry = rateLimitStore.get(ip);
+
+    if (!entry || now > entry.resetAt) {
+      rateLimitStore.set(ip, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+
+    if (entry.count >= limit) {
+      logWarn('webhook.rate_limit', 'rejected: rate limit exceeded', { ip, path: req.originalUrl });
+      return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+    }
+
+    entry.count++;
+    next();
+  };
+}
+
+function restrictToAllowedOrigin(): RequestHandler {
+  const allowed = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim().toLowerCase())
+    : [];
+
+  return (req, res, next) => {
+    // If ALLOWED_ORIGINS is empty or unset, skip checks (dev/testing mode)
+    if (allowed.length === 0) {
+      return next();
+    }
+
+    const origin = (req.get('origin') || '').toLowerCase();
+    const referer = (req.get('referer') || '').toLowerCase();
+
+    const isOriginAllowed = origin && allowed.some((a) => origin.includes(a));
+    const isRefererAllowed = referer && allowed.some((a) => referer.includes(a));
+
+    if (!isOriginAllowed && !isRefererAllowed) {
+      logWarn('webhook.origin', 'rejected: unauthorized origin/referer', {
+        origin,
+        referer,
+        path: req.originalUrl,
+      });
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    next();
+  };
+}
+
 // Site-behavior analytics ingest (WF3): page views / form opens / submits from
-// the website into lead_activity, attributed to a lead by email when known.
+// the website into lead_activity, attributed to a lead by lead_id or email when known.
 const analyticsSchema = z.object({
-  email: z.string().email().optional(),
+  email: z.string().email().max(200).optional(),
+  lead_id: z.string().uuid().optional(),
   type: z.enum(SITE_EVENT_TYPES),
   path: z.string().max(500).optional(),
-  detail: z.string().max(1000).optional(),
-  occurred_at: z.string().optional(),
+  detail: z.string().max(2000).optional(),
+  occurred_at: z.string().max(100).optional(),
 });
 
-webhooksRouter.post('/analytics', requireWebhookSecret('ANALYTICS_WEBHOOK_SECRET'), async (req, res) => {
+webhooksRouter.post('/analytics', restrictToAllowedOrigin(), rateLimiter(100, 15 * 60_000), async (req, res) => {
   const parsed = analyticsSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'invalid payload' });
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
+  }
   const d = parsed.data;
   try {
     const { activityId, leadId } = await ingestSiteEvent({
       email: d.email ?? null,
+      leadId: d.lead_id ?? null,
       type: d.type,
       path: d.path ?? null,
       detail: d.detail ?? null,
@@ -212,14 +269,14 @@ webhooksRouter.post('/analytics', requireWebhookSecret('ANALYTICS_WEBHOOK_SECRET
 });
 
 const leadSchema = z.object({
-  email: z.string().email(),
-  name: z.string().optional(),
-  source: z.string().optional(), // 'website' | 'outlook' | ...
-  path: z.string().optional(), // e.g. '/book-a-consult'
-  message: z.string().optional(),
+  email: z.string().email().max(200),
+  name: z.string().max(200).optional(),
+  source: z.string().max(50).optional(), // 'website' | 'outlook' | ...
+  path: z.string().max(500).optional(), // e.g. '/book-a-consult'
+  message: z.string().max(2000).optional(),
 });
 
-webhooksRouter.post('/lead', requireWebhookSecret('LEAD_WEBHOOK_SECRET'), async (req, res) => {
+webhooksRouter.post('/lead', restrictToAllowedOrigin(), rateLimiter(5, 15 * 60_000), async (req, res) => {
   const parsed = leadSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });

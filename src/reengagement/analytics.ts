@@ -12,6 +12,7 @@ export type SiteEventType = (typeof SITE_EVENT_TYPES)[number];
 
 export interface SiteEvent {
   email?: string | null;
+  leadId?: string | null;
   type: SiteEventType;
   path?: string | null;
   detail?: string | null;
@@ -20,7 +21,9 @@ export interface SiteEvent {
 
 export async function ingestSiteEvent(e: SiteEvent): Promise<{ activityId: string; leadId: string | null }> {
   let leadId: string | null = null;
-  if (e.email) {
+  if (e.leadId) {
+    leadId = e.leadId;
+  } else if (e.email) {
     const r = await pool.query<{ id: string }>(
       `SELECT id FROM leads WHERE lower(email) = lower($1) ORDER BY created_at DESC LIMIT 1`,
       [e.email],
