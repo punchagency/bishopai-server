@@ -8,6 +8,30 @@ import { pbConfig } from './config';
 // NOTE: the exact token-request encoding is confirmed once we have beta access.
 // We send client credentials via HTTP Basic + a form body (the common
 // client-credentials shape); adjust here if PB expects them elsewhere.
+//
+// Rate limit (confirmed with PB): 5 req/s sustained, burst 20, 10,000/day quota.
+// Every caller (Schedule's live fetch, the sessions/protocols pollers, booking)
+// shares one token bucket here so a coincidental pile-up across call sites can
+// never itself trigger a 429 — `fetchJson` still retries on 429 as a backstop
+// for the daily quota / anything outside our own throttling.
+const RATE_PER_SEC = 5;
+const BURST = 20;
+let tokens = BURST;
+let lastRefill = Date.now();
+
+async function takeRateLimitToken(): Promise<void> {
+  for (;;) {
+    const now = Date.now();
+    tokens = Math.min(BURST, tokens + ((now - lastRefill) / 1000) * RATE_PER_SEC);
+    lastRefill = now;
+    if (tokens >= 1) {
+      tokens -= 1;
+      return;
+    }
+    const waitMs = ((1 - tokens) / RATE_PER_SEC) * 1000;
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+}
 
 interface TokenResponse {
   access_token: string;
@@ -45,6 +69,7 @@ async function getAccessToken(): Promise<string> {
 export async function pbRequest<T>(path: string, init: HttpOptions = {}): Promise<T> {
   const { baseUrl } = pbConfig();
   const token = await getAccessToken();
+  await takeRateLimitToken();
   return fetchJson<T>(new URL(path, baseUrl).toString(), {
     ...init,
     headers: {
@@ -58,4 +83,10 @@ export async function pbRequest<T>(path: string, init: HttpOptions = {}): Promis
 /** Test seam: drop the cached token (e.g. after a 401). */
 export function resetPbToken(): void {
   cached = null;
+}
+
+/** Test seam: refill the rate-limit bucket to full burst capacity. */
+export function resetPbRateLimit(): void {
+  tokens = BURST;
+  lastRefill = Date.now();
 }

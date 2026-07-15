@@ -2,6 +2,14 @@
 // confirmed against live responses at integration time; these cover what the
 // pipeline reads today.
 
+/** Best-effort display name from a clientRecord — flat `name`, else `profile.firstName/lastName`. */
+export function clientRecordName(r?: { name?: string; profile?: { firstName?: string; lastName?: string } }): string | undefined {
+  if (!r) return undefined;
+  if (r.name) return r.name;
+  const full = [r.profile?.firstName, r.profile?.lastName].filter(Boolean).join(' ').trim();
+  return full || undefined;
+}
+
 export interface PbList<T> {
   count?: number;
   hasMore?: boolean;
@@ -18,7 +26,7 @@ export interface PbSession {
   clientConfirmationStatus?: string;
   paymentStatus?: string;
   fee?: { amount?: number; currency?: string };
-  clientRecord?: { id?: string; name?: string };
+  clientRecord?: { id?: string; name?: string; profile?: { firstName?: string; lastName?: string } };
   serviceType?: string;   // 'face' | 'phone' | 'virtual'
   serviceId?: string;     // required for createSession
   upcoming?: boolean;     // response field only (NOT a query param)

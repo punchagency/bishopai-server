@@ -4,7 +4,9 @@ import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
 import { isPbConfigured } from '../integrations/pb/config';
 import { listSessions } from '../integrations/pb/reads';
+import { clientRecordName } from '../integrations/pb/types';
 import type { PbSession } from '../integrations/pb/types';
+import { buildBrief } from '../brief/service';
 
 // ---------------------------------------------------------------------------
 // Schedule / Appointments route
@@ -165,7 +167,7 @@ export async function fetchUpcoming(oh: OfficeHours): Promise<UpcomingSession[]>
         .map((s): UpcomingSession => ({
           id: s.id,
           pb_id: s.id,
-          client_name: s.clientRecord?.name ?? null,
+          client_name: clientRecordName(s.clientRecord) ?? null,
           starts_at: s.sessionDate!,
           // Prefer PB's true end time; fall back to start + duration.
           ends_at: s.endDate ?? addMinutes(s.sessionDate!, s.duration ?? oh.session_duration_min),
@@ -418,3 +420,18 @@ appointmentsRouter.get('/services', async (_req, res) => {
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// GET /appointments/:id/brief — the pre-session prep brief.
+// ---------------------------------------------------------------------------
+appointmentsRouter.get('/:id/brief', async (req, res) => {
+  // No uuid check: the id may be a PB session id, which is what the Schedule view
+  // holds for PB-sourced appointments. buildBrief resolves either.
+  try {
+    const brief = await buildBrief(req.params.id);
+    return brief ? res.json(brief) : res.status(404).json({ error: 'not found' });
+  } catch (err) {
+    logError('appointments.brief', 'brief failed', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
+  }
+});

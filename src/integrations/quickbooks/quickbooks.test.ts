@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { chargeCard, interpretChargeResponse } from './index';
+import { chargeCard, interpretChargeResponse, toRequestId } from './index';
 import { normalizeInvoice } from './invoice';
 
 // Pure-logic unit tests (no network/DB): the dry-run gate, the status-aware
@@ -81,5 +81,30 @@ describe('normalizeInvoice', () => {
     });
     // Summing the kept lines must not include the subtotal row.
     expect(inv.lines.reduce((s, l) => s + l.amountCents, 0)).toBe(28775);
+  });
+});
+
+describe('toRequestId', () => {
+  // Intuit rejects a request-id over 50 chars with PMT-4000. Our real keys are 52
+  // and 58 chars, so this is not hypothetical — before the fix, every live charge
+  // failed. Dry-run never caught it because dry-run never sends the header.
+  const CHECKOUT_KEY = `checkout:${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}:charge`;
+
+  it('folds an over-long key under Intuit\'s 50-char cap', () => {
+    expect(CHECKOUT_KEY.length).toBeGreaterThan(50);
+    expect(toRequestId(CHECKOUT_KEY).length).toBeLessThanOrEqual(50);
+    expect(toRequestId(`${CHECKOUT_KEY}:token`).length).toBeLessThanOrEqual(50);
+  });
+
+  it('is deterministic — a retry must reuse the same id or it double-charges', () => {
+    expect(toRequestId(CHECKOUT_KEY)).toBe(toRequestId(CHECKOUT_KEY));
+  });
+
+  it('keeps the charge and tokenize ids distinct', () => {
+    expect(toRequestId(CHECKOUT_KEY)).not.toBe(toRequestId(`${CHECKOUT_KEY}:token`));
+  });
+
+  it('passes a short key through untouched, so ids stay readable when they fit', () => {
+    expect(toRequestId('short-key')).toBe('short-key');
   });
 });

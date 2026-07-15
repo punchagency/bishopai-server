@@ -1,6 +1,7 @@
 import { logEvent, logError } from '../../observability/logger';
 import { isPbConfigured } from './config';
 import { listProtocols } from './reads';
+import { clientRecordName } from './types';
 import type { PbProtocol } from './types';
 
 // Fullscript dispensary reconcile — the replacement for a Fullscript webhook.
@@ -13,15 +14,6 @@ import type { PbProtocol } from './types';
 // notification, we poll protocols and surface the failures.
 
 export type DispensaryStatus = 'created' | 'failed' | 'none';
-
-/** Best-effort display name from a protocol's client record (flat name or profile). */
-function clientRecordName(p: PbProtocol): string | undefined {
-  const r = p.clientRecord;
-  if (!r) return undefined;
-  if (r.name) return r.name;
-  const full = [r.profile?.firstName, r.profile?.lastName].filter(Boolean).join(' ').trim();
-  return full || undefined;
-}
 
 /**
  * Classify a protocol's Fullscript push outcome. Pure — exported for tests.
@@ -98,7 +90,7 @@ export async function reconcileDispensaryPushes(
         continue;
       }
       result.failed++;
-      const clientName = clientRecordName(p);
+      const clientName = clientRecordName(p.clientRecord);
       result.failures.push({ protocolId: p.id, protocolName: p.name, clientName });
       logEvent('warn', 'pb.dispensary', 'Fullscript push failed for protocol — needs re-publish', {
         protocol_id: p.id,

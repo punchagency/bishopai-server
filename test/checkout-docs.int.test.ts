@@ -33,7 +33,13 @@ const suite = dbUp ? describe : describe.skip;
 suite('recordCheckoutOutcome (integration)', () => {
   const clientIds: string[] = [];
   afterEach(async () => {
-    for (const id of clientIds.splice(0)) await pool.query(`DELETE FROM clients WHERE id = $1`, [id]);
+    for (const id of clientIds.splice(0)) {
+      // appointments.client_id is ON DELETE SET NULL, so dropping the client alone
+      // would strand its appointments as orphans that show up as "(unknown)" in the
+      // cockpit. Delete them first — appointment_sheets cascade off the appointment.
+      await pool.query(`DELETE FROM appointments WHERE client_id = $1`, [id]);
+      await pool.query(`DELETE FROM clients WHERE id = $1`, [id]);
+    }
   });
   afterAll(async () => {
     await pool.end();

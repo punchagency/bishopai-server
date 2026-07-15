@@ -2,8 +2,13 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { fetchJson, HttpError } from './http';
 import { isPbConfigured, pbConfig } from './pb/config';
 
-function res(status: number, body: string): Response {
-  return { ok: status >= 200 && status < 300, status, text: () => Promise.resolve(body) } as unknown as Response;
+function res(status: number, body: string, headers: Record<string, string> = {}): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: () => Promise.resolve(body),
+    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
+  } as unknown as Response;
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -28,6 +33,35 @@ describe('fetchJson', () => {
       .mockResolvedValueOnce(res(200, '{"ok":1}'));
     vi.stubGlobal('fetch', fetchMock);
     await expect(fetchJson('https://x/y', { retries: 2 })).resolves.toEqual({ ok: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries 429 (rate limited) then succeeds', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(res(429, 'slow down'))
+      .mockResolvedValueOnce(res(200, '{"ok":1}'));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchJson('https://x/y', { retries: 2 })).resolves.toEqual({ ok: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('honors Retry-After on 429 instead of guessing a backoff', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(res(429, 'slow down', { 'retry-after': '0' }))
+      .mockResolvedValueOnce(res(200, '{"ok":1}'));
+    vi.stubGlobal('fetch', fetchMock);
+    const start = Date.now();
+    await expect(fetchJson('https://x/y', { retries: 2 })).resolves.toEqual({ ok: 1 });
+    // Retry-After: 0 should resolve near-instantly, not wait out the exp backoff floor.
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it('throws HttpError on 429 once retries are exhausted', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(res(429, 'slow down', { 'retry-after': '0' }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchJson('https://x/y', { retries: 1 })).rejects.toBeInstanceOf(HttpError);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

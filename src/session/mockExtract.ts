@@ -35,8 +35,61 @@ const SUPPLEMENTS: SupplementCue[] = [
   { match: /\bashwagandha|adaptogen\b/, name: 'Ashwagandha', dose: '1 cap twice daily' },
 ];
 
+// NRT findings + the lifestyle log are spoken aloud in a real session, so the mock
+// pulls them out of the transcript when the cue is there and leaves them null when
+// it isn't — same contract as the LLM path (never invent a clinical value).
+// Captured against the ORIGINAL transcript (case-insensitively), not a lowercased
+// copy: these strings land verbatim in Nicole's documents, so their casing matters.
+// Every field cue, so a capture can be told to stop when the next one begins —
+// otherwise "BM is daily, sleep is 7 hours" hands BM the whole rest of the clause.
+const CUES = String.raw`bm|bowel movements?|sleep(?:ing)?|water|cycle|exercise|diet|pulse|priority|k[\s-]?27|stressors?|foundation|body[\s-]?scan`;
+
+/**
+ * Match `<label> <is|was|shows|:> <value>`, capturing lazily up to a sentence end or
+ * the next field cue. The connector is mandatory: without it "trouble sleeping and
+ * low energy" would hand SLEEP the value "and low energy".
+ */
+function field(label: string, connectors = 'is|was|are|were|shows?|reads?'): RegExp {
+  // The next cue may be introduced conversationally — "…, and her diet is …" — so the
+  // terminator tolerates a leading conjunction/possessive before the cue word.
+  const nextCue = String.raw`[,;]?\s*(?:and\s+)?(?:her|his|their|the)?\s*(?:${CUES})\b\s*(?:${connectors}|:)`;
+  return new RegExp(
+    String.raw`\b(?:${label})\s*(?:\s(?:${connectors})\s|\s*:\s*)\s*(.{1,80}?)` +
+      String.raw`(?=\s*${nextCue}|[.;\n]|$)`,
+    'i',
+  );
+}
+
+const capture = (raw: string, re: RegExp): string | null => {
+  const m = raw.match(re);
+  return m?.[1]?.trim().replace(/[,\s]+$/, '') || null;
+};
+
+function mockNrt(raw: string): SessionNote['nrt'] {
+  return {
+    pulse0: capture(raw, field(String.raw`pulse\s*0?`)),
+    priority1: capture(raw, field(String.raw`priority\s*#?\s*1`)),
+    k27: capture(raw, field(String.raw`k[\s-]?27`)),
+    stressors: capture(raw, field(String.raw`stressors?`)),
+    foundation: capture(raw, field(String.raw`foundations?(?:\s+testing)?`)),
+    body_scan: capture(raw, field(String.raw`body[\s-]?scan`)),
+  };
+}
+
+function mockLifestyle(raw: string): SessionNote['lifestyle'] {
+  return {
+    bm: capture(raw, field(String.raw`bowel movements?|bm`)),
+    sleep: capture(raw, field(String.raw`sleep`)),
+    water: capture(raw, field(String.raw`water(?:\s+intake)?`)),
+    cycle: capture(raw, field(String.raw`(?:menstrual\s+)?cycle`)),
+    exercise: capture(raw, field(String.raw`exercise`)),
+    diet: capture(raw, field(String.raw`diet`)),
+  };
+}
+
 export function mockExtractSessionNote(transcript: string): SessionNote {
-  const t = (transcript || '').toLowerCase();
+  const raw = transcript || '';
+  const t = raw.toLowerCase(); // cue matching only; captured values come from `raw`
 
   const concerns: string[] = [];
   const assessments: string[] = [];
@@ -46,6 +99,10 @@ export function mockExtractSessionNote(transcript: string): SessionNote {
       assessments.push(s.assessment);
     }
   }
+
+  const goals: string[] = [];
+  const goalMatch = raw.match(/(?:goal is|goal:|wants? to|hoping to|would like to)\s+([^.;\n]{3,60})/i);
+  if (goalMatch) goals.push(goalMatch[1].trim());
 
   const starting = /\b(start|begin|add|introduce|let'?s try|put you on)\b/.test(t);
   const supplements: SessionNote['supplements'] = [];
@@ -61,15 +118,29 @@ export function mockExtractSessionNote(transcript: string): SessionNote {
     }
   }
 
-  const follow_ups: string[] = [];
+  // Follow-ups become real, dated tasks on approval, so a due date is only set when
+  // a timeframe was actually spoken. There is deliberately no default: an unstated
+  // recheck interval must not become a task with an invented date.
+  const follow_ups: SessionNote['follow_ups'] = [];
   const weeks = t.match(/(\d+)\s*weeks?/);
-  if (weeks) follow_ups.push(`Recheck in ${weeks[1]} weeks`);
-  else if (/recheck|follow[\s-]?up|next (visit|session|appointment)/.test(t)) follow_ups.push('Schedule a follow-up');
-  if (follow_ups.length === 0) follow_ups.push('Recheck in 4 weeks');
+  const months = t.match(/(\d+)\s*months?/);
+  if (weeks) follow_ups.push({ text: `Recheck in ${weeks[1]} weeks`, due_in_days: Number(weeks[1]) * 7 });
+  else if (months) follow_ups.push({ text: `Recheck in ${months[1]} months`, due_in_days: Number(months[1]) * 30 });
+  else if (/recheck|follow[\s-]?up|next (visit|session|appointment)/.test(t))
+    follow_ups.push({ text: 'Schedule a follow-up', due_in_days: null });
 
   // Guarantee a non-empty note even for a sparse transcript.
   if (concerns.length === 0) concerns.push('General wellness check-in');
   if (assessments.length === 0) assessments.push('Stable — maintain current plan');
 
-  return { concerns, assessments, protocol_changes, supplements, follow_ups };
+  return {
+    concerns,
+    goals,
+    assessments,
+    protocol_changes,
+    supplements,
+    follow_ups,
+    nrt: mockNrt(raw),
+    lifestyle: mockLifestyle(raw),
+  };
 }

@@ -1,9 +1,38 @@
 import { logEvent } from '../../observability/logger';
+import type { FlowSheetEntry } from '../docs/types';
 import { driveConfig, isDriveConfigured } from './config';
-import { findOrCreateFolder, upsertDoc } from './files';
+import {
+  findOrCreateFolder,
+  upsertDoc,
+  uploadBinary,
+  resolveDocFolder,
+  ensureConvertedSheet,
+  type DocType,
+} from './files';
+import { appendFlowSheetEntry, type AppendResult } from './sheets';
+import { demoDir, writeDemoBinary, appendDemoFlowSheet } from './demoSink';
+
+// Presentation mode: setting DEMO_OUTPUT_DIR forces every publish onto the local
+// demo path (dry-run + emit real files locally) regardless of whether Google
+// creds are present — so a live demo produces openable docs reliably, without
+// depending on internet, valid tokens, or the newer Sheets scope. Unset it to
+// write to real Drive.
+export const isDemoMode = (): boolean => demoDir() !== null;
+const demoMode = isDemoMode;
 
 export { isDriveConfigured, driveConfig } from './config';
-export { findOrCreateFolder, upsertDoc } from './files';
+export {
+  findOrCreateFolder,
+  upsertDoc,
+  uploadBinary,
+  resolveDocFolder,
+  ensureConvertedSheet,
+  DOCX_MIME,
+  XLSX_MIME,
+  SHEET_MIME,
+  type DocType,
+} from './files';
+export { appendFlowSheetEntry } from './sheets';
 
 export interface PublishInput {
   /** Client folder name (used only when no stable folder id is known yet). */
@@ -32,7 +61,7 @@ export interface PublishResult {
  * the moment credentials land — no wiring change.
  */
 export async function publishDocument(input: PublishInput): Promise<PublishResult> {
-  if (!isDriveConfigured()) {
+  if (!isDriveConfigured() || demoMode()) {
     logEvent('info', 'drive.publish', '[dry-run] would write document to Drive', {
       folder: input.clientName,
       title: input.title,
@@ -51,4 +80,123 @@ export async function publishDocument(input: PublishInput): Promise<PublishResul
     fileId: id,
   });
   return { fileId: id, updated, folderId };
+}
+
+export interface BinaryDocInput {
+  clientName: string;
+  /** Stable client folder id, if stored — preferred over name matching. */
+  driveFolderId?: string | null;
+  docType: DocType;
+  /** File name to write (Supplement Protocols carry a date; the ROF is fixed). */
+  fileName: string;
+  bytes: Buffer;
+  mimeType: string;
+  /** Overwrite a same-named file vs always create a new one (dated Supplement). */
+  update?: boolean;
+  /** Leave an existing same-named file untouched (fill-once intake ROF). */
+  skipIfExists?: boolean;
+}
+
+export interface BinaryDocResult {
+  dryRun?: boolean;
+  fileId?: string;
+  updated?: boolean;
+  /** A fill-once doc that already existed and was left as-is. */
+  skipped?: boolean;
+  /** The doc-type subfolder id the file landed in. */
+  folderId?: string;
+  /** The client folder id — persist it per client for next time. */
+  clientFolderId?: string;
+}
+
+/**
+ * Write a rendered binary doc (docx/xlsx) into `<Client>/<DocType>/`, preserving
+ * the file as-is. Same dry-run contract as `publishDocument`.
+ */
+export async function publishBinaryDoc(input: BinaryDocInput): Promise<BinaryDocResult> {
+  if (!isDriveConfigured() || demoMode()) {
+    let demoPath: string | undefined;
+    if (demoDir()) {
+      try {
+        demoPath = writeDemoBinary(input.clientName, input.docType, input.fileName, input.bytes);
+      } catch (err) {
+        logEvent('warn', 'drive.publishBinary', 'demo artifact write failed', { error: String(err) });
+      }
+    }
+    logEvent('info', 'drive.publishBinary', demoPath ? 'wrote demo binary doc' : '[dry-run] would write a binary doc to Drive', {
+      client: input.clientName,
+      docType: input.docType,
+      fileName: input.fileName,
+      bytes: input.bytes.length,
+      demoPath,
+    });
+    return { dryRun: true };
+  }
+
+  const { clientFolderId, folderId } = await resolveDocFolder(input.clientName, input.docType, {
+    clientFolderId: input.driveFolderId,
+    rootFolderId: driveConfig().rootFolderId,
+  });
+  const { id, updated, skipped } = await uploadBinary(folderId, input.fileName, input.bytes, input.mimeType, {
+    update: input.update,
+    skipIfExists: input.skipIfExists,
+  });
+  logEvent(
+    'info',
+    'drive.publishBinary',
+    skipped
+      ? 'binary doc already exists — left as-is'
+      : updated
+        ? 'updated binary doc in Drive'
+        : 'wrote binary doc to Drive',
+    { client: input.clientName, docType: input.docType, fileName: input.fileName, fileId: id },
+  );
+  return { fileId: id, updated, skipped, folderId, clientFolderId };
+}
+
+export interface FlowSheetInput {
+  /** Client name, for logging only. */
+  clientName: string;
+  /** Google Sheet id of the client's Appointment Flow Sheet. */
+  spreadsheetId: string;
+  entry: FlowSheetEntry;
+}
+
+export interface FlowSheetPublishResult extends Partial<AppendResult> {
+  dryRun?: boolean;
+}
+
+/**
+ * Append a session block to the client's Flow Sheet (native Google Sheet). Same
+ * dry-run contract as `publishDocument`: with no Google creds it logs the intended
+ * write and returns `{ dryRun: true }`, so the post-session path is exercisable
+ * offline and flips to real Sheets writes the moment credentials land.
+ */
+export async function publishFlowSheet(input: FlowSheetInput): Promise<FlowSheetPublishResult> {
+  if (!isDriveConfigured() || demoMode()) {
+    let demoPath: string | undefined;
+    if (demoDir()) {
+      try {
+        demoPath = await appendDemoFlowSheet(input.clientName, input.entry);
+      } catch (err) {
+        logEvent('warn', 'drive.flowsheet', 'demo Flow Sheet write failed', { error: String(err) });
+      }
+    }
+    logEvent('info', 'drive.flowsheet', demoPath ? 'appended demo Flow Sheet block' : '[dry-run] would append a Flow Sheet block', {
+      client: input.clientName,
+      spreadsheetId: input.spreadsheetId,
+      date: input.entry.date,
+      demoPath,
+    });
+    return { dryRun: true };
+  }
+
+  const res = await appendFlowSheetEntry(input.spreadsheetId, input.entry);
+  logEvent('info', 'drive.flowsheet', 'appended Flow Sheet block', {
+    client: input.clientName,
+    spreadsheetId: input.spreadsheetId,
+    block: res.blockIndex,
+    headerRow: res.headerRow,
+  });
+  return res;
 }

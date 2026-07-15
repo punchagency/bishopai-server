@@ -10,6 +10,8 @@ import { llmConfig } from '../llm/config';
 import { ingestConversation } from '../conversations/ingest';
 import { processConversation } from '../session/process';
 import { projectRefills } from '../refills/project';
+import { createTasksFromNote } from '../tasks/service';
+import type { SessionNote } from '../session/extract';
 import { detectCheckout, approveAndCharge } from '../checkout/machine';
 import { enrollMaintenanceClients } from '../reengagement/maintenance';
 import { enrollFirstAppointmentClients } from '../reengagement/firstAppointment';
@@ -27,6 +29,10 @@ interface SeedClient {
   transcript: string;
   // appointment offset (ms from now); negative = past (gets a note), positive = upcoming.
   appointmentOffset: number;
+  // A booked return visit. This is what the prep brief briefs *for* — without a
+  // next appointment there is nothing to prepare, and the Schedule has no card to
+  // open. Set on the clients whose past session is worth reading back.
+  returnOffset?: number;
   supplements: { name: string; dose: string; qty: number | null; startOffset: number }[];
 }
 
@@ -35,8 +41,16 @@ const CLIENTS: SeedClient[] = [
     name: 'Seed Maya Chen',
     email: 'maya.chen@example.com',
     appointmentOffset: -2 * DAY,
+    returnOffset: 2 * DAY,
     transcript:
       "Maya's been having trouble sleeping and low energy for weeks. We talked through her stress at work. " +
+      'She wants to get through the afternoon without crashing. ' +
+      'Pulse 0 is 78, thready. K-27 was switched, corrected on the rub. ' +
+      'Priority #1 is an immune stressor in the upper GI. Stressors are immune challenge and food, mainly dairy. ' +
+      'Foundation testing shows HTA positive with the CNS switched; dental is clear. ' +
+      'Body scan shows matrix at the liver and cell at the adrenal. ' +
+      'Her BM is every other day and sluggish, sleep is 5 to 6 hours waking around 3am, water is about 40oz a day, ' +
+      'cycle is regular at 28 days, exercise is walking twice a week, and her diet is high sugar with coffee on an empty stomach. ' +
       "Let's start magnesium glycinate at night and add a B-complex in the morning. Recheck in 4 weeks.",
     supplements: [
       { name: 'Magnesium glycinate', dose: '2 caps nightly', qty: 60, startOffset: -25 * DAY },
@@ -47,8 +61,16 @@ const CLIENTS: SeedClient[] = [
     name: 'Seed David Osei',
     email: 'david.osei@example.com',
     appointmentOffset: -5 * DAY,
+    returnOffset: 4 * DAY,
     transcript:
-      "David reports bloating and digestive discomfort after meals, plus some joint aches. " +
+      'David reports bloating and digestive discomfort after meals, plus some joint aches. ' +
+      'He wants to eat a full meal without discomfort. ' +
+      'Pulse 0 reads 68, steady. K-27 is holding this time. ' +
+      'Priority #1 is a food stressor at the small intestine. Stressors are food, mainly gluten. ' +
+      'Foundation shows HTA clear and the CNS holding. ' +
+      'Body scan shows matrix at the gallbladder, ectoderm clear. ' +
+      'BM is daily but loose, sleep is a solid 7 hours, water is around 80oz, exercise is lifting three times a week, ' +
+      'and his diet is mostly clean with late dinners. ' +
       "We'll continue his omega-3 and introduce a probiotic. Follow-up in 6 weeks.",
     supplements: [
       { name: 'Omega-3', dose: '2 softgels daily', qty: 60, startOffset: -50 * DAY },
@@ -59,8 +81,17 @@ const CLIENTS: SeedClient[] = [
     name: 'Seed Lena Petrov',
     email: 'lena.petrov@example.com',
     appointmentOffset: -1 * DAY,
+    // Her return visit is the payoff: the brief for it lists exactly what the short
+    // session never covered (Priority #1, K-27, body scan, BM, cycle, exercise).
+    returnOffset: 1 * DAY,
+    // Deliberately partial: no body scan, no cycle, no K-27 — a short session where
+    // Nicole didn't get to everything. Those cells must come out BLANK, never guessed.
     transcript:
-      "Lena's main concern is anxiety and feeling overwhelmed. Sleep is also disrupted. " +
+      "Lena's main concern is anxiety and feeling overwhelmed. Sleep is disrupted, about 4 hours a night. " +
+      'She would like to feel calm enough to focus at work. ' +
+      'Pulse 0 is 84 and jumpy. Stressors are chemical, likely her new cleaning products. ' +
+      'Foundation shows the CNS switched. We ran short on time so no body scan today. ' +
+      'Water is barely 30oz a day and her diet is skipping meals under stress. ' +
       "Let's begin ashwagandha twice daily and keep the vitamin D going. Recheck in 8 weeks.",
     supplements: [
       { name: 'Ashwagandha', dose: '1 cap twice daily', qty: 60, startOffset: -3 * DAY },
@@ -126,6 +157,14 @@ async function main(): Promise<void> {
       [clientId, `seed-appt-${clientId}`, iso(apptStart), iso(apptEnd), apptStart < 0 ? 'completed' : 'confirmed'],
     );
 
+    // The booked return visit — what the prep brief is prepared for.
+    if (c.returnOffset !== undefined) {
+      await pool.query(
+        `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status) VALUES ($1,$2,$3,$4,'confirmed')`,
+        [clientId, `seed-appt-return-${clientId}`, iso(c.returnOffset), iso(c.returnOffset + 60 * 60 * 1000)],
+      );
+    }
+
     // Supplements (drive refill projection).
     for (const s of c.supplements) {
       await pool.query(
@@ -148,6 +187,34 @@ async function main(): Promise<void> {
         await processConversation(conversationId);
       }
     }
+  }
+
+  // David's last session is already signed off, so his return visit has a populated
+  // prep brief the moment the app opens — a brief only reads from APPROVED notes, and
+  // without this every brief would be empty until someone clicks Approve. Maya and Lena
+  // stay in the review queue: they're the two the demo actually approves.
+  const david = await pool.query<{
+    sheet_id: string;
+    client_id: string;
+    appointment_id: string;
+    starts_at: string;
+    content_json: SessionNote;
+  }>(
+    `SELECT s.id AS sheet_id, s.client_id, s.appointment_id, a.starts_at, s.content_json
+       FROM appointment_sheets s
+       JOIN clients c ON c.id = s.client_id
+       JOIN appointments a ON a.id = s.appointment_id
+      WHERE c.name = 'Seed David Osei'`,
+  );
+  if (david.rowCount) {
+    const d = david.rows[0];
+    await pool.query(`UPDATE appointment_sheets SET status = 'approved' WHERE id = $1`, [d.sheet_id]);
+    await createTasksFromNote(pool, {
+      clientId: d.client_id,
+      appointmentId: d.appointment_id,
+      sessionDate: new Date(d.starts_at),
+      note: d.content_json,
+    });
   }
 
   // Give the quiet client a second, older completed session so it reads as an

@@ -1,4 +1,5 @@
 import { type SessionNote, SessionNoteSchema } from './extract';
+import { followUpTexts } from './followups';
 
 // Shared templating (build plan §7): the same SessionNote renders into an
 // internal Appointment Sheet and a client-facing Protocol. Pure and
@@ -47,7 +48,7 @@ export function coerceSessionNote(raw: unknown): SessionNote {
     assessments: arr<string>(r.assessments),
     protocol_changes: arr<SessionNote['protocol_changes'][number]>(r.protocol_changes),
     supplements: arr<SessionNote['supplements'][number]>(r.supplements),
-    follow_ups: arr<string>(r.follow_ups),
+    follow_ups: arr<SessionNote['follow_ups'][number]>(r.follow_ups),
   };
 }
 
@@ -88,7 +89,7 @@ export function renderAppointmentSheet(note: SessionNote, ctx: RenderContext): s
     supplements,
     '',
     '## Follow-ups',
-    bullets(note.follow_ups),
+    bullets(followUpTexts(note.follow_ups)),
     '',
     '## Billing',
     ctx.billing ? renderBilling(ctx.billing) : '_Not checked out._',
@@ -125,7 +126,7 @@ export function renderProtocol(note: SessionNote, ctx: RenderContext): string {
     changes,
     '',
     '## Next Steps',
-    bullets(note.follow_ups),
+    bullets(followUpTexts(note.follow_ups)),
     '',
   ].join('\n');
 }

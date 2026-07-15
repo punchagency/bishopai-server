@@ -10,7 +10,11 @@ import { spawn } from 'node:child_process';
 
 const PORT = Number(process.env.GOOGLE_AUTH_PORT ?? 4571);
 const REDIRECT = `http://localhost:${PORT}/oauth2callback`;
-const SCOPE = process.env.GOOGLE_AUTH_SCOPE ?? 'https://www.googleapis.com/auth/drive.file';
+// drive.file: create/open the client's Drive docs. spreadsheets: append blocks to
+// the native Appointment Flow Sheet via the Sheets API. Both granted in one consent.
+const SCOPE =
+  process.env.GOOGLE_AUTH_SCOPE ??
+  'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/spreadsheets';
 const clientId = process.env.GOOGLE_CLIENT_ID;
 const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 

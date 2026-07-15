@@ -37,6 +37,8 @@ describe.skipIf(!dbUp)('checkout approve — card capture (integration)', () => 
   let base = '';
   const created: string[] = [];
 
+  // These tests assert the DRY-RUN charge path. test/setup.ts blanks the QB_* env so
+  // the suite can never reach Intuit, whatever a developer holds in .env.
   beforeAll(async () => {
     await updateAuthConfig({ enabled: false });
     server = http.createServer(createApp());

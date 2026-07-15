@@ -2,19 +2,22 @@
   "name": "bishopai-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Innerlume Healing automation backend — correlation engine + checkout state machine",
+  "description": "Innerlume Healing automation backend \u2014 correlation engine + checkout state machine",
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "demo:server": "DEMO_OUTPUT_DIR=./demo-output tsx watch src/server.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "migrate": "tsx src/db/migrate.ts",
     "migrate:prod": "node dist/db/migrate.js",
     "seed": "tsx src/db/seed.ts",
+    "demo:templates": "tsx scripts/demo-templates.mts",
     "google-auth": "node scripts/google-auth.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "qb-auth": "node scripts/qb-auth.mjs"
   },
   "engines": {
     "node": ">=20"
@@ -22,10 +25,13 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.109.0",
     "@google/genai": "^2.10.0",
+    "docxtemplater": "^3.69.0",
     "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "node-cron": "^3.0.3",
     "pg": "^8.12.0",
+    "pizzip": "^3.2.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

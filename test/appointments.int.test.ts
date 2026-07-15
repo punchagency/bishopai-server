@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { pool } from '../src/db/pool';
 import { deriveAvailableSlots, isSlotOfferable, type OfficeHours, type UpcomingSession } from '../src/routes/appointments';
 
@@ -252,7 +252,40 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
 
   describe('Public Booking Endpoints', () => {
     const testLeadId = 'c0000000-0000-0000-0000-000000000001';
-    const testSlot = '2026-07-13T10:00:00.000Z';
+
+    /**
+     * Derived, never pinned. This was a literal ISO date, which passed until the day
+     * that date fell into the past — then every booking test started failing on a
+     * correct 409 (the slot guard refuses to book history). Compute the next weekday
+     * at 10:00 UTC, which sits inside the default 09:00–17:00 Europe/London hours.
+     */
+    const nextWeekdaySlot = (): string => {
+      const d = new Date();
+      d.setUTCDate(d.getUTCDate() + 1);
+      d.setUTCHours(10, 0, 0, 0);
+      while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() + 1);
+      return d.toISOString();
+    };
+    const testSlot = nextWeekdaySlot();
+
+    /**
+     * Booking a lead provisions a client + an appointment. Both must go, and the
+     * appointment must go FIRST: appointments.client_id is ON DELETE SET NULL, so
+     * deleting the client on its own strands the appointment as an orphan that the
+     * cockpit renders as an "(unknown)" session. Matching on client_id (rather than a
+     * pb_id prefix) also catches appointments whose id pattern we don't control.
+     */
+    const clearBookingFixtures = async (): Promise<void> => {
+      await pool.query(
+        `DELETE FROM appointments
+          WHERE pb_id LIKE 'pb-session-%'
+             OR pb_id LIKE 'dry-session-%'
+             OR client_id IN (SELECT id FROM clients WHERE email = 'test-lead@example.com')`,
+      );
+      await pool.query(`DELETE FROM lead_activity WHERE lead_id = $1`, [testLeadId]);
+      await pool.query(`DELETE FROM leads WHERE id = $1`, [testLeadId]);
+      await pool.query(`DELETE FROM clients WHERE email = 'test-lead@example.com'`);
+    };
 
     beforeEach(async () => {
       mockListSessions.mockReset().mockResolvedValue({ items: [] });
@@ -260,12 +293,13 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
       mockListServices.mockReset();
       mockCreateSession.mockReset();
 
-      // Clear existing appointments/leads/activities for test clean-state
-      await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'pb-session-%' OR pb_id LIKE 'dry-session-%'`);
-      await pool.query(`DELETE FROM lead_activity WHERE lead_id = $1`, [testLeadId]);
-      await pool.query(`DELETE FROM leads WHERE id = $1`, [testLeadId]);
-      await pool.query(`DELETE FROM clients WHERE email = 'test-lead@example.com'`);
+      await clearBookingFixtures();
     });
+
+    // Also AFTER the last test: a beforeEach-only cleanup always leaves the final
+    // run's fixtures behind, which is how the stray 'Lead Inquiry' client and its
+    // "(unknown)" session kept reappearing in the cockpit.
+    afterAll(clearBookingFixtures);
 
     it('GET /webhooks/appointments/book returns 400 for non-existent lead', async () => {
       const res = await fetch(`${base}/webhooks/appointments/book?leadId=${testLeadId}&slot=${testSlot}`);

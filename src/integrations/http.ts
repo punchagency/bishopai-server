@@ -19,7 +19,7 @@ export interface HttpOptions {
   body?: string;
   /** Abort after this many ms (default 15s). */
   timeoutMs?: number;
-  /** Retries on network error / timeout / 5xx (default 2). */
+  /** Retries on network error / timeout / 429 / 5xx (default 2). */
   retries?: number;
 }
 
@@ -35,10 +35,11 @@ export async function fetchJson<T>(url: string, opts: HttpOptions = {}): Promise
       const res = await fetch(url, { method, headers, body, signal: ctrl.signal });
       const text = await res.text();
       if (!res.ok) {
-        // Retry transient server errors; surface 4xx immediately.
-        if (res.status >= 500 && attempt < retries) {
+        // Retry transient errors — server 5xx, and 429 (rate limit). Surface
+        // other 4xx immediately, they won't resolve by retrying.
+        if ((res.status >= 500 || res.status === 429) && attempt < retries) {
           lastErr = new HttpError(res.status, `${method} ${url} → ${res.status}`, text);
-          await backoff(attempt);
+          await (res.status === 429 ? retryAfterDelay(res, attempt) : backoff(attempt));
           continue;
         }
         throw new HttpError(res.status, `${method} ${url} → ${res.status}: ${text.slice(0, 300)}`, text);
@@ -59,7 +60,7 @@ export async function fetchJson<T>(url: string, opts: HttpOptions = {}): Promise
 }
 
 function isRetryable(err: unknown): boolean {
-  if (err instanceof HttpError) return err.status >= 500;
+  if (err instanceof HttpError) return err.status >= 500 || err.status === 429;
   // AbortError (timeout) and network errors (TypeError from fetch) are retryable.
   return err instanceof Error && (err.name === 'AbortError' || err.name === 'TypeError');
 }
@@ -67,4 +68,15 @@ function isRetryable(err: unknown): boolean {
 function backoff(attempt: number): Promise<void> {
   const ms = Math.min(1000 * 2 ** attempt, 8000) + Math.random() * 250; // exp + jitter
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** On 429, prefer the server's own `Retry-After` (seconds or HTTP-date) over guessing. */
+function retryAfterDelay(res: Response, attempt: number): Promise<void> {
+  const header = res.headers.get('retry-after');
+  if (header) {
+    const seconds = Number(header);
+    const ms = Number.isFinite(seconds) ? seconds * 1000 : new Date(header).getTime() - Date.now();
+    if (Number.isFinite(ms)) return new Promise((r) => setTimeout(r, Math.min(Math.max(ms, 0), 30_000)));
+  }
+  return backoff(attempt);
 }

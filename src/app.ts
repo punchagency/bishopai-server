@@ -10,6 +10,7 @@ import { consentsRouter } from './routes/consents';
 import { authRouter } from './routes/auth';
 import { outlookRouter } from './routes/outlook';
 import { appointmentsRouter } from './routes/appointments';
+import { tasksRouter } from './routes/tasks';
 import { requireAuth } from './auth/middleware';
 
 // Build the Express app (routes + middleware) without listening. server.ts adds
@@ -49,6 +50,7 @@ export function createApp(): express.Express {
   app.use('/dashboard', requireAuth, dashboardRouter);
   app.use('/consents', requireAuth, consentsRouter);
   app.use('/appointments', requireAuth, appointmentsRouter);
+  app.use('/tasks', requireAuth, tasksRouter);
 
   return app;
 }

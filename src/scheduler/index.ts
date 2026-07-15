@@ -9,6 +9,8 @@ import { inboxPollerJob } from './jobs/inboxPoller';
 import { reconcileJob } from './jobs/reconcile';
 import { refillRemindersJob } from './jobs/refillReminders';
 import { bookingReconcileJob } from './jobs/bookingReconcile';
+import { morningBriefJob } from './jobs/morningBrief';
+import { sessionsPollJob } from './jobs/sessionsPoll';
 
 // In-process scheduler for the WF3/WF4 cadences (§14). Opt-in via
 // SCHEDULER_ENABLED=true so dev/tests don't run background jobs. Each tick is
@@ -22,6 +24,8 @@ const jobs: Job[] = [
   reconcileJob,
   refillRemindersJob,
   bookingReconcileJob,
+  morningBriefJob,
+  sessionsPollJob,
 ];
 let tasks: ScheduledTask[] = [];
 

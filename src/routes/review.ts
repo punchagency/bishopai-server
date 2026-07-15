@@ -5,7 +5,9 @@ import { logError, logEvent } from '../observability/logger';
 import { coerceSessionNote, renderAppointmentSheet, renderProtocol } from '../session/render';
 import { processConversation } from '../session/process';
 import { publishApproved } from '../session/publish';
+import { publishClientTemplates } from '../session/publishTemplates';
 import { syncClientSupplements } from '../session/supplements';
+import { createTasksFromNote } from '../tasks/service';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
 // session extraction, with edit + approve. (No auth yet — approved_by is a
@@ -201,14 +203,22 @@ function approveOne(table: Table, approvalType: string) {
     const db = await pool.connect();
     try {
       await db.query('BEGIN');
+      // Capture the prior status atomically so we can tell a genuine first
+      // approval from a re-approval — the Flow Sheet append + dated Supplement
+      // are NOT idempotent, so they must fire only on the transition.
       const r = await db.query(
-        `UPDATE ${table} SET status = 'approved' WHERE id = $1 RETURNING *`,
+        `WITH prev AS (SELECT status AS old_status FROM ${table} WHERE id = $1 FOR UPDATE)
+         UPDATE ${table} t SET status = 'approved'
+           FROM prev WHERE t.id = $1
+         RETURNING t.*, prev.old_status`,
         [req.params.id],
       );
       if (r.rowCount === 0) {
         await db.query('ROLLBACK');
         return res.status(404).json({ error: 'not found' });
       }
+      const firstApproval = r.rows[0].old_status !== 'approved';
+      delete r.rows[0].old_status; // internal — don't leak into the response
       // Audit the approval through the shared approvals table (§7).
       await db.query(
         `INSERT INTO approvals (type, payload_json, status, approved_by, approved_at)
@@ -232,12 +242,41 @@ function approveOne(table: Table, approvalType: string) {
           ...sync,
         });
       }
+      // The note's follow-ups become tracked tasks. Both the sheet and the protocol
+      // carry the same follow_ups and either may be approved first, so this runs for
+      // both and leans on the unique index to dedupe rather than picking a winner.
+      if (r.rows[0].client_id) {
+        const appt = await db.query<{ starts_at: string | null }>(
+          `SELECT starts_at FROM appointments WHERE id = $1`,
+          [r.rows[0].appointment_id],
+        );
+        const { created } = await createTasksFromNote(db, {
+          clientId: r.rows[0].client_id,
+          appointmentId: r.rows[0].appointment_id ?? null,
+          sessionDate: appt.rows[0]?.starts_at ? new Date(appt.rows[0].starts_at) : new Date(),
+          note: coerceSessionNote(r.rows[0].content_json),
+        });
+        if (created > 0) {
+          logEvent('info', 'review.tasks', 'created tasks from approved follow-ups', {
+            id: req.params.id,
+            created,
+          });
+        }
+      }
       await db.query('COMMIT');
       // WF1 final step: render + write to the client's Drive folder, off the
       // request path (best-effort; dry-run until Google OAuth is configured).
       void publishApproved(table, req.params.id).catch((err) =>
         logError(`review.${table}_publish`, 'Drive publish failed', err, { id: req.params.id }),
       );
+      // Client-facing deliverables in Nicole's own templates (ROF/Supplement/Flow
+      // Sheet) fire on the FIRST Protocol approval only — re-approval must not
+      // append a second Flow Sheet block or a duplicate dated Supplement.
+      if (table === 'protocols' && firstApproval) {
+        void publishClientTemplates(req.params.id).catch((err) =>
+          logError('review.protocol_templates', 'template publish failed', err, { id: req.params.id }),
+        );
+      }
       return res.json(r.rows[0]);
     } catch (err) {
       await db.query('ROLLBACK');

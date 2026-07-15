@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { fetchJson } from '../http';
 import { logEvent } from '../../observability/logger';
 import { isQuickbooksConfigured, quickbooksConfig } from './config';
@@ -55,6 +56,19 @@ export interface ChargeResult {
 // with an id, so we MUST inspect status rather than trust the HTTP code.
 const CAPTURABLE = new Set(['CAPTURED', 'AUTHORIZED', 'SETTLED']);
 
+// Intuit caps request-id at 50 characters and rejects anything longer with
+// PMT-4000. Our natural key — `checkout:{uuid}:charge` — is 52, and the tokenize
+// variant is 58, so BOTH would have failed every live charge. Fold anything over
+// the limit into a hash, which must stay deterministic: replaying the same logical
+// operation has to produce the same request-id, since that is the entire mechanism
+// stopping a retry from charging twice.
+const MAX_REQUEST_ID = 50;
+
+export function toRequestId(key: string): string {
+  if (key.length <= MAX_REQUEST_ID) return key;
+  return createHash('sha256').update(key).digest('hex').slice(0, MAX_REQUEST_ID);
+}
+
 async function paymentsHeaders(requestId?: string): Promise<Record<string, string>> {
   const token = await getQuickbooksAccessToken();
   const h: Record<string, string> = {
@@ -62,7 +76,7 @@ async function paymentsHeaders(requestId?: string): Promise<Record<string, strin
     'content-type': 'application/json',
     accept: 'application/json',
   };
-  if (requestId) h['request-id'] = requestId;
+  if (requestId) h['request-id'] = toRequestId(requestId);
   return h;
 }
 

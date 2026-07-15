@@ -42,6 +42,19 @@ export function createClientRecord(payload: {
 }
 
 /**
+ * A single client record — "records" is PB's name for clients (confirmed in
+ * swagger). The session/protocol embeds only carry `id`/`name`; email lives
+ * here, so anything that needs it (cancelled-cadence enrollment) fetches it
+ * on demand rather than eagerly on every session sync.
+ */
+export function getClientRecord(id: string): Promise<{
+  id: string;
+  profile?: { firstName?: string; lastName?: string; emailAddress?: string };
+}> {
+  return pbRequest(`/consultant/records/${id}`);
+}
+
+/**
  * Protocols + Fullscript plan linkage — WF4 refill intelligence.
  * Query params (from swagger): `records[]` (client record ids — the client
  * filter), `consultants[]`, `limit` (1–100), `after_id`/`before_id` (cursors).
