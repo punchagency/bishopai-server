@@ -10,7 +10,7 @@ import {
   type DocType,
 } from './files';
 import { appendFlowSheetEntry, type AppendResult } from './sheets';
-import { demoDir, writeDemoBinary, appendDemoFlowSheet } from './demoSink';
+import { demoDir, writeDemoBinary, appendDemoFlowSheet, writeDemoMarkdown } from './demoSink';
 
 // Presentation mode: setting DEMO_OUTPUT_DIR forces every publish onto the local
 // demo path (dry-run + emit real files locally) regardless of whether Google
@@ -62,10 +62,19 @@ export interface PublishResult {
  */
 export async function publishDocument(input: PublishInput): Promise<PublishResult> {
   if (!isDriveConfigured() || demoMode()) {
-    logEvent('info', 'drive.publish', '[dry-run] would write document to Drive', {
+    let demoPath: string | undefined;
+    if (demoDir()) {
+      try {
+        demoPath = writeDemoMarkdown(input.clientName, input.title, input.markdown);
+      } catch (err) {
+        logEvent('warn', 'drive.publish', 'demo markdown write failed', { error: String(err) });
+      }
+    }
+    logEvent('info', 'drive.publish', demoPath ? 'wrote demo document' : '[dry-run] would write document to Drive', {
       folder: input.clientName,
       title: input.title,
       bytes: input.markdown.length,
+      demoPath,
     });
     return { dryRun: true };
   }
@@ -81,6 +90,7 @@ export async function publishDocument(input: PublishInput): Promise<PublishResul
   });
   return { fileId: id, updated, folderId };
 }
+
 
 export interface BinaryDocInput {
   clientName: string;

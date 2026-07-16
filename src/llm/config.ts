@@ -1,7 +1,7 @@
 import 'dotenv/config';
 
 export type Effort = 'low' | 'medium' | 'high' | 'max';
-export type Provider = 'google' | 'anthropic' | 'mock';
+export type Provider = 'google' | 'anthropic' | 'groq' | 'mock';
 
 // Central LLM config. Provider is swappable via LLM_PROVIDER; the transcript →
 // SessionNote task is schema-constrained extraction, so the default is the
@@ -20,6 +20,7 @@ export type Provider = 'google' | 'anthropic' | 'mock';
 function resolveProvider(): Provider {
   const explicit = process.env.LLM_PROVIDER as Provider | undefined;
   if (explicit) return explicit;
+  if (process.env.GROQ_API_KEY) return 'groq';
   if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) return 'google';
   if (process.env.ANTHROPIC_API_KEY) return 'anthropic';
   return 'mock';
@@ -29,9 +30,13 @@ export const llmConfig = {
   provider: resolveProvider(),
   maxTokens: Number(process.env.LLM_MAX_TOKENS ?? process.env.ANTHROPIC_MAX_TOKENS ?? 4096),
 
+  groq: {
+    apiKey: process.env.GROQ_API_KEY ?? '',
+    model: process.env.GROQ_MODEL ?? 'openai/gpt-oss-120b',
+  },
   google: {
     apiKey: process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY ?? '',
-    model: process.env.GEMINI_MODEL ?? 'gemini-2.5-flash-lite',
+    model: process.env.GEMINI_MODEL ?? 'gemini-2.0-flash',
   },
   anthropic: {
     apiKey: process.env.ANTHROPIC_API_KEY ?? '',

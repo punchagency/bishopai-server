@@ -2,7 +2,7 @@
   "name": "bishopai-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Innerlume Healing automation backend \u2014 correlation engine + checkout state machine",
+  "description": "Innerlume Healing automation backend — correlation engine + checkout state machine",
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -29,6 +29,7 @@
     "dotenv": "^16.4.5",
     "exceljs": "^4.4.0",
     "express": "^4.19.2",
+    "groq-sdk": "^1.3.0",
     "node-cron": "^3.0.3",
     "pg": "^8.12.0",
     "pizzip": "^3.2.0",

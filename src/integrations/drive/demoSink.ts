@@ -35,6 +35,15 @@ export function writeDemoBinary(clientName: string, docType: string, fileName: s
   return path;
 }
 
+/** Write a rendered markdown doc under `<demoDir>/<Client>/<fileName>.md`. */
+export function writeDemoMarkdown(clientName: string, fileName: string, markdown: string): string {
+  const dir = join(demoDir()!, safe(clientName));
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${safe(fileName)}.md`);
+  writeFileSync(path, markdown, 'utf8');
+  return path;
+}
+
 /**
  * Append a Flow Sheet block into a local xlsx (mirrors the Sheets-API append, but
  * to a file). Loads the client's accumulated demo sheet if present, else the blank

@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import { GoogleGenAI } from '@google/genai';
+import Groq from 'groq-sdk';
 import type { z } from 'zod';
 import { llmConfig } from './config';
 
@@ -22,6 +23,8 @@ export function generateStructured(req: StructuredRequest): Promise<unknown> {
       return anthropicExtract(req);
     case 'google':
       return googleExtract(req);
+    case 'groq':
+      return groqExtract(req);
     default:
       throw new Error(`unknown LLM_PROVIDER: ${llmConfig.provider}`);
   }
@@ -69,5 +72,35 @@ async function googleExtract(req: StructuredRequest): Promise<unknown> {
   });
   const text = res.text;
   if (!text) throw new Error('Gemini returned no text output');
+  return JSON.parse(text);
+}
+
+// --- Groq (OpenAI-compatible, JSON mode) -------------------------------------
+let groq: Groq | null = null;
+function getGroq(): Groq {
+  groq ??= new Groq({ apiKey: llmConfig.groq.apiKey });
+  return groq;
+}
+
+async function groqExtract(req: StructuredRequest): Promise<unknown> {
+  const schemaStr = req.jsonSchema ? JSON.stringify(req.jsonSchema, null, 2) : '';
+  const completion = await getGroq().chat.completions.create({
+    model: llmConfig.groq.model,
+    temperature: 0,
+    max_completion_tokens: llmConfig.maxTokens,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: req.system +
+          '\n\nYou must return a JSON object matching this schema:\n' +
+          schemaStr +
+          '\n\nRespond with valid JSON only.'
+      },
+      { role: 'user',   content: req.user },
+    ],
+  });
+  const text = completion.choices[0]?.message?.content;
+  if (!text) throw new Error('Groq returned no content');
   return JSON.parse(text);
 }
