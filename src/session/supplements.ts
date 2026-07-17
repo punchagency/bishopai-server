@@ -1,5 +1,7 @@
 import type { PoolClient } from 'pg';
+import { pool } from '../db/pool';
 import { coerceSessionNote } from './render';
+import type { SessionNote } from './extract';
 
 // WF1 → WF2/WF4 linkage: when Nicole approves a client's Protocol, persist its
 // supplement changes into the `supplements` table — the shared "current plan"
@@ -68,4 +70,45 @@ export async function syncClientSupplements(
   }
 
   return { upserted, removed };
+}
+
+export interface CurrentSupplementRow {
+  name: string;
+  dose: string | null;
+  qty: number | null;
+}
+
+/** The client's running supplement plan — accumulated across every approved
+ *  protocol, not just the one being reviewed. This is what the Supplement
+ *  Protocol document's grid should actually be built from. */
+export async function fetchCurrentSupplements(clientId: string): Promise<CurrentSupplementRow[]> {
+  const r = await pool.query<CurrentSupplementRow>(
+    `SELECT name, dose, qty FROM supplements WHERE client_id = $1 ORDER BY name`,
+    [clientId],
+  );
+  return r.rows;
+}
+
+/**
+ * Pure preview of what `syncClientSupplements` WOULD produce for this note,
+ * without writing anything — same upsert-by-name / stop-removes rules, so the
+ * Review UI can show Nicole the grid as it will actually render before she
+ * approves, not just this session's deltas.
+ */
+export function previewSupplementMerge(
+  current: CurrentSupplementRow[],
+  note: SessionNote,
+): CurrentSupplementRow[] {
+  const map = new Map(current.map((r) => [r.name.toLowerCase(), { ...r }]));
+  for (const s of note.supplements) {
+    const name = s.name?.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (s.change === 'stop') {
+      map.delete(key);
+      continue;
+    }
+    map.set(key, { name, dose: s.dose, qty: s.quantity });
+  }
+  return [...map.values()];
 }

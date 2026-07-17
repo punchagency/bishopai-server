@@ -1,5 +1,6 @@
 import type { SessionNote } from './extract';
 import { followUpTexts } from './followups';
+import type { CurrentSupplementRow } from './supplements';
 import type {
   RofData,
   SupplementProtocolData,
@@ -30,25 +31,31 @@ function describeSupplement(s: SessionNote['supplements'][number]): string {
   return `${verb} ${s.name}${dose}${qty}`.trim();
 }
 
-/** SessionNote → Supplement Protocol grid rows. */
-function supplementRows(note: SessionNote): SupplementRow[] {
-  // Stopped supplements don't belong on the current dosing grid.
-  return note.supplements
-    .filter((s) => s.change !== 'stop')
-    .map((s) => ({
-      name: s.name,
-      specialInstructions: s.dose ?? undefined,
-      bottleQuantity: s.quantity ?? undefined,
-    }));
+/** The client's running plan (accumulated across every approved session,
+ *  post-sync) → Supplement Protocol grid rows. A row not touched this session
+ *  is still here — the grid reflects the FULL current protocol, not just
+ *  today's deltas. */
+function supplementRows(current: CurrentSupplementRow[]): SupplementRow[] {
+  return current.map((s) => ({
+    name: s.name,
+    specialInstructions: s.dose ?? undefined,
+    bottleQuantity: s.qty ?? undefined,
+  }));
 }
 
-/** SessionNote → Supplement Protocol data (new dated version per protocol change). */
-export function toSupplementData(note: SessionNote): SupplementProtocolData {
+/**
+ * The client's current supplement plan + this note's follow-ups/changes →
+ * Supplement Protocol data (new dated version per protocol change). `current`
+ * must already include this session's changes merged in (real publishes call
+ * this after `syncClientSupplements`; the Review UI preview merges separately
+ * via `previewSupplementMerge`).
+ */
+export function toSupplementData(current: CurrentSupplementRow[], note: SessionNote): SupplementProtocolData {
   const toDo = note.protocol_changes.length
     ? note.protocol_changes.map((c) => c.description).join('\n')
     : undefined;
   return {
-    rows: supplementRows(note),
+    rows: supplementRows(current),
     notes: followUpTexts(note.follow_ups).join('\n') || undefined,
     toDo,
   };

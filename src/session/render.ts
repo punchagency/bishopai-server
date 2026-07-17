@@ -45,6 +45,7 @@ export function coerceSessionNote(raw: unknown): SessionNote {
   const arr = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
   return {
     concerns: arr<string>(r.concerns),
+    goals: arr<string>(r.goals),
     assessments: arr<string>(r.assessments),
     protocol_changes: arr<SessionNote['protocol_changes'][number]>(r.protocol_changes),
     supplements: arr<SessionNote['supplements'][number]>(r.supplements),

@@ -12,13 +12,12 @@ import {
 import { appendFlowSheetEntry, type AppendResult } from './sheets';
 import { demoDir, writeDemoBinary, appendDemoFlowSheet, writeDemoMarkdown } from './demoSink';
 
-// Presentation mode: setting DEMO_OUTPUT_DIR forces every publish onto the local
-// demo path (dry-run + emit real files locally) regardless of whether Google
-// creds are present — so a live demo produces openable docs reliably, without
-// depending on internet, valid tokens, or the newer Sheets scope. Unset it to
-// write to real Drive.
+// Presentation mode: setting DEMO_OUTPUT_DIR makes every publish ALSO emit the
+// real rendered file to a local folder — in addition to the real Drive write
+// when Google creds are configured, not instead of it. So a live demo has
+// tangible local artifacts to open regardless of whether Drive is wired up,
+// and real Drive writes still happen whenever creds are present.
 export const isDemoMode = (): boolean => demoDir() !== null;
-const demoMode = isDemoMode;
 
 export { isDriveConfigured, driveConfig } from './config';
 export {
@@ -61,15 +60,16 @@ export interface PublishResult {
  * the moment credentials land — no wiring change.
  */
 export async function publishDocument(input: PublishInput): Promise<PublishResult> {
-  if (!isDriveConfigured() || demoMode()) {
-    let demoPath: string | undefined;
-    if (demoDir()) {
-      try {
-        demoPath = writeDemoMarkdown(input.clientName, input.title, input.markdown);
-      } catch (err) {
-        logEvent('warn', 'drive.publish', 'demo markdown write failed', { error: String(err) });
-      }
+  let demoPath: string | undefined;
+  if (demoDir()) {
+    try {
+      demoPath = writeDemoMarkdown(input.clientName, input.title, input.markdown);
+    } catch (err) {
+      logEvent('warn', 'drive.publish', 'demo markdown write failed', { error: String(err) });
     }
+  }
+
+  if (!isDriveConfigured()) {
     logEvent('info', 'drive.publish', demoPath ? 'wrote demo document' : '[dry-run] would write document to Drive', {
       folder: input.clientName,
       title: input.title,
@@ -124,15 +124,16 @@ export interface BinaryDocResult {
  * the file as-is. Same dry-run contract as `publishDocument`.
  */
 export async function publishBinaryDoc(input: BinaryDocInput): Promise<BinaryDocResult> {
-  if (!isDriveConfigured() || demoMode()) {
-    let demoPath: string | undefined;
-    if (demoDir()) {
-      try {
-        demoPath = writeDemoBinary(input.clientName, input.docType, input.fileName, input.bytes);
-      } catch (err) {
-        logEvent('warn', 'drive.publishBinary', 'demo artifact write failed', { error: String(err) });
-      }
+  let demoPath: string | undefined;
+  if (demoDir()) {
+    try {
+      demoPath = writeDemoBinary(input.clientName, input.docType, input.fileName, input.bytes);
+    } catch (err) {
+      logEvent('warn', 'drive.publishBinary', 'demo artifact write failed', { error: String(err) });
     }
+  }
+
+  if (!isDriveConfigured()) {
     logEvent('info', 'drive.publishBinary', demoPath ? 'wrote demo binary doc' : '[dry-run] would write a binary doc to Drive', {
       client: input.clientName,
       docType: input.docType,
@@ -183,15 +184,16 @@ export interface FlowSheetPublishResult extends Partial<AppendResult> {
  * offline and flips to real Sheets writes the moment credentials land.
  */
 export async function publishFlowSheet(input: FlowSheetInput): Promise<FlowSheetPublishResult> {
-  if (!isDriveConfigured() || demoMode()) {
-    let demoPath: string | undefined;
-    if (demoDir()) {
-      try {
-        demoPath = await appendDemoFlowSheet(input.clientName, input.entry);
-      } catch (err) {
-        logEvent('warn', 'drive.flowsheet', 'demo Flow Sheet write failed', { error: String(err) });
-      }
+  let demoPath: string | undefined;
+  if (demoDir()) {
+    try {
+      demoPath = await appendDemoFlowSheet(input.clientName, input.entry);
+    } catch (err) {
+      logEvent('warn', 'drive.flowsheet', 'demo Flow Sheet write failed', { error: String(err) });
     }
+  }
+
+  if (!isDriveConfigured()) {
     logEvent('info', 'drive.flowsheet', demoPath ? 'appended demo Flow Sheet block' : '[dry-run] would append a Flow Sheet block', {
       client: input.clientName,
       spreadsheetId: input.spreadsheetId,

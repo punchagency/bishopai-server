@@ -4,6 +4,7 @@ import { toRofData, toSupplementData, toFlowSheetEntry } from './templateData';
 
 const note: SessionNote = {
   concerns: ['Fatigue', 'Bloating'],
+  goals: [],
   assessments: ['Adrenal stress', 'Low stomach acid'],
   protocol_changes: [{ description: 'Add liver support', type: 'add' }],
   supplements: [
@@ -15,8 +16,14 @@ const note: SessionNote = {
 };
 
 describe('toSupplementData', () => {
-  it('builds grid rows, dropping stopped supplements, and fills notes/toDo', () => {
-    const data = toSupplementData(note);
+  it('builds grid rows from the accumulated plan (not just this session), and fills notes/toDo', () => {
+    // The accumulated `supplements` table state — post-sync, so it already
+    // reflects this note's start/continue changes and excludes the stopped one.
+    const current = [
+      { name: 'Cataplex B', dose: '2 daily', qty: 1 },
+      { name: 'Zypan', dose: '1 w/ meals', qty: 2 },
+    ];
+    const data = toSupplementData(current, note);
     expect(data.rows).toEqual([
       { name: 'Cataplex B', specialInstructions: '2 daily', bottleQuantity: 1 },
       { name: 'Zypan', specialInstructions: '1 w/ meals', bottleQuantity: 2 },
@@ -108,7 +115,7 @@ describe('toFlowSheetEntry', () => {
   });
 
   it('handles an empty note without emitting stray fields', () => {
-    const empty: SessionNote = { concerns: [], assessments: [], protocol_changes: [], supplements: [], follow_ups: [] };
+    const empty: SessionNote = { concerns: [], goals: [], assessments: [], protocol_changes: [], supplements: [], follow_ups: [] };
     const entry = toFlowSheetEntry(empty, { date: 'd' });
     expect(entry).toEqual({ date: 'd', symptoms: undefined, foundation: undefined, protocol: undefined });
   });

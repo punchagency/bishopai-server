@@ -19,8 +19,10 @@ process.env.DEMO_OUTPUT_DIR ||= join(process.cwd(), 'demo-output');
 for (const k of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN']) process.env[k] = '';
 
 const { renderClientTemplates } = await import('../src/session/publishTemplates');
+const { previewSupplementMerge } = await import('../src/session/supplements');
 const { publishBinaryDoc, publishFlowSheet, DOCX_MIME, XLSX_MIME } = await import('../src/integrations/drive');
 type SessionNote = import('../src/session/extract').SessionNote;
+type CurrentSupplementRow = import('../src/session/supplements').CurrentSupplementRow;
 
 const CLIENT = 'Leeza Woodbury';
 
@@ -87,8 +89,19 @@ const followUp: SessionNote = {
   },
 };
 
-async function publishSession(note: SessionNote, dateISO: string, opts: { withRof: boolean }): Promise<void> {
-  const r = await renderClientTemplates(note, { clientName: CLIENT, date: dateISO });
+// No DB here, so we simulate what syncClientSupplements would have persisted:
+// each session's plan is the prior session's plan merged with this note's
+// changes — this is what makes the follow-up's Supplement Protocol show
+// Cataplex B/Drenamin (carried over, not re-mentioned as "start") alongside
+// the new Symplex F, instead of only whatever this session's note lists.
+async function publishSession(
+  note: SessionNote,
+  dateISO: string,
+  opts: { withRof: boolean },
+  priorPlan: CurrentSupplementRow[],
+): Promise<CurrentSupplementRow[]> {
+  const plan = previewSupplementMerge(priorPlan, note);
+  const r = await renderClientTemplates(note, { clientName: CLIENT, date: dateISO }, plan);
   if (opts.withRof) {
     await publishBinaryDoc({
       clientName: CLIENT, docType: 'ROF', fileName: 'ROF.docx',
@@ -101,11 +114,12 @@ async function publishSession(note: SessionNote, dateISO: string, opts: { withRo
   });
   await publishFlowSheet({ clientName: CLIENT, spreadsheetId: 'demo', entry: r.flowEntry });
   console.log(`  ✓ ${dateISO.slice(0, 10)} — ${opts.withRof ? 'ROF, ' : ''}${r.supplementFileName}, Flow Sheet block`);
+  return plan;
 }
 
 console.log(`\nFilling Nicole's templates for ${CLIENT} → ${process.env.DEMO_OUTPUT_DIR}\n`);
-await publishSession(intake, '2026-06-15T15:00:00Z', { withRof: true });
-await publishSession(followUp, '2026-07-09T15:00:00Z', { withRof: false });
+const planAfterIntake = await publishSession(intake, '2026-06-15T15:00:00Z', { withRof: true }, []);
+await publishSession(followUp, '2026-07-09T15:00:00Z', { withRof: false }, planAfterIntake);
 console.log(`\nDone. Open the files under ${process.env.DEMO_OUTPUT_DIR}/${CLIENT}/\n`);
 // Exit immediately: the app's logger enqueues a best-effort DB flush we don't
 // want in a no-DB demo — quitting now skips it (and its stderr noise) cleanly.

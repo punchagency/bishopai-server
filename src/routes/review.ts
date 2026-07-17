@@ -6,7 +6,7 @@ import { coerceSessionNote, renderAppointmentSheet, renderProtocol } from '../se
 import { processConversation } from '../session/process';
 import { publishApproved } from '../session/publish';
 import { publishClientTemplates } from '../session/publishTemplates';
-import { syncClientSupplements } from '../session/supplements';
+import { syncClientSupplements, fetchCurrentSupplements, previewSupplementMerge } from '../session/supplements';
 import { createTasksFromNote } from '../tasks/service';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
@@ -288,15 +288,82 @@ function approveOne(table: Table, approvalType: string) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// GET /review/:kind/:id/context — everything Nicole needs to compare this
+// draft against what's already on file before she approves: the last
+// APPROVED sheet/protocol for the same client (never a draft — a draft isn't
+// yet her word), and the client's running supplement plan both as it stands
+// now and as this draft would leave it (a pure preview; nothing is written).
+// ---------------------------------------------------------------------------
+function contextOne(table: Table) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+    try {
+      const item = await pool.query<{ client_id: string | null; content_json: unknown }>(
+        `SELECT client_id, content_json FROM ${table} WHERE id = $1`,
+        [req.params.id],
+      );
+      if (item.rowCount === 0) return res.status(404).json({ error: 'not found' });
+      const clientId = item.rows[0].client_id;
+      const note = coerceSessionNote(item.rows[0].content_json);
+
+      if (!clientId) {
+        return res.json({
+          client_id: null,
+          prior: { sheet: null, protocol: null },
+          supplementPlan: { current: [], merged: previewSupplementMerge([], note) },
+        });
+      }
+
+      const [priorSheet, priorProtocol, current] = await Promise.all([
+        pool.query<{ content_json: unknown; updated_at: string }>(
+          `SELECT content_json, updated_at FROM appointment_sheets
+            WHERE client_id = $1 AND status = 'approved' AND id <> $2
+         ORDER BY updated_at DESC LIMIT 1`,
+          [clientId, req.params.id],
+        ),
+        pool.query<{ content_json: unknown; updated_at: string }>(
+          `SELECT content_json, updated_at FROM protocols
+            WHERE client_id = $1 AND status = 'approved' AND id <> $2
+         ORDER BY updated_at DESC LIMIT 1`,
+          [clientId, req.params.id],
+        ),
+        fetchCurrentSupplements(clientId),
+      ]);
+
+      return res.json({
+        client_id: clientId,
+        prior: {
+          sheet: priorSheet.rowCount
+            ? { date: priorSheet.rows[0].updated_at, note: coerceSessionNote(priorSheet.rows[0].content_json) }
+            : null,
+          protocol: priorProtocol.rowCount
+            ? { date: priorProtocol.rows[0].updated_at, note: coerceSessionNote(priorProtocol.rows[0].content_json) }
+            : null,
+        },
+        supplementPlan: {
+          current,
+          merged: previewSupplementMerge(current, note),
+        },
+      });
+    } catch (err) {
+      logError(`review.${table}_context`, 'context query failed', err, { id: req.params.id });
+      return res.status(500).json({ error: 'internal error' });
+    }
+  };
+}
+
 // Appointment Sheets (internal)
 reviewRouter.get('/sheets/:id', getOne('appointment_sheets'));
 reviewRouter.patch('/sheets/:id', patchOne('appointment_sheets'));
 reviewRouter.post('/sheets/:id/approve', approveOne('appointment_sheets', 'appointment_sheet'));
+reviewRouter.get('/sheets/:id/context', contextOne('appointment_sheets'));
 
 // Protocols (client-facing)
 reviewRouter.get('/protocols/:id', getOne('protocols'));
 reviewRouter.patch('/protocols/:id', patchOne('protocols'));
 reviewRouter.post('/protocols/:id/approve', approveOne('protocols', 'protocol'));
+reviewRouter.get('/protocols/:id/context', contextOne('protocols'));
 
 // ---------------------------------------------------------------------------
 // Rendered documents — Markdown produced from the current content_json.

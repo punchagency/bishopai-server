@@ -5,6 +5,7 @@ import type { SessionNote } from './extract';
 
 const note: SessionNote = {
   concerns: ['Fatigue'],
+  goals: [],
   assessments: ['Adrenal stress'],
   protocol_changes: [{ description: 'Add liver support', type: 'add' }],
   supplements: [{ name: 'Cataplex B', dose: '2 daily', quantity: 1, change: 'start' }],
@@ -13,7 +14,14 @@ const note: SessionNote = {
 
 describe('renderClientTemplates', () => {
   it('renders all three templates offline from a note', async () => {
-    const out = await renderClientTemplates(note, { clientName: 'Leeza Woodbury', date: '2026-07-09T15:00:00Z' });
+    // The grid comes from the accumulated plan (post-sync in real use), not
+    // note.supplements directly — pass it explicitly for this offline test.
+    const currentSupplements = [{ name: 'Cataplex B', dose: '2 daily', qty: 1 }];
+    const out = await renderClientTemplates(
+      note,
+      { clientName: 'Leeza Woodbury', date: '2026-07-09T15:00:00Z' },
+      currentSupplements,
+    );
 
     // ROF is a real docx carrying the mapped fields + boilerplate.
     const rofText = new PizZip(out.rof).file('word/document.xml')!.asText().replace(/<[^>]+>/g, '');

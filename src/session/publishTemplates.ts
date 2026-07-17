@@ -7,6 +7,7 @@ import { coerceSessionNote } from './render';
 import { toRofData, toSupplementData, toFlowSheetEntry } from './templateData';
 import { fillRof } from '../integrations/docs/rof';
 import { fillSupplementProtocol } from '../integrations/docs/supplement';
+import { fetchCurrentSupplements, type CurrentSupplementRow } from './supplements';
 import type { FlowSheetEntry } from '../integrations/docs/types';
 import type { SessionNote } from './extract';
 import {
@@ -15,7 +16,6 @@ import {
   resolveDocFolder,
   ensureConvertedSheet,
   isDriveConfigured,
-  isDemoMode,
   driveConfig,
   DOCX_MIME,
   XLSX_MIME,
@@ -59,9 +59,10 @@ export interface RenderedTemplates {
 export async function renderClientTemplates(
   note: SessionNote,
   ctx: { clientName: string; date: unknown },
+  currentSupplements: CurrentSupplementRow[],
 ): Promise<RenderedTemplates> {
   const display = displayDate(ctx.date);
-  const supplement = await fillSupplementProtocol(toSupplementData(note));
+  const supplement = await fillSupplementProtocol(toSupplementData(currentSupplements, note));
   return {
     rof: fillRof(toRofData(note, { name: ctx.clientName, date: display })),
     supplement,
@@ -161,7 +162,11 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
   const row = r.rows[0];
   const clientName: string = row.client_name ?? 'Unknown client';
   const note = coerceSessionNote(row.content_json);
-  const rendered = await renderClientTemplates(note, { clientName, date: row.starts_at });
+  // syncClientSupplements already ran (in the approval transaction, before this
+  // fires), so the table already reflects this session's changes merged in —
+  // this is the full current plan, not just what this session mentioned.
+  const currentSupplements = row.client_id ? await fetchCurrentSupplements(row.client_id) : [];
+  const rendered = await renderClientTemplates(note, { clientName, date: row.starts_at }, currentSupplements);
 
   const result: ClientTemplatesResult = {};
 
@@ -192,30 +197,38 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
   result.supplementFileId = supp.fileId;
   clientFolderId = supp.clientFolderId ?? clientFolderId;
 
-  // Flow Sheet — provision once (xlsx → Google Sheet), then append a block. In
-  // demo mode we skip real provisioning; publishFlowSheet writes a local xlsx.
+  // Flow Sheet — provision once (xlsx → Google Sheet), then append a block.
+  // publishFlowSheet also mirrors the block into a local demo xlsx whenever
+  // DEMO_OUTPUT_DIR is set, in addition to (not instead of) the real Sheet.
   let flowSheetId: string | null = row.flow_sheet_id ?? null;
-  if (isDriveConfigured() && !isDemoMode() && !flowSheetId) {
-    const { folderId, clientFolderId: cfid } = await resolveDocFolder(clientName, 'AppointmentFlowSheet', {
-      clientFolderId,
-      rootFolderId: driveConfig().rootFolderId,
+  try {
+    if (isDriveConfigured() && !flowSheetId) {
+      const { folderId, clientFolderId: cfid } = await resolveDocFolder(clientName, 'AppointmentFlowSheet', {
+        clientFolderId,
+        rootFolderId: driveConfig().rootFolderId,
+      });
+      clientFolderId = cfid;
+      const sheet = await ensureConvertedSheet(folderId, `${clientName} Appointment Flow Sheet`, readFileSync(FLOW_TEMPLATE));
+      flowSheetId = sheet.id;
+      logEvent('info', 'session.flowsheet_provision', 'provisioned client Flow Sheet', {
+        client: clientName,
+        spreadsheetId: flowSheetId,
+        created: sheet.created,
+      });
+    }
+    const flow = await publishFlowSheet({
+      clientName,
+      spreadsheetId: flowSheetId ?? 'unprovisioned',
+      entry: rendered.flowEntry,
     });
-    clientFolderId = cfid;
-    const sheet = await ensureConvertedSheet(folderId, `${clientName} Appointment Flow Sheet`, readFileSync(FLOW_TEMPLATE));
-    flowSheetId = sheet.id;
-    logEvent('info', 'session.flowsheet_provision', 'provisioned client Flow Sheet', {
-      client: clientName,
-      spreadsheetId: flowSheetId,
-      created: sheet.created,
-    });
+    result.flowSheetId = flowSheetId;
+    result.flowBlock = flow.blockIndex;
+  } catch (err) {
+    // ROF/Supplement already landed above — a Sheets-API hiccup (e.g. the API
+    // not yet enabled on the Cloud project) must not lose that work or block
+    // persistIds/email below, so this doc's failure stays local to it.
+    logError('session.flowsheet_publish', 'Flow Sheet publish failed', err, { client: clientName });
   }
-  const flow = await publishFlowSheet({
-    clientName,
-    spreadsheetId: flowSheetId ?? 'unprovisioned',
-    entry: rendered.flowEntry,
-  });
-  result.flowSheetId = flowSheetId;
-  result.flowBlock = flow.blockIndex;
 
   // Optionally mail the client their filled docs (off unless Nicole enables it).
   // The ROF rides along only on the session that actually created it.
