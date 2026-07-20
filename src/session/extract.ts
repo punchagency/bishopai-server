@@ -186,6 +186,9 @@ export const SessionNoteSchema = z.object({
       // filled only when the timing was actually spoken; an absent slot means
       // "not taken then", not "unknown".
       schedule: ScheduleSchema.optional(),
+      // "Here | Fullscript" on the protocol grid — where the client gets it.
+      // Rarely spoken aloud, so usually filled in by Nicole during review.
+      obtained_from: stated().optional(),
     }),
   ).default([]),
   follow_ups: z.array(z.union([z.string(), FollowUpSchema])).default([]),

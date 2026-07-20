@@ -51,7 +51,8 @@ function supplementRows(current: CurrentSupplementRow[]): SupplementRow[] {
       specialInstructions: s.dose ?? undefined,
       bottleQuantity: s.qty ?? undefined,
       schedule: Object.keys(schedule).length ? schedule : undefined,
-      source: text(s.source),
+      // Column L is where the CLIENT gets it, not how the row reached our plan.
+      source: text(s.obtained_from),
     };
   });
 }

@@ -40,7 +40,10 @@ describe('toSupplementData', () => {
           dose: '2 daily',
           qty: 1,
           schedule: { breakfast: '1 tab', beforeBed: '1 tab' },
-          source: 'Fullscript',
+          // Provenance (how the row reached our plan) must NOT reach the client's
+          // document; the grid's last column is where they obtain it.
+          source: 'notes',
+          obtained_from: 'Fullscript',
         },
       ],
       note,

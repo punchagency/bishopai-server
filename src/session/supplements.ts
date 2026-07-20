@@ -66,15 +66,16 @@ export async function syncClientSupplements(
       await db.query(
         `UPDATE supplements
             SET name = $2, dose = $3, qty = $4, start_date = $5, source = 'notes',
-                schedule = COALESCE($6::jsonb, schedule)
+                schedule = COALESCE($6::jsonb, schedule),
+                obtained_from = COALESCE($7, obtained_from)
           WHERE id = $1`,
-        [existing.rows[0].id, name, s.dose, s.quantity, startDate, schedule],
+        [existing.rows[0].id, name, s.dose, s.quantity, startDate, schedule, s.obtained_from ?? null],
       );
     } else {
       await db.query(
-        `INSERT INTO supplements (client_id, name, dose, qty, start_date, source, schedule)
-         VALUES ($1, $2, $3, $4, $5, 'notes', $6::jsonb)`,
-        [clientId, name, s.dose, s.quantity, startDate, schedule],
+        `INSERT INTO supplements (client_id, name, dose, qty, start_date, source, schedule, obtained_from)
+         VALUES ($1, $2, $3, $4, $5, 'notes', $6::jsonb, $7)`,
+        [clientId, name, s.dose, s.quantity, startDate, schedule, s.obtained_from ?? null],
       );
     }
     upserted++;
@@ -89,8 +90,11 @@ export interface CurrentSupplementRow {
   qty: number | null;
   /** Dosing slots for the protocol grid's D–J columns; null if never stated. */
   schedule?: Partial<Record<ScheduleSlot, string | null>> | null;
-  /** Where the client obtains it — the grid's "Here | Fullscript" column. */
+  /** How the row entered the plan (notes | fullscript | pb) — provenance, not
+   *  anything the client sees. */
   source?: string | null;
+  /** Where the client obtains it — the grid's "Here | Fullscript" column. */
+  obtained_from?: string | null;
 }
 
 /** The client's running supplement plan — accumulated across every approved
@@ -98,7 +102,8 @@ export interface CurrentSupplementRow {
  *  Protocol document's grid should actually be built from. */
 export async function fetchCurrentSupplements(clientId: string): Promise<CurrentSupplementRow[]> {
   const r = await pool.query<CurrentSupplementRow>(
-    `SELECT name, dose, qty, schedule, source FROM supplements WHERE client_id = $1 ORDER BY name`,
+    `SELECT name, dose, qty, schedule, source, obtained_from
+       FROM supplements WHERE client_id = $1 ORDER BY name`,
     [clientId],
   );
   return r.rows;
@@ -133,6 +138,7 @@ export function previewSupplementMerge(
       // whatever an earlier session established rather than clearing it.
       schedule: stated ?? prior?.schedule ?? null,
       source: prior?.source ?? null,
+      obtained_from: s.obtained_from ?? prior?.obtained_from ?? null,
     });
   }
   return [...map.values()];

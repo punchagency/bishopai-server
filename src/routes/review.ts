@@ -14,6 +14,15 @@ import {
 } from '../session/supplements';
 import { createTasksFromNote } from '../tasks/service';
 import { fetchRevisions, snapshotRevision } from '../session/revisions';
+import { scoreNameMatch, nameSignalRank, overlapSeconds } from '../correlation/nameMatch';
+import {
+  listSessions,
+  getSession,
+  patchSession,
+  approveSession,
+  amendSession,
+  appointmentForItem,
+} from '../session/sessionService';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
 // session extraction, with edit + approve. (No auth yet — approved_by is a
@@ -50,45 +59,21 @@ function fmtDate(v: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// GET /review/queue — everything awaiting Nicole (draft + in_review).
-// GET /review/queue?status=approved — what she has already signed off on, so a
-// finished session stays reachable instead of vanishing from the app entirely.
+// GET /review/queue — one row per SESSION awaiting Nicole.
+// GET /review/queue?status=approved — sessions already signed off.
+//
+// A session is one clinical note, not two documents. The sheet and the protocol
+// hold identical content and are approved together, so listing them separately
+// showed every visit twice and let the two copies drift apart.
 // Approved rows are capped: this is a recent-history list, not an archive.
 // ---------------------------------------------------------------------------
 const APPROVED_LIMIT = 100;
 
 reviewRouter.get('/queue', async (req, res) => {
-  const approved = req.query.status === 'approved';
-  const statuses = approved ? ['approved'] : ['draft', 'in_review'];
-  const limit = approved ? `LIMIT ${APPROVED_LIMIT}` : '';
+  const scope = req.query.status === 'approved' ? 'approved' : 'pending';
   try {
-    const sheets = await pool.query(
-      `SELECT s.id, s.status, s.content_json, s.updated_at,
-              a.id AS appointment_id, a.starts_at, a.ends_at,
-              c.id AS client_id, c.name AS client_name
-         FROM appointment_sheets s
-         JOIN appointments a ON a.id = s.appointment_id
-    LEFT JOIN clients c ON c.id = s.client_id
-        WHERE s.status = ANY($1)
-     ORDER BY a.starts_at DESC ${limit}`,
-      [statuses],
-    );
-    // Join appointments for starts_at: without it the list falls back to
-    // updated_at, which is when the ROW was written. A client with several
-    // sessions then shows a stack of protocols all stamped the same day —
-    // indistinguishable, and wrong.
-    const protocols = await pool.query(
-      `SELECT p.id, p.status, p.content_json, p.updated_at, p.appointment_id,
-              a.starts_at, a.ends_at,
-              c.id AS client_id, c.name AS client_name
-         FROM protocols p
-    LEFT JOIN appointments a ON a.id = p.appointment_id
-    LEFT JOIN clients c ON c.id = p.client_id
-        WHERE p.status = ANY($1)
-     ORDER BY COALESCE(a.starts_at, p.updated_at) DESC ${limit}`,
-      [statuses],
-    );
-    res.json({ appointment_sheets: sheets.rows, protocols: protocols.rows });
+    const sessions = await listSessions(scope, APPROVED_LIMIT);
+    res.json({ sessions });
   } catch (err) {
     logError('review.queue', 'queue query failed', err);
     res.status(500).json({ error: 'internal error' });
@@ -117,24 +102,65 @@ reviewRouter.get('/unmatched', async (_req, res) => {
 });
 
 // GET /review/unmatched/:id/candidates — appointments to offer for manual
-// tagging, nearest in time to the conversation first.
+// tagging.
+//
+// Ordered by EVIDENCE, not just clock distance. When appointments run back to
+// back, a recording that starts late or runs long overlaps two of them and
+// correlation rightly refuses to guess — but then offering Nicole two adjacent
+// slots sorted by time tells her nothing. The transcript almost always says the
+// client's name, so that becomes the primary signal, with overlap and then time
+// distance breaking ties.
+//
+// Still never auto-assigns: a name in a transcript is evidence, not proof (a
+// client can be discussed in someone else's session). The signals are returned
+// so the UI can show WHY a candidate is ranked where it is.
 reviewRouter.get('/unmatched/:id/candidates', async (req, res) => {
   if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   try {
-    const conv = await pool.query<{ starts_at: string }>(
-      `SELECT starts_at FROM conversations WHERE id = $1`,
+    const conv = await pool.query<{ starts_at: string; ends_at: string; transcript: string | null }>(
+      `SELECT starts_at, ends_at, transcript FROM conversations WHERE id = $1`,
       [req.params.id],
     );
     if (conv.rowCount === 0) return res.status(404).json({ error: 'not found' });
-    const r = await pool.query(
-      `SELECT a.id, a.starts_at, a.ends_at, c.name AS client_name
+    const { starts_at: cs, ends_at: ce, transcript } = conv.rows[0];
+
+    const r = await pool.query<{
+      id: string;
+      starts_at: string;
+      ends_at: string;
+      client_id: string | null;
+      client_name: string | null;
+    }>(
+      `SELECT a.id, a.starts_at, a.ends_at, a.client_id, c.name AS client_name
          FROM appointments a
     LEFT JOIN clients c ON c.id = a.client_id
      ORDER BY abs(extract(epoch FROM (a.starts_at - $1::timestamptz)))
-        LIMIT 8`,
-      [conv.rows[0].starts_at],
+        LIMIT 12`,
+      [cs],
     );
-    return res.json({ appointments: r.rows });
+
+    const scored = r.rows.map((a) => {
+      const name = scoreNameMatch(transcript, a.client_name);
+      return {
+        ...a,
+        name_mentions: name.mentions,
+        name_matched_on: name.matchedOn,
+        overlap_seconds: overlapSeconds(cs, ce, a.starts_at, a.ends_at),
+        _rank: nameSignalRank(name),
+      };
+    });
+
+    scored.sort(
+      (x, y) =>
+        y._rank - x._rank ||
+        y.overlap_seconds - x.overlap_seconds ||
+        Math.abs(new Date(x.starts_at).getTime() - new Date(cs).getTime()) -
+          Math.abs(new Date(y.starts_at).getTime() - new Date(cs).getTime()),
+    );
+
+    return res.json({
+      appointments: scored.slice(0, 8).map(({ _rank, ...a }) => a),
+    });
   } catch (err) {
     logError('review.candidates', 'candidate query failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
@@ -179,6 +205,208 @@ reviewRouter.post('/unmatched/:id/match', async (req, res) => {
   }
 });
 
+// POST /review/unmatched/:id/assign-client — a walk-in.
+//
+// Some sessions never existed in Practice Better: a walk-in, a phone follow-up,
+// a booking made under the wrong name. Correlation has nothing to match against
+// and the recording sits unmatched forever, because until now the only way to
+// assign one was to pick an EXISTING appointment.
+//
+// So create the appointment from the recording itself. Its time window is the
+// recording's, which is the truth of when the session happened, and it's marked
+// `walk-in` so it's distinguishable from anything PB booked.
+const assignClientSchema = z.object({ client_id: z.string() });
+
+reviewRouter.post('/unmatched/:id/assign-client', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  const parsed = assignClientSchema.safeParse(req.body);
+  if (!parsed.success || !isUuid(parsed.data.client_id)) {
+    return res.status(400).json({ error: 'invalid payload' });
+  }
+
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    const conv = await db.query<{ starts_at: string; ends_at: string; transcript: string | null }>(
+      `SELECT starts_at, ends_at, transcript FROM conversations
+        WHERE id = $1 AND appointment_id IS NULL FOR UPDATE`,
+      [req.params.id],
+    );
+    if (conv.rowCount === 0) {
+      await db.query('ROLLBACK');
+      return res.status(409).json({ error: 'already matched or not found' });
+    }
+    const client = await db.query(`SELECT 1 FROM clients WHERE id = $1`, [parsed.data.client_id]);
+    if (client.rowCount === 0) {
+      await db.query('ROLLBACK');
+      return res.status(404).json({ error: 'client not found' });
+    }
+
+    const appt = await db.query<{ id: string }>(
+      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
+            VALUES ($1, $2, $3, $4, 'completed') RETURNING id`,
+      [
+        parsed.data.client_id,
+        // No PB booking exists, so the id is derived from the recording — stable,
+        // and obviously not a Practice Better id to anyone reading the table.
+        `walkin-${req.params.id}`,
+        conv.rows[0].starts_at,
+        conv.rows[0].ends_at,
+      ],
+    );
+
+    await db.query(
+      `UPDATE conversations
+          SET appointment_id = $2, client_id = $3, correlation_status = 'walk_in'
+        WHERE id = $1`,
+      [req.params.id, appt.rows[0].id, parsed.data.client_id],
+    );
+    await db.query('COMMIT');
+
+    logEvent('info', 'review.assign_client', 'assigned a walk-in recording to a client', {
+      conversation_id: req.params.id,
+      client_id: parsed.data.client_id,
+      appointment_id: appt.rows[0].id,
+    });
+
+    if (conv.rows[0].transcript) {
+      void processConversation(req.params.id).catch((e) =>
+        logError('session.process', 'walk-in processing failed', e, { conversation_id: req.params.id }),
+      );
+    }
+    return res.json({ appointment_id: appt.rows[0].id, client_id: parsed.data.client_id, status: 'walk_in' });
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {});
+    logError('review.assign_client', 'walk-in assignment failed', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
+  } finally {
+    db.release();
+  }
+});
+
+// POST /review/conversations/:id/unmatch — detach a recording from the wrong client.
+//
+// Correlation can be confidently wrong: two clients booked back to back, one
+// runs over, and the single overlapping appointment is the wrong one. Until now
+// there was no way back — /match only accepts a conversation with no appointment.
+//
+// Refuses once the note has been APPROVED. At that point documents are in the
+// client's Drive folder and possibly with the client; silently detaching would
+// leave those files orphaned under a client the app no longer links to the
+// session. That needs a deliberate amendment, not a re-assignment.
+type UnmatchOutcome = { code: number; body: Record<string, unknown> };
+
+async function unmatchByConversation(conversationId: string): Promise<UnmatchOutcome> {
+  const db = await pool.connect();
+  try {
+    await db.query('BEGIN');
+    const conv = await db.query<{ appointment_id: string | null }>(
+      `SELECT appointment_id FROM conversations WHERE id = $1 FOR UPDATE`,
+      [conversationId],
+    );
+    if (conv.rowCount === 0) {
+      await db.query('ROLLBACK');
+      return { code: 404, body: { error: 'not found' } };
+    }
+    const apptId = conv.rows[0].appointment_id;
+    if (!apptId) {
+      await db.query('ROLLBACK');
+      return { code: 409, body: { error: 'not matched', detail: 'This recording is already unassigned.' } };
+    }
+
+    const approved = await db.query(
+      `SELECT 1 FROM appointment_sheets WHERE appointment_id = $1 AND status = 'approved'
+        UNION ALL
+       SELECT 1 FROM protocols WHERE appointment_id = $1 AND status = 'approved'
+        LIMIT 1`,
+      [apptId],
+    );
+    if (approved.rowCount) {
+      await db.query('ROLLBACK');
+      return {
+        code: 409,
+        body: {
+          error: 'already approved',
+          detail:
+            'This session has been approved and its documents published. Amend the note instead of reassigning it.',
+        },
+      };
+    }
+
+    // The draft note belongs to the wrong client — remove it rather than leaving
+    // it in her queue attributed to someone who was never in the room.
+    await db.query(`DELETE FROM appointment_sheets WHERE appointment_id = $1`, [apptId]);
+    await db.query(`DELETE FROM protocols WHERE appointment_id = $1`, [apptId]);
+
+    // A walk-in appointment exists only to carry this recording, so it goes too.
+    await db.query(
+      `DELETE FROM appointments WHERE id = $1 AND pb_id = $2`,
+      [apptId, `walkin-${conversationId}`],
+    );
+
+    await db.query(
+      `UPDATE conversations
+          SET appointment_id = NULL, client_id = NULL,
+              correlation_status = 'unmatched', extraction_status = 'pending'
+        WHERE id = $1`,
+      [conversationId],
+    );
+    await db.query('COMMIT');
+
+    logEvent('info', 'review.unmatch', 'detached a recording from its appointment', {
+      conversation_id: conversationId,
+      appointment_id: apptId,
+    });
+    return { code: 200, body: { status: 'unmatched' } };
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {});
+    logError('review.unmatch', 'unmatch failed', err, { id: conversationId });
+    return { code: 500, body: { error: 'internal error' } };
+  } finally {
+    db.release();
+  }
+}
+
+reviewRouter.post('/conversations/:id/unmatch', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  const out = await unmatchByConversation(req.params.id);
+  return res.status(out.code).json(out.body);
+});
+
+/**
+ * POST /review/:kind/:id/unmatch — same thing, reached from the session itself.
+ *
+ * Nicole discovers a wrong match while reading the note, not while looking at a
+ * list of recordings, so the action has to exist where the mistake becomes
+ * visible. Resolves the recording behind this session and detaches that.
+ */
+function unmatchOne(table: Table) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+    try {
+      const conv = await pool.query<{ id: string }>(
+        `SELECT c.id
+           FROM conversations c
+           JOIN ${table} t ON t.appointment_id = c.appointment_id
+          WHERE t.id = $1
+          LIMIT 1`,
+        [req.params.id],
+      );
+      if (conv.rowCount === 0) {
+        return res.status(404).json({
+          error: 'no recording',
+          detail: 'This session has no Bee recording attached, so there is nothing to reassign.',
+        });
+      }
+      const out = await unmatchByConversation(conv.rows[0].id);
+      return res.status(out.code).json(out.body);
+    } catch (err) {
+      logError(`review.${table}_unmatch`, 'unmatch lookup failed', err, { id: req.params.id });
+      return res.status(500).json({ error: 'internal error' });
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Generic handlers, reused for both 'appointment_sheets' and 'protocols'.
 // ---------------------------------------------------------------------------
@@ -190,7 +418,36 @@ function getOne(table: Table) {
     try {
       const r = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
       if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
-      return res.json(r.rows[0]);
+
+      // Whether this session can still be detached from its client, so the UI can
+      // avoid offering an action that would only fail. A sheet and a protocol
+      // share an appointment: approving EITHER publishes documents, which pins
+      // the pairing even while the other is still a draft.
+      const apptId = r.rows[0].appointment_id;
+      let canUnmatch = false;
+      let blocked: string | null = 'This session has no Bee recording attached.';
+      if (apptId) {
+        const [conv, approved] = await Promise.all([
+          pool.query(`SELECT 1 FROM conversations WHERE appointment_id = $1 LIMIT 1`, [apptId]),
+          pool.query(
+            `SELECT 1 FROM appointment_sheets WHERE appointment_id = $1 AND status = 'approved'
+              UNION ALL
+             SELECT 1 FROM protocols WHERE appointment_id = $1 AND status = 'approved'
+              LIMIT 1`,
+            [apptId],
+          ),
+        ]);
+        if (approved.rowCount) {
+          blocked = 'This session has been approved and its documents published. Amend it instead.';
+        } else if (conv.rowCount === 0) {
+          blocked = 'This session has no Bee recording attached.';
+        } else {
+          canUnmatch = true;
+          blocked = null;
+        }
+      }
+
+      return res.json({ ...r.rows[0], can_unmatch: canUnmatch, unmatch_blocked_reason: blocked });
     } catch (err) {
       logError(`review.${table}_get`, 'fetch failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
@@ -207,34 +464,23 @@ function patchOne(table: Table) {
     }
     const { content_json, status } = parsed.data;
     try {
-      // An approved note has already been published to Drive and may have been
-      // emailed to the client. Editing it here would leave the record and the
-      // delivered document disagreeing, with nothing to show it happened — and
-      // re-approving does NOT republish (see firstApproval below), so the drift
-      // would be permanent and silent. Corrections go through /amend, which
-      // snapshots the superseded version and republishes what it safely can.
+      // Content edits go through the session so both documents move together —
+      // they hold the same note, and letting one change alone is what allowed a
+      // correction to reach the brief but never the client's documents.
       if (content_json) {
-        const cur = await pool.query<{ status: string }>(
-          `SELECT status FROM ${table} WHERE id = $1`,
-          [req.params.id],
-        );
-        if (cur.rowCount === 0) return res.status(404).json({ error: 'not found' });
-        if (cur.rows[0].status === 'approved') {
-          return res.status(409).json({
-            error: 'already approved',
-            detail: 'This note has been approved and its documents published. Use amend to correct it.',
-          });
-        }
+        const apptId = await appointmentForItem(table, req.params.id);
+        if (!apptId) return res.status(404).json({ error: 'not found' });
+        const out = await patchSession(apptId, content_json);
+        if (!out.ok) return res.status(out.code).json({ error: out.error, detail: out.detail });
       }
 
-      const r = await pool.query(
-        `UPDATE ${table}
-            SET content_json = COALESCE($2, content_json),
-                status       = COALESCE($3, status)
-          WHERE id = $1
-      RETURNING *`,
-        [req.params.id, content_json ? JSON.stringify(content_json) : null, status ?? null],
-      );
+      // A bare status change (draft → in_review) is per-document bookkeeping and
+      // carries no clinical content, so it stays where it is.
+      if (status) {
+        await pool.query(`UPDATE ${table} SET status = $2 WHERE id = $1`, [req.params.id, status]);
+      }
+
+      const r = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
       if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
       return res.json(r.rows[0]);
     } catch (err) {
@@ -254,115 +500,43 @@ function patchOne(table: Table) {
  * done deliberately and selectively, because the three templates behave
  * differently (see republishAmended).
  */
-function amendOne(table: Table, approvalType: string) {
+function amendOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
     const parsed = amendSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       return res.status(400).json({ error: 'invalid payload', details: parsed.error.issues });
     }
-    const { content_json, reason } = parsed.data;
-    const amendedBy = parsed.data.amended_by || 'nicole';
-
-    const db = await pool.connect();
     try {
-      await db.query('BEGIN');
-      const cur = await db.query<{ status: string; content_json: unknown; client_id: string | null; appointment_id: string | null }>(
-        `SELECT status, content_json, client_id, appointment_id FROM ${table} WHERE id = $1 FOR UPDATE`,
-        [req.params.id],
+      const apptId = await appointmentForItem(table, req.params.id);
+      if (!apptId) return res.status(404).json({ error: 'not found' });
+      const out = await amendSession(
+        apptId,
+        parsed.data.content_json,
+        parsed.data.reason ?? null,
+        parsed.data.amended_by || 'nicole',
       );
-      if (cur.rowCount === 0) {
-        await db.query('ROLLBACK');
-        return res.status(404).json({ error: 'not found' });
-      }
-      if (cur.rows[0].status !== 'approved') {
-        await db.query('ROLLBACK');
-        return res.status(409).json({
-          error: 'not approved',
-          detail: 'Only an approved note is amended. Edit this one directly instead.',
-        });
-      }
+      if (!out.ok) return res.status(out.code).json({ error: out.error, detail: out.detail });
 
-      const revision = await snapshotRevision(
-        db,
-        table,
-        req.params.id,
-        cur.rows[0].content_json,
-        reason ?? null,
-      );
-
-      const upd = await db.query(
-        `UPDATE ${table} SET content_json = $2 WHERE id = $1 RETURNING *`,
-        [req.params.id, JSON.stringify(content_json)],
-      );
-
-      await db.query(
-        `INSERT INTO approvals (type, payload_json, status, approved_by, approved_at)
-              VALUES ($1, $2, 'amended', $3, now())`,
-        [
-          approvalType,
-          JSON.stringify({ [`${approvalType}_id`]: req.params.id, revision, reason: reason ?? null }),
-          amendedBy,
-        ],
-      );
-
-      // An amended protocol changes the supplement plan, so re-run the same sync
-      // the approval does. It's keyed by name and idempotent, so re-applying the
-      // corrected note converges rather than duplicating.
-      if (table === 'protocols' && cur.rows[0].client_id) {
-        const appt = await db.query<{ starts_at: string | null }>(
-          `SELECT starts_at FROM appointments WHERE id = $1`,
-          [cur.rows[0].appointment_id],
-        );
-        const startDate = appt.rows[0]?.starts_at
-          ? new Date(appt.rows[0].starts_at).toISOString().slice(0, 10)
-          : null;
-        await syncClientSupplements(db, cur.rows[0].client_id, startDate, content_json);
-        // Sync alone can't retract: it only ever removes on an explicit 'stop'.
-        const dropped = await removeSupplementsDroppedByAmendment(
-          db,
-          cur.rows[0].client_id,
-          cur.rows[0].content_json,
-          content_json,
-        );
-        if (dropped > 0) {
-          logEvent('info', 'review.protocol_amend', 'removed supplements retracted by amendment', {
-            id: req.params.id,
-            dropped,
-          });
-        }
-      }
-
-      await db.query('COMMIT');
-
-      logEvent('info', `review.${table}_amend`, 'amended an approved note', {
-        id: req.params.id,
-        revision,
-        amendedBy,
-      });
-
-      // Off the request path, like the approve publish. Which documents can be
-      // safely rewritten differs per template — republishAmended decides.
       void publishApproved(table, req.params.id).catch((err) =>
         logError(`review.${table}_amend_publish`, 'Drive publish failed', err, { id: req.params.id }),
       );
-      if (table === 'protocols') {
-        void republishAmended(req.params.id).catch((err) =>
+      if (out.session.protocol_id) {
+        void republishAmended(out.session.protocol_id).catch((err) =>
           logError('review.protocol_amend_republish', 'republish failed', err, { id: req.params.id }),
         );
       }
 
-      return res.json({ ...upd.rows[0], revision });
+      const row = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
+      return res.json({ ...row.rows[0], revision: out.revision });
     } catch (err) {
-      await db.query('ROLLBACK').catch(() => {});
       logError(`review.${table}_amend`, 'amend failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
-    } finally {
-      db.release();
     }
   };
 }
 
+/** GET /review/:kind/:id/revisions — the superseded versions, newest first. */
 /**
  * GET /review/:kind/:id/history — the client's previous sessions, newest first.
  *
@@ -438,7 +612,6 @@ function historyOne(table: Table) {
   };
 }
 
-/** GET /review/:kind/:id/revisions — the superseded versions, newest first. */
 function revisionsOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
@@ -451,107 +624,41 @@ function revisionsOne(table: Table) {
   };
 }
 
-function approveOne(table: Table, approvalType: string) {
+function approveOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
     const parsedBody = approveSchema.safeParse(req.body ?? {});
     const approvedBy = (parsedBody.success && parsedBody.data.approved_by) || 'nicole';
-
-    const db = await pool.connect();
     try {
-      await db.query('BEGIN');
-      // Capture the prior status atomically so we can tell a genuine first
-      // approval from a re-approval — the Flow Sheet append + dated Supplement
-      // are NOT idempotent, so they must fire only on the transition.
-      const r = await db.query(
-        `WITH prev AS (SELECT status AS old_status FROM ${table} WHERE id = $1 FOR UPDATE)
-         UPDATE ${table} t SET status = 'approved'
-           FROM prev WHERE t.id = $1
-         RETURNING t.*, prev.old_status`,
-        [req.params.id],
-      );
-      if (r.rowCount === 0) {
-        await db.query('ROLLBACK');
-        return res.status(404).json({ error: 'not found' });
-      }
-      const firstApproval = r.rows[0].old_status !== 'approved';
-      delete r.rows[0].old_status; // internal — don't leak into the response
-      // Audit the approval through the shared approvals table (§7).
-      await db.query(
-        `INSERT INTO approvals (type, payload_json, status, approved_by, approved_at)
-              VALUES ($1, $2, 'approved', $3, now())`,
-        [approvalType, JSON.stringify({ [`${approvalType}_id`]: req.params.id }), approvedBy],
-      );
-      // Approving a Protocol commits its supplement changes into the shared
-      // `supplements` plan (atomic with the approval) — this is what feeds WF2
-      // checkout summaries and WF4 refill projection with real data.
-      if (table === 'protocols' && r.rows[0].client_id) {
-        const appt = await db.query<{ starts_at: string | null }>(
-          `SELECT starts_at FROM appointments WHERE id = $1`,
-          [r.rows[0].appointment_id],
+      const apptId = await appointmentForItem(table, req.params.id);
+      if (!apptId) return res.status(404).json({ error: 'not found' });
+      const out = await approveSession(apptId, approvedBy);
+      if (!out.ok) return res.status(out.code).json({ error: out.error, detail: out.detail });
+
+      // Off the request path. Both documents are written to Drive; the client
+      // templates fire once, and only on the transition — the Flow Sheet append
+      // and the dated Supplement are not idempotent.
+      void publishApproved('appointment_sheets', out.session.sheet_id ?? '').catch(() => {});
+      if (out.session.protocol_id) {
+        void publishApproved('protocols', out.session.protocol_id).catch((err) =>
+          logError('review.protocol_publish', 'Drive publish failed', err, { id: req.params.id }),
         );
-        const startDate = appt.rows[0]?.starts_at
-          ? new Date(appt.rows[0].starts_at).toISOString().slice(0, 10)
-          : null;
-        const sync = await syncClientSupplements(db, r.rows[0].client_id, startDate, r.rows[0].content_json);
-        logEvent('info', 'review.protocol_sync', 'synced supplements from approved protocol', {
-          id: req.params.id,
-          ...sync,
-        });
-      }
-      // The note's follow-ups become tracked tasks. Both the sheet and the protocol
-      // carry the same follow_ups and either may be approved first, so this runs for
-      // both and leans on the unique index to dedupe rather than picking a winner.
-      if (r.rows[0].client_id) {
-        const appt = await db.query<{ starts_at: string | null }>(
-          `SELECT starts_at FROM appointments WHERE id = $1`,
-          [r.rows[0].appointment_id],
-        );
-        const { created } = await createTasksFromNote(db, {
-          clientId: r.rows[0].client_id,
-          appointmentId: r.rows[0].appointment_id ?? null,
-          sessionDate: appt.rows[0]?.starts_at ? new Date(appt.rows[0].starts_at) : new Date(),
-          note: coerceSessionNote(r.rows[0].content_json),
-        });
-        if (created > 0) {
-          logEvent('info', 'review.tasks', 'created tasks from approved follow-ups', {
-            id: req.params.id,
-            created,
-          });
+        if (out.firstApproval) {
+          void publishClientTemplates(out.session.protocol_id).catch((err) =>
+            logError('review.templates_publish', 'template publish failed', err, { id: req.params.id }),
+          );
         }
       }
-      await db.query('COMMIT');
-      // WF1 final step: render + write to the client's Drive folder, off the
-      // request path (best-effort; dry-run until Google OAuth is configured).
-      void publishApproved(table, req.params.id).catch((err) =>
-        logError(`review.${table}_publish`, 'Drive publish failed', err, { id: req.params.id }),
-      );
-      // Client-facing deliverables in Nicole's own templates (ROF/Supplement/Flow
-      // Sheet) fire on the FIRST Protocol approval only — re-approval must not
-      // append a second Flow Sheet block or a duplicate dated Supplement.
-      if (table === 'protocols' && firstApproval) {
-        void publishClientTemplates(req.params.id).catch((err) =>
-          logError('review.protocol_templates', 'template publish failed', err, { id: req.params.id }),
-        );
-      }
-      return res.json(r.rows[0]);
+
+      const row = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
+      return res.json(row.rows[0]);
     } catch (err) {
-      await db.query('ROLLBACK');
       logError(`review.${table}_approve`, 'approve failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
-    } finally {
-      db.release();
     }
   };
 }
 
-// ---------------------------------------------------------------------------
-// GET /review/:kind/:id/context — everything Nicole needs to compare this
-// draft against what's already on file before she approves: the last
-// APPROVED sheet/protocol for the same client (never a draft — a draft isn't
-// yet her word), and the client's running supplement plan both as it stands
-// now and as this draft would leave it (a pure preview; nothing is written).
-// ---------------------------------------------------------------------------
 function contextOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
@@ -638,20 +745,22 @@ function contextOne(table: Table) {
 // Appointment Sheets (internal)
 reviewRouter.get('/sheets/:id', getOne('appointment_sheets'));
 reviewRouter.patch('/sheets/:id', patchOne('appointment_sheets'));
-reviewRouter.post('/sheets/:id/approve', approveOne('appointment_sheets', 'appointment_sheet'));
+reviewRouter.post('/sheets/:id/approve', approveOne('appointment_sheets'));
 reviewRouter.get('/sheets/:id/context', contextOne('appointment_sheets'));
-reviewRouter.post('/sheets/:id/amend', amendOne('appointment_sheets', 'appointment_sheet'));
+reviewRouter.post('/sheets/:id/amend', amendOne('appointment_sheets'));
 reviewRouter.get('/sheets/:id/revisions', revisionsOne('appointment_sheets'));
 reviewRouter.get('/sheets/:id/history', historyOne('appointment_sheets'));
+reviewRouter.post('/sheets/:id/unmatch', unmatchOne('appointment_sheets'));
 
 // Protocols (client-facing)
 reviewRouter.get('/protocols/:id', getOne('protocols'));
 reviewRouter.patch('/protocols/:id', patchOne('protocols'));
-reviewRouter.post('/protocols/:id/approve', approveOne('protocols', 'protocol'));
+reviewRouter.post('/protocols/:id/approve', approveOne('protocols'));
 reviewRouter.get('/protocols/:id/context', contextOne('protocols'));
-reviewRouter.post('/protocols/:id/amend', amendOne('protocols', 'protocol'));
+reviewRouter.post('/protocols/:id/amend', amendOne('protocols'));
 reviewRouter.get('/protocols/:id/revisions', revisionsOne('protocols'));
 reviewRouter.get('/protocols/:id/history', historyOne('protocols'));
+reviewRouter.post('/protocols/:id/unmatch', unmatchOne('protocols'));
 
 // ---------------------------------------------------------------------------
 // Rendered documents — Markdown produced from the current content_json.

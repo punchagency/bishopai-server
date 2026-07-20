@@ -12,8 +12,14 @@ dashboardRouter.get('/overview', async (_req, res) => {
     const [stats, activity, upcoming] = await Promise.all([
       pool.query(
         `SELECT
-           (SELECT count(*) FROM appointment_sheets WHERE status IN ('draft','in_review'))
-         + (SELECT count(*) FROM protocols        WHERE status IN ('draft','in_review')) AS awaiting_review,
+           -- Count SESSIONS, not documents. A sheet and a protocol are the same
+           -- note approved together, so summing both counted every visit twice
+           -- and left the badge disagreeing with the list it links to.
+           (SELECT count(*) FROM appointments a
+             WHERE EXISTS (SELECT 1 FROM appointment_sheets s
+                            WHERE s.appointment_id = a.id AND s.status IN ('draft','in_review'))
+                OR EXISTS (SELECT 1 FROM protocols p
+                            WHERE p.appointment_id = a.id AND p.status IN ('draft','in_review'))) AS awaiting_review,
            (SELECT count(*) FROM conversations WHERE appointment_id IS NULL)              AS unmatched,
            (SELECT count(*) FROM appointments  WHERE starts_at > now())                   AS upcoming,
            (SELECT count(*) FROM approvals     WHERE approved_at::date = now()::date)     AS approved_today,

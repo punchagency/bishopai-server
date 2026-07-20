@@ -280,11 +280,20 @@ suite('amending an approved note (integration, real Postgres)', () => {
     expect(dates[0]).toBeGreaterThan(dates[1]);
   });
 
-  it('lists approved notes only under ?status=approved', async () => {
+  it('lists the session once, under the scope matching its combined status', async () => {
+    // The queue is one row per SESSION now, not one per document — a sheet and a
+    // protocol are the same note and were previously listed twice.
     const approved = await (await get('/review/queue?status=approved')).json();
-    expect(approved.protocols.map((p: { id: string }) => p.id)).toContain(protocolId);
+    const mine = approved.sessions.filter(
+      (x: { appointment_id: string }) => x.appointment_id === appointmentId,
+    );
+    expect(mine).toHaveLength(1);
+    expect(mine[0].protocol_id).toBe(protocolId);
+    expect(mine[0].status).toBe('approved');
 
     const pending = await (await get('/review/queue')).json();
-    expect(pending.protocols.map((p: { id: string }) => p.id)).not.toContain(protocolId);
+    expect(
+      pending.sessions.some((x: { appointment_id: string }) => x.appointment_id === appointmentId),
+    ).toBe(false);
   });
 });
