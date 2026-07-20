@@ -65,10 +65,11 @@ export interface FlowSheetEntry {
   date: string;
   /** SYMPTOMS column (merged). */
   symptoms?: string;
-  /** FOUNDATION findings, appended below the template's scaffold. Omit to leave
-   *  the blank scaffold for Nicole to fill in-session. */
+  /** FOUNDATION column: the prompt scaffold with each captured finding written
+   *  onto its own prompt line (see renderFoundation). Prompts the session never
+   *  covered stay bare, for Nicole to fill in-session. */
   foundation?: string;
-  /** BODY SCAN findings, appended below the scaffold. Omit to leave blank. */
+  /** BODY SCAN column, same prompt-scaffold treatment (see renderBodyScan). */
   bodyScan?: string;
   /** PROTOCOL column free text. */
   protocol?: string;

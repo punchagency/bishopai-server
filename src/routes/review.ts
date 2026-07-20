@@ -5,9 +5,15 @@ import { logError, logEvent } from '../observability/logger';
 import { coerceSessionNote, renderAppointmentSheet, renderProtocol } from '../session/render';
 import { processConversation } from '../session/process';
 import { publishApproved } from '../session/publish';
-import { publishClientTemplates } from '../session/publishTemplates';
-import { syncClientSupplements, fetchCurrentSupplements, previewSupplementMerge } from '../session/supplements';
+import { publishClientTemplates, republishAmended } from '../session/publishTemplates';
+import {
+  syncClientSupplements,
+  fetchCurrentSupplements,
+  previewSupplementMerge,
+  removeSupplementsDroppedByAmendment,
+} from '../session/supplements';
 import { createTasksFromNote } from '../tasks/service';
+import { fetchRevisions, snapshotRevision } from '../session/revisions';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
 // session extraction, with edit + approve. (No auth yet — approved_by is a
@@ -27,6 +33,14 @@ const patchSchema = z
 
 const approveSchema = z.object({ approved_by: z.string().optional() });
 
+// Amending an approved note is a deliberate correction, not a save: the reason
+// is recorded alongside the superseded version so the change is explicable later.
+const amendSchema = z.object({
+  content_json: z.record(z.string(), z.unknown()),
+  reason: z.string().max(500).optional(),
+  amended_by: z.string().optional(),
+});
+
 const isUuid = (id: string) => z.uuid().safeParse(id).success;
 
 function fmtDate(v: unknown): string {
@@ -37,8 +51,16 @@ function fmtDate(v: unknown): string {
 
 // ---------------------------------------------------------------------------
 // GET /review/queue — everything awaiting Nicole (draft + in_review).
+// GET /review/queue?status=approved — what she has already signed off on, so a
+// finished session stays reachable instead of vanishing from the app entirely.
+// Approved rows are capped: this is a recent-history list, not an archive.
 // ---------------------------------------------------------------------------
-reviewRouter.get('/queue', async (_req, res) => {
+const APPROVED_LIMIT = 100;
+
+reviewRouter.get('/queue', async (req, res) => {
+  const approved = req.query.status === 'approved';
+  const statuses = approved ? ['approved'] : ['draft', 'in_review'];
+  const limit = approved ? `LIMIT ${APPROVED_LIMIT}` : '';
   try {
     const sheets = await pool.query(
       `SELECT s.id, s.status, s.content_json, s.updated_at,
@@ -47,16 +69,24 @@ reviewRouter.get('/queue', async (_req, res) => {
          FROM appointment_sheets s
          JOIN appointments a ON a.id = s.appointment_id
     LEFT JOIN clients c ON c.id = s.client_id
-        WHERE s.status IN ('draft', 'in_review')
-     ORDER BY a.starts_at DESC`,
+        WHERE s.status = ANY($1)
+     ORDER BY a.starts_at DESC ${limit}`,
+      [statuses],
     );
+    // Join appointments for starts_at: without it the list falls back to
+    // updated_at, which is when the ROW was written. A client with several
+    // sessions then shows a stack of protocols all stamped the same day —
+    // indistinguishable, and wrong.
     const protocols = await pool.query(
       `SELECT p.id, p.status, p.content_json, p.updated_at, p.appointment_id,
+              a.starts_at, a.ends_at,
               c.id AS client_id, c.name AS client_name
          FROM protocols p
+    LEFT JOIN appointments a ON a.id = p.appointment_id
     LEFT JOIN clients c ON c.id = p.client_id
-        WHERE p.status IN ('draft', 'in_review')
-     ORDER BY p.updated_at DESC`,
+        WHERE p.status = ANY($1)
+     ORDER BY COALESCE(a.starts_at, p.updated_at) DESC ${limit}`,
+      [statuses],
     );
     res.json({ appointment_sheets: sheets.rows, protocols: protocols.rows });
   } catch (err) {
@@ -177,6 +207,26 @@ function patchOne(table: Table) {
     }
     const { content_json, status } = parsed.data;
     try {
+      // An approved note has already been published to Drive and may have been
+      // emailed to the client. Editing it here would leave the record and the
+      // delivered document disagreeing, with nothing to show it happened — and
+      // re-approving does NOT republish (see firstApproval below), so the drift
+      // would be permanent and silent. Corrections go through /amend, which
+      // snapshots the superseded version and republishes what it safely can.
+      if (content_json) {
+        const cur = await pool.query<{ status: string }>(
+          `SELECT status FROM ${table} WHERE id = $1`,
+          [req.params.id],
+        );
+        if (cur.rowCount === 0) return res.status(404).json({ error: 'not found' });
+        if (cur.rows[0].status === 'approved') {
+          return res.status(409).json({
+            error: 'already approved',
+            detail: 'This note has been approved and its documents published. Use amend to correct it.',
+          });
+        }
+      }
+
       const r = await pool.query(
         `UPDATE ${table}
             SET content_json = COALESCE($2, content_json),
@@ -189,6 +239,213 @@ function patchOne(table: Table) {
       return res.json(r.rows[0]);
     } catch (err) {
       logError(`review.${table}_patch`, 'update failed', err, { id: req.params.id });
+      return res.status(500).json({ error: 'internal error' });
+    }
+  };
+}
+
+/**
+ * POST /review/:kind/:id/amend — correct a note that has already been approved.
+ *
+ * Not an edit: the superseded content is filed in `note_revisions` first, so
+ * what Nicole originally signed off on stays recoverable and the change is
+ * attributable. Then the documents are brought back into line, which is the
+ * whole reason plain PATCH is refused on approved rows — republishing has to be
+ * done deliberately and selectively, because the three templates behave
+ * differently (see republishAmended).
+ */
+function amendOne(table: Table, approvalType: string) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+    const parsed = amendSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'invalid payload', details: parsed.error.issues });
+    }
+    const { content_json, reason } = parsed.data;
+    const amendedBy = parsed.data.amended_by || 'nicole';
+
+    const db = await pool.connect();
+    try {
+      await db.query('BEGIN');
+      const cur = await db.query<{ status: string; content_json: unknown; client_id: string | null; appointment_id: string | null }>(
+        `SELECT status, content_json, client_id, appointment_id FROM ${table} WHERE id = $1 FOR UPDATE`,
+        [req.params.id],
+      );
+      if (cur.rowCount === 0) {
+        await db.query('ROLLBACK');
+        return res.status(404).json({ error: 'not found' });
+      }
+      if (cur.rows[0].status !== 'approved') {
+        await db.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'not approved',
+          detail: 'Only an approved note is amended. Edit this one directly instead.',
+        });
+      }
+
+      const revision = await snapshotRevision(
+        db,
+        table,
+        req.params.id,
+        cur.rows[0].content_json,
+        reason ?? null,
+      );
+
+      const upd = await db.query(
+        `UPDATE ${table} SET content_json = $2 WHERE id = $1 RETURNING *`,
+        [req.params.id, JSON.stringify(content_json)],
+      );
+
+      await db.query(
+        `INSERT INTO approvals (type, payload_json, status, approved_by, approved_at)
+              VALUES ($1, $2, 'amended', $3, now())`,
+        [
+          approvalType,
+          JSON.stringify({ [`${approvalType}_id`]: req.params.id, revision, reason: reason ?? null }),
+          amendedBy,
+        ],
+      );
+
+      // An amended protocol changes the supplement plan, so re-run the same sync
+      // the approval does. It's keyed by name and idempotent, so re-applying the
+      // corrected note converges rather than duplicating.
+      if (table === 'protocols' && cur.rows[0].client_id) {
+        const appt = await db.query<{ starts_at: string | null }>(
+          `SELECT starts_at FROM appointments WHERE id = $1`,
+          [cur.rows[0].appointment_id],
+        );
+        const startDate = appt.rows[0]?.starts_at
+          ? new Date(appt.rows[0].starts_at).toISOString().slice(0, 10)
+          : null;
+        await syncClientSupplements(db, cur.rows[0].client_id, startDate, content_json);
+        // Sync alone can't retract: it only ever removes on an explicit 'stop'.
+        const dropped = await removeSupplementsDroppedByAmendment(
+          db,
+          cur.rows[0].client_id,
+          cur.rows[0].content_json,
+          content_json,
+        );
+        if (dropped > 0) {
+          logEvent('info', 'review.protocol_amend', 'removed supplements retracted by amendment', {
+            id: req.params.id,
+            dropped,
+          });
+        }
+      }
+
+      await db.query('COMMIT');
+
+      logEvent('info', `review.${table}_amend`, 'amended an approved note', {
+        id: req.params.id,
+        revision,
+        amendedBy,
+      });
+
+      // Off the request path, like the approve publish. Which documents can be
+      // safely rewritten differs per template — republishAmended decides.
+      void publishApproved(table, req.params.id).catch((err) =>
+        logError(`review.${table}_amend_publish`, 'Drive publish failed', err, { id: req.params.id }),
+      );
+      if (table === 'protocols') {
+        void republishAmended(req.params.id).catch((err) =>
+          logError('review.protocol_amend_republish', 'republish failed', err, { id: req.params.id }),
+        );
+      }
+
+      return res.json({ ...upd.rows[0], revision });
+    } catch (err) {
+      await db.query('ROLLBACK').catch(() => {});
+      logError(`review.${table}_amend`, 'amend failed', err, { id: req.params.id });
+      return res.status(500).json({ error: 'internal error' });
+    } finally {
+      db.release();
+    }
+  };
+}
+
+/**
+ * GET /review/:kind/:id/history — the client's previous sessions, newest first.
+ *
+ * `context` returns only the single most recent session, which answers "what
+ * changed since last time" but not "is this getting better", and the latter is
+ * the question a running flow sheet exists to answer. Her paper sheet stacks
+ * every visit in one place; this is the data behind doing the same on screen.
+ *
+ * One entry per APPOINTMENT, preferring the appointment sheet and falling back
+ * to the protocol — the two carry the same clinical fields and either may be the
+ * one she approved, so keying on the appointment avoids listing a visit twice.
+ */
+const HISTORY_LIMIT = 8;
+
+function historyOne(table: Table) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+    try {
+      const item = await pool.query<{
+        client_id: string | null;
+        appointment_id: string | null;
+        starts_at: string | null;
+      }>(
+        `SELECT t.client_id, t.appointment_id, a.starts_at
+           FROM ${table} t
+      LEFT JOIN appointments a ON a.id = t.appointment_id
+          WHERE t.id = $1`,
+        [req.params.id],
+      );
+      if (item.rowCount === 0) return res.status(404).json({ error: 'not found' });
+      const { client_id: clientId, appointment_id: apptId, starts_at: startsAt } = item.rows[0];
+      if (!clientId) return res.json({ total: 0, sessions: [] });
+
+      // Count first: the list is capped, and silently dropping older visits
+      // would misrepresent the client's history as shorter than it is.
+      const totalRow = await pool.query<{ n: string }>(
+        `SELECT count(*) AS n
+           FROM appointments a
+      LEFT JOIN appointment_sheets s ON s.appointment_id = a.id AND s.status = 'approved'
+      LEFT JOIN protocols p ON p.appointment_id = a.id AND p.status = 'approved'
+          WHERE a.client_id = $1
+            AND ($2::uuid IS NULL OR a.id IS DISTINCT FROM $2::uuid)
+            AND ($3::timestamptz IS NULL OR a.starts_at < $3::timestamptz)
+            AND (s.id IS NOT NULL OR p.id IS NOT NULL)`,
+        [clientId, apptId, startsAt],
+      );
+
+      const r = await pool.query<{ starts_at: string; content_json: unknown }>(
+        `SELECT a.starts_at, COALESCE(s.content_json, p.content_json) AS content_json
+           FROM appointments a
+      LEFT JOIN appointment_sheets s ON s.appointment_id = a.id AND s.status = 'approved'
+      LEFT JOIN protocols p ON p.appointment_id = a.id AND p.status = 'approved'
+          WHERE a.client_id = $1
+            AND ($2::uuid IS NULL OR a.id IS DISTINCT FROM $2::uuid)
+            AND ($3::timestamptz IS NULL OR a.starts_at < $3::timestamptz)
+            AND (s.id IS NOT NULL OR p.id IS NOT NULL)
+       ORDER BY a.starts_at DESC
+          LIMIT $4`,
+        [clientId, apptId, startsAt, HISTORY_LIMIT],
+      );
+
+      return res.json({
+        total: Number(totalRow.rows[0]?.n ?? 0),
+        sessions: r.rows.map((x) => ({
+          date: x.starts_at,
+          note: coerceSessionNote(x.content_json),
+        })),
+      });
+    } catch (err) {
+      logError(`review.${table}_history`, 'history query failed', err, { id: req.params.id });
+      return res.status(500).json({ error: 'internal error' });
+    }
+  };
+}
+
+/** GET /review/:kind/:id/revisions — the superseded versions, newest first. */
+function revisionsOne(table: Table) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+    try {
+      return res.json({ revisions: await fetchRevisions(table, req.params.id) });
+    } catch (err) {
+      logError(`review.${table}_revisions`, 'fetch failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
     }
   };
@@ -299,8 +556,16 @@ function contextOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
     try {
-      const item = await pool.query<{ client_id: string | null; content_json: unknown }>(
-        `SELECT client_id, content_json FROM ${table} WHERE id = $1`,
+      const item = await pool.query<{
+        client_id: string | null;
+        content_json: unknown;
+        appointment_id: string | null;
+        starts_at: string | null;
+      }>(
+        `SELECT t.client_id, t.content_json, t.appointment_id, a.starts_at
+           FROM ${table} t
+      LEFT JOIN appointments a ON a.id = t.appointment_id
+          WHERE t.id = $1`,
         [req.params.id],
       );
       if (item.rowCount === 0) return res.status(404).json({ error: 'not found' });
@@ -315,19 +580,36 @@ function contextOne(table: Table) {
         });
       }
 
+      // "Prior" means the previous SESSION, so it is ordered by when the
+      // appointment happened — not by updated_at, which is a row-modification
+      // timestamp and reorders itself every time a note is re-approved or a
+      // seed re-runs. Rows from THIS appointment are excluded by appointment_id
+      // rather than row id: a protocol and its sheet share an appointment but
+      // live in different tables with different ids, so excluding on id alone
+      // would offer this very session back as its own history.
+      const apptId = item.rows[0].appointment_id;
+      const startsAt = item.rows[0].starts_at;
+      const priorSql = (t: Table) => `
+        SELECT x.content_json, a.starts_at
+          FROM ${t} x
+          JOIN appointments a ON a.id = x.appointment_id
+         WHERE x.client_id = $1
+           AND x.status = 'approved'
+           AND ($2::uuid IS NULL OR x.appointment_id IS DISTINCT FROM $2::uuid)
+           AND ($3::timestamptz IS NULL OR a.starts_at < $3::timestamptz)
+      ORDER BY a.starts_at DESC LIMIT 1`;
+
       const [priorSheet, priorProtocol, current] = await Promise.all([
-        pool.query<{ content_json: unknown; updated_at: string }>(
-          `SELECT content_json, updated_at FROM appointment_sheets
-            WHERE client_id = $1 AND status = 'approved' AND id <> $2
-         ORDER BY updated_at DESC LIMIT 1`,
-          [clientId, req.params.id],
-        ),
-        pool.query<{ content_json: unknown; updated_at: string }>(
-          `SELECT content_json, updated_at FROM protocols
-            WHERE client_id = $1 AND status = 'approved' AND id <> $2
-         ORDER BY updated_at DESC LIMIT 1`,
-          [clientId, req.params.id],
-        ),
+        pool.query<{ content_json: unknown; starts_at: string }>(priorSql('appointment_sheets'), [
+          clientId,
+          apptId,
+          startsAt,
+        ]),
+        pool.query<{ content_json: unknown; starts_at: string }>(priorSql('protocols'), [
+          clientId,
+          apptId,
+          startsAt,
+        ]),
         fetchCurrentSupplements(clientId),
       ]);
 
@@ -335,10 +617,10 @@ function contextOne(table: Table) {
         client_id: clientId,
         prior: {
           sheet: priorSheet.rowCount
-            ? { date: priorSheet.rows[0].updated_at, note: coerceSessionNote(priorSheet.rows[0].content_json) }
+            ? { date: priorSheet.rows[0].starts_at, note: coerceSessionNote(priorSheet.rows[0].content_json) }
             : null,
           protocol: priorProtocol.rowCount
-            ? { date: priorProtocol.rows[0].updated_at, note: coerceSessionNote(priorProtocol.rows[0].content_json) }
+            ? { date: priorProtocol.rows[0].starts_at, note: coerceSessionNote(priorProtocol.rows[0].content_json) }
             : null,
         },
         supplementPlan: {
@@ -358,12 +640,18 @@ reviewRouter.get('/sheets/:id', getOne('appointment_sheets'));
 reviewRouter.patch('/sheets/:id', patchOne('appointment_sheets'));
 reviewRouter.post('/sheets/:id/approve', approveOne('appointment_sheets', 'appointment_sheet'));
 reviewRouter.get('/sheets/:id/context', contextOne('appointment_sheets'));
+reviewRouter.post('/sheets/:id/amend', amendOne('appointment_sheets', 'appointment_sheet'));
+reviewRouter.get('/sheets/:id/revisions', revisionsOne('appointment_sheets'));
+reviewRouter.get('/sheets/:id/history', historyOne('appointment_sheets'));
 
 // Protocols (client-facing)
 reviewRouter.get('/protocols/:id', getOne('protocols'));
 reviewRouter.patch('/protocols/:id', patchOne('protocols'));
 reviewRouter.post('/protocols/:id/approve', approveOne('protocols', 'protocol'));
 reviewRouter.get('/protocols/:id/context', contextOne('protocols'));
+reviewRouter.post('/protocols/:id/amend', amendOne('protocols', 'protocol'));
+reviewRouter.get('/protocols/:id/revisions', revisionsOne('protocols'));
+reviewRouter.get('/protocols/:id/history', historyOne('protocols'));
 
 // ---------------------------------------------------------------------------
 // Rendered documents — Markdown produced from the current content_json.

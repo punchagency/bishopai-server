@@ -119,6 +119,8 @@ export interface AppendResult {
   alreadyPresent?: boolean;
   /** True when the sheet had to be grown past its pre-formatted blocks. */
   grew?: boolean;
+  /** True when an existing block was overwritten in place (an amendment). */
+  rewritten?: boolean;
 }
 
 /**
@@ -164,6 +166,49 @@ export async function appendFlowSheetEntry(
   });
 
   return { blockIndex, headerRow: blockHeaderRow(blockIndex), cellsWritten: writes.length, grew };
+}
+
+/**
+ * Rewrite the block for this entry's DATE in place, for an amended session.
+ *
+ * Appending is wrong here: the client would end up with two blocks for one
+ * visit. And appendFlowSheetEntry is a no-op when the date is already present,
+ * so it can't be reused to push a correction through either.
+ *
+ * The block is reset to the blank scaffold before the new values land, so a
+ * finding the amendment REMOVED actually disappears rather than lingering from
+ * the previous write. Falls back to appending when the date isn't on the sheet
+ * (the original publish failed, or the sheet was rebuilt).
+ */
+export async function rewriteFlowSheetEntry(
+  spreadsheetId: string,
+  entry: FlowSheetEntry,
+): Promise<AppendResult> {
+  const meta = await firstSheetMeta(spreadsheetId);
+  const dates = await scanBlockDates(spreadsheetId, meta);
+  const blockIndex = dates.findIndex((d) => d === entry.date);
+  if (blockIndex < 0) return appendFlowSheetEntry(spreadsheetId, entry);
+
+  const writes = mergeWrites(
+    blankBlockWrites(blockIndex, meta.title),
+    buildFlowSheetBlock(entry, blockIndex, meta.title),
+  );
+
+  await driveRequest(`${SHEETS}/${spreadsheetId}/values:batchUpdate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      valueInputOption: 'RAW',
+      data: writes.map((w) => ({ range: w.range, values: [[w.value]] })),
+    }),
+  });
+
+  return {
+    blockIndex,
+    headerRow: blockHeaderRow(blockIndex),
+    cellsWritten: writes.length,
+    rewritten: true,
+  };
 }
 
 /** Overlay `over` onto `base`, last write per cell wins (entry beats blank scaffold). */

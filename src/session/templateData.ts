@@ -1,12 +1,14 @@
 import type { SessionNote } from './extract';
 import { followUpTexts } from './followups';
 import type { CurrentSupplementRow } from './supplements';
+import { renderBodyScan, renderFoundation } from '../integrations/docs/flowsheet';
 import type {
   RofData,
   SupplementProtocolData,
   SupplementRow,
   FlowSheetEntry,
   ProtocolLine,
+  ScheduleSlot,
 } from '../integrations/docs/types';
 
 // Map an extracted SessionNote onto Nicole's three template shapes. The extraction
@@ -36,11 +38,22 @@ function describeSupplement(s: SessionNote['supplements'][number]): string {
  *  is still here — the grid reflects the FULL current protocol, not just
  *  today's deltas. */
 function supplementRows(current: CurrentSupplementRow[]): SupplementRow[] {
-  return current.map((s) => ({
-    name: s.name,
-    specialInstructions: s.dose ?? undefined,
-    bottleQuantity: s.qty ?? undefined,
-  }));
+  return current.map((s) => {
+    // Drop null/blank slots so an unstated time-of-day leaves its column empty
+    // rather than writing an empty string over the template's formatting.
+    const schedule: Partial<Record<ScheduleSlot, string>> = {};
+    for (const [slot, amount] of Object.entries(s.schedule ?? {})) {
+      const v = amount?.trim();
+      if (v) schedule[slot as ScheduleSlot] = v;
+    }
+    return {
+      name: s.name,
+      specialInstructions: s.dose ?? undefined,
+      bottleQuantity: s.qty ?? undefined,
+      schedule: Object.keys(schedule).length ? schedule : undefined,
+      source: text(s.source),
+    };
+  });
 }
 
 /**
@@ -86,10 +99,26 @@ export function toFlowSheetEntry(note: SessionNote, ctx: { date: string }): Flow
     ? note.supplements.map(describeSupplement).join('\n')
     : undefined;
 
-  // FOUNDATION column: the muscle-testing findings when captured, else fall back to
-  // the practitioner's assessments — the closest thing the transcript yields.
-  const foundation =
-    text(note.nrt?.foundation) ?? (note.assessments.length ? note.assessments.join('\n') : undefined);
+  // FOUNDATION / BODY SCAN: fill each muscle-testing prompt on its own line, so an
+  // untested prompt stays visibly bare rather than being hidden inside a blob.
+  // Anything the practitioner said that maps to no prompt falls through to
+  // ADDITIONAL — including the assessments, which are the closest the transcript
+  // gets when the foundation pass itself was never narrated.
+  // When the session captured nothing for a column, emit nothing: the template's
+  // own blank scaffold is already in the cell, and rewriting it would be noise.
+  const some = (o?: object | null): boolean => !!o && Object.values(o).some((v) => v?.trim?.());
+
+  // The assessments fallback applies only when the foundation pass was never
+  // narrated at all. Once there are real muscle-testing findings, mixing the
+  // practitioner's general assessments in among them would misattribute them.
+  const tested = note.nrt?.foundation;
+  const fnd = some(tested)
+    ? tested
+    : { additional: note.assessments.length ? note.assessments.join('\n') : null };
+  const foundation = some(fnd) ? renderFoundation(fnd) : undefined;
+
+  const bs = note.nrt?.body_scan;
+  const bodyScan = some(bs) ? renderBodyScan(bs) : undefined;
 
   const ls = note.lifestyle;
   const notes = ls && {
@@ -105,7 +134,7 @@ export function toFlowSheetEntry(note: SessionNote, ctx: { date: string }): Flow
     date: ctx.date,
     symptoms: join(note.concerns),
     foundation,
-    bodyScan: text(note.nrt?.body_scan),
+    bodyScan,
     protocol,
     notes: notes && Object.values(notes).some(Boolean) ? notes : undefined,
   };

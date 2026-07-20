@@ -2,6 +2,7 @@ import type { PoolClient } from 'pg';
 import { pool } from '../db/pool';
 import { coerceSessionNote } from './render';
 import type { SessionNote } from './extract';
+import type { ScheduleSlot } from '../integrations/docs/types';
 
 // WF1 → WF2/WF4 linkage: when Nicole approves a client's Protocol, persist its
 // supplement changes into the `supplements` table — the shared "current plan"
@@ -55,15 +56,25 @@ export async function syncClientSupplements(
       `SELECT id FROM supplements WHERE client_id = $1 AND lower(name) = lower($2) LIMIT 1`,
       [clientId, name],
     );
+    // Only overwrite the stored schedule when this session actually stated timing;
+    // otherwise the row keeps whatever slot pattern an earlier session established.
+    const schedule = s.schedule && Object.values(s.schedule).some(Boolean)
+      ? JSON.stringify(s.schedule)
+      : null;
+
     if (existing.rowCount) {
       await db.query(
-        `UPDATE supplements SET name = $2, dose = $3, qty = $4, start_date = $5, source = 'notes' WHERE id = $1`,
-        [existing.rows[0].id, name, s.dose, s.quantity, startDate],
+        `UPDATE supplements
+            SET name = $2, dose = $3, qty = $4, start_date = $5, source = 'notes',
+                schedule = COALESCE($6::jsonb, schedule)
+          WHERE id = $1`,
+        [existing.rows[0].id, name, s.dose, s.quantity, startDate, schedule],
       );
     } else {
       await db.query(
-        `INSERT INTO supplements (client_id, name, dose, qty, start_date, source) VALUES ($1, $2, $3, $4, $5, 'notes')`,
-        [clientId, name, s.dose, s.quantity, startDate],
+        `INSERT INTO supplements (client_id, name, dose, qty, start_date, source, schedule)
+         VALUES ($1, $2, $3, $4, $5, 'notes', $6::jsonb)`,
+        [clientId, name, s.dose, s.quantity, startDate, schedule],
       );
     }
     upserted++;
@@ -76,6 +87,10 @@ export interface CurrentSupplementRow {
   name: string;
   dose: string | null;
   qty: number | null;
+  /** Dosing slots for the protocol grid's D–J columns; null if never stated. */
+  schedule?: Partial<Record<ScheduleSlot, string | null>> | null;
+  /** Where the client obtains it — the grid's "Here | Fullscript" column. */
+  source?: string | null;
 }
 
 /** The client's running supplement plan — accumulated across every approved
@@ -83,7 +98,7 @@ export interface CurrentSupplementRow {
  *  Protocol document's grid should actually be built from. */
 export async function fetchCurrentSupplements(clientId: string): Promise<CurrentSupplementRow[]> {
   const r = await pool.query<CurrentSupplementRow>(
-    `SELECT name, dose, qty FROM supplements WHERE client_id = $1 ORDER BY name`,
+    `SELECT name, dose, qty, schedule, source FROM supplements WHERE client_id = $1 ORDER BY name`,
     [clientId],
   );
   return r.rows;
@@ -108,7 +123,59 @@ export function previewSupplementMerge(
       map.delete(key);
       continue;
     }
-    map.set(key, { name, dose: s.dose, qty: s.quantity });
+    const prior = map.get(key);
+    const stated = s.schedule && Object.values(s.schedule).some(Boolean) ? s.schedule : null;
+    map.set(key, {
+      name,
+      dose: s.dose,
+      qty: s.quantity,
+      // Mirrors the COALESCE in syncClientSupplements: an unstated schedule keeps
+      // whatever an earlier session established rather than clearing it.
+      schedule: stated ?? prior?.schedule ?? null,
+      source: prior?.source ?? null,
+    });
   }
   return [...map.values()];
+}
+
+/**
+ * Undo supplements that an amendment took back out of the note.
+ *
+ * syncClientSupplements deliberately never removes a supplement just because a
+ * note doesn't mention it — the plan is cumulative, so a supplement from an
+ * earlier session must survive a session that didn't discuss it. That's right
+ * for a normal approval and wrong for an amendment: "I added the wrong
+ * supplement" is the single most likely reason to amend a protocol, and without
+ * this the mistaken row would stay on the plan forever.
+ *
+ * Scoped narrowly on purpose. Only a supplement the superseded note itself
+ * STARTED, and which the amended note no longer mentions at all, is removed.
+ * A dropped 'increase'/'continue' is left alone: that supplement was already on
+ * the plan before this session, so the amendment is retracting the change, not
+ * the supplement.
+ */
+export async function removeSupplementsDroppedByAmendment(
+  db: PoolClient,
+  clientId: string,
+  supersededNote: unknown,
+  amendedNote: unknown,
+): Promise<number> {
+  const before = coerceSessionNote(supersededNote);
+  const after = coerceSessionNote(amendedNote);
+  const stillNamed = new Set(
+    after.supplements.map((s) => s.name?.trim().toLowerCase()).filter(Boolean),
+  );
+
+  let removed = 0;
+  for (const s of before.supplements) {
+    const name = s.name?.trim();
+    if (!name || s.change !== 'start') continue;
+    if (stillNamed.has(name.toLowerCase())) continue;
+    const r = await db.query(
+      `DELETE FROM supplements WHERE client_id = $1 AND lower(name) = lower($2)`,
+      [clientId, name],
+    );
+    removed += r.rowCount ?? 0;
+  }
+  return removed;
 }

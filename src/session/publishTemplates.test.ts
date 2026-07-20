@@ -37,7 +37,10 @@ describe('renderClientTemplates', () => {
     // Flow Sheet entry carries the human date + mapped summaries.
     expect(out.flowEntry.date).toBe('July 9, 2026');
     expect(out.flowEntry.symptoms).toBe('Fatigue');
-    expect(out.flowEntry.foundation).toBe('Adrenal stress');
+    // No muscle-testing pass in this note, so the assessments fall through to the
+    // scaffold's ADDITIONAL prompt and the rest stay bare.
+    expect(out.flowEntry.foundation).toContain('ADDITIONAL: Adrenal stress');
+    expect(out.flowEntry.foundation).toContain('HTA:\n');
     expect(out.flowEntry.protocol).toBe('Start Cataplex B 2 daily (qty 1)');
   });
 });

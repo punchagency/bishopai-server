@@ -1,4 +1,4 @@
-import { type SessionNote, SessionNoteSchema } from './extract';
+import { LifestyleSchema, NrtFindingsSchema, type SessionNote, SessionNoteSchema } from './extract';
 import { followUpTexts } from './followups';
 
 // Shared templating (build plan §7): the same SessionNote renders into an
@@ -37,12 +37,25 @@ function renderBilling(b: BillingBlock): string {
   return lines.join('\n');
 }
 
-/** Coerce stored/edited content_json into a SessionNote, tolerating partial edits. */
+/**
+ * Coerce stored/edited content_json into a SessionNote, tolerating partial edits.
+ *
+ * The fallback must salvage EVERY field the strict schema knows about, field by
+ * field. Dropping one here is silent and expensive: the review UI PATCHes partial
+ * notes constantly, so a note that fails strict parse still flows on to the ROF's
+ * NRT block, the Flow Sheet's FOUNDATION / BODY SCAN columns, and the prep brief's
+ * not_covered_last_time. A dropped `nrt` doesn't read as missing data downstream —
+ * it reads as "the practitioner never tested it", which is a clinical lie.
+ */
 export function coerceSessionNote(raw: unknown): SessionNote {
   const parsed = SessionNoteSchema.safeParse(raw);
   if (parsed.success) return parsed.data;
   const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const arr = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+  // Salvage the optional sub-objects independently: one malformed lifestyle field
+  // must not cost us the NRT findings, and vice versa.
+  const nrt = NrtFindingsSchema.safeParse(r.nrt);
+  const lifestyle = LifestyleSchema.safeParse(r.lifestyle);
   return {
     concerns: arr<string>(r.concerns),
     goals: arr<string>(r.goals),
@@ -50,6 +63,8 @@ export function coerceSessionNote(raw: unknown): SessionNote {
     protocol_changes: arr<SessionNote['protocol_changes'][number]>(r.protocol_changes),
     supplements: arr<SessionNote['supplements'][number]>(r.supplements),
     follow_ups: arr<SessionNote['follow_ups'][number]>(r.follow_ups),
+    ...(nrt.success ? { nrt: nrt.data } : {}),
+    ...(lifestyle.success ? { lifestyle: lifestyle.data } : {}),
   };
 }
 

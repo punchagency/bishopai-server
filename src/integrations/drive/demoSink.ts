@@ -49,7 +49,11 @@ export function writeDemoMarkdown(clientName: string, fileName: string, markdown
  * to a file). Loads the client's accumulated demo sheet if present, else the blank
  * template, fills the next empty block, and saves. Idempotent by date.
  */
-export async function appendDemoFlowSheet(clientName: string, entry: FlowSheetEntry): Promise<string> {
+export async function appendDemoFlowSheet(
+  clientName: string,
+  entry: FlowSheetEntry,
+  opts: { rewrite?: boolean } = {},
+): Promise<string> {
   const dir = join(demoDir()!, safe(clientName), 'AppointmentFlowSheet');
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${safe(clientName)} Appointment Flow Sheet.xlsx`);
@@ -65,7 +69,13 @@ export async function appendDemoFlowSheet(clientName: string, entry: FlowSheetEn
   for (let b = 0; b < blocks; b++) {
     const dateCell = ws.getCell(blockHeaderRow(b) + 1, 1).value; // col A, header+1
     const val = dateCell == null ? '' : String(dateCell);
-    if (val === entry.date) return path; // already appended for this date
+    // An amendment targets the block it already wrote; a normal publish treats
+    // a matching date as "already done" and leaves it alone.
+    if (val === entry.date) {
+      if (!opts.rewrite) return path;
+      target = b;
+      break;
+    }
     if (val === '' && target < 0) target = b;
   }
 
@@ -78,9 +88,13 @@ export async function appendDemoFlowSheet(clientName: string, entry: FlowSheetEn
     grew = true;
   }
 
-  const writes = grew
-    ? [...blankBlockWrites(target, ws.name), ...buildFlowSheetBlock(entry, target, ws.name)]
-    : buildFlowSheetBlock(entry, target, ws.name);
+  // Reset to the blank scaffold first when growing (inherited content from the
+  // copied block) or rewriting (so a finding the amendment removed disappears
+  // rather than lingering from the previous write).
+  const writes =
+    grew || opts.rewrite
+      ? [...blankBlockWrites(target, ws.name), ...buildFlowSheetBlock(entry, target, ws.name)]
+      : buildFlowSheetBlock(entry, target, ws.name);
   for (const w of writes) {
     const a1 = w.range.includes('!') ? w.range.split('!')[1] : w.range;
     ws.getCell(a1).value = w.value;

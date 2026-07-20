@@ -9,7 +9,7 @@ import {
   ensureConvertedSheet,
   type DocType,
 } from './files';
-import { appendFlowSheetEntry, type AppendResult } from './sheets';
+import { appendFlowSheetEntry, rewriteFlowSheetEntry, type AppendResult } from './sheets';
 import { demoDir, writeDemoBinary, appendDemoFlowSheet, writeDemoMarkdown } from './demoSink';
 
 // Presentation mode: setting DEMO_OUTPUT_DIR makes every publish ALSO emit the
@@ -31,7 +31,7 @@ export {
   SHEET_MIME,
   type DocType,
 } from './files';
-export { appendFlowSheetEntry } from './sheets';
+export { appendFlowSheetEntry, rewriteFlowSheetEntry } from './sheets';
 
 export interface PublishInput {
   /** Client folder name (used only when no stable folder id is known yet). */
@@ -183,6 +183,41 @@ export interface FlowSheetPublishResult extends Partial<AppendResult> {
  * write and returns `{ dryRun: true }`, so the post-session path is exercisable
  * offline and flips to real Sheets writes the moment credentials land.
  */
+/**
+ * Rewrite an amended session's own Flow Sheet block, rather than appending.
+ * Same shape as publishFlowSheet (demo mirror, dry-run gate), but it overwrites
+ * the block already carrying this entry's date — one visit, one block.
+ */
+export async function rewriteFlowSheetBlock(input: FlowSheetInput): Promise<FlowSheetPublishResult> {
+  let demoPath: string | undefined;
+  if (demoDir()) {
+    try {
+      demoPath = await appendDemoFlowSheet(input.clientName, input.entry, { rewrite: true });
+    } catch (err) {
+      logEvent('warn', 'drive.flowsheet', 'demo Flow Sheet rewrite failed', { error: String(err) });
+    }
+  }
+
+  if (!isDriveConfigured()) {
+    logEvent(
+      'info',
+      'drive.flowsheet',
+      demoPath ? 'rewrote demo Flow Sheet block' : '[dry-run] would rewrite a Flow Sheet block',
+      { client: input.clientName, spreadsheetId: input.spreadsheetId, date: input.entry.date, demoPath },
+    );
+    return { dryRun: true };
+  }
+
+  const res = await rewriteFlowSheetEntry(input.spreadsheetId, input.entry);
+  logEvent('info', 'drive.flowsheet', 'rewrote Flow Sheet block', {
+    client: input.clientName,
+    spreadsheetId: input.spreadsheetId,
+    block: res.blockIndex,
+    rewritten: res.rewritten ?? false,
+  });
+  return res;
+}
+
 export async function publishFlowSheet(input: FlowSheetInput): Promise<FlowSheetPublishResult> {
   let demoPath: string | undefined;
   if (demoDir()) {

@@ -15,10 +15,12 @@ const suite = dbUp ? describe : describe.skip;
 suite('supplement sync (integration, real Postgres)', () => {
   let clientId = '';
 
-  // pb_id outside the 'it-%' namespace correlation.int.test.ts bulk-deletes.
-  async function makeClient(): Promise<string> {
+  // pb_id outside the 'it-%' namespace correlation.int.test.ts bulk-deletes, and
+  // unique, so each test takes its own suffix rather than colliding.
+  async function makeClient(suffix = ''): Promise<string> {
     const r = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id) VALUES ('SS SuppSync', 'sstest-suppsync') RETURNING id`,
+      `INSERT INTO clients (name, pb_id) VALUES ('SS SuppSync', $1) RETURNING id`,
+      [`sstest-suppsync${suffix}`],
     );
     return r.rows[0].id;
   }
@@ -40,8 +42,13 @@ suite('supplement sync (integration, real Postgres)', () => {
   });
 
   afterAll(async () => {
-    await pool.query(`DELETE FROM supplements WHERE client_id = $1`, [clientId]).catch(() => {});
-    await pool.query(`DELETE FROM clients WHERE pb_id = 'sstest-suppsync'`).catch(() => {});
+    await pool
+      .query(
+        `DELETE FROM supplements WHERE client_id IN
+           (SELECT id FROM clients WHERE pb_id LIKE 'sstest-suppsync%')`,
+      )
+      .catch(() => {});
+    await pool.query(`DELETE FROM clients WHERE pb_id LIKE 'sstest-suppsync%'`).catch(() => {});
     await pool.end();
   });
 
@@ -95,6 +102,68 @@ suite('supplement sync (integration, real Postgres)', () => {
       );
       expect(r3).toEqual({ upserted: 1, removed: 0 });
       expect(await names()).toEqual(['Magnesium']);
+    } finally {
+      db.release();
+    }
+  });
+
+  it('keeps a stated dosing schedule and does not clear it on a silent session', async () => {
+    clientId = await makeClient('-sched');
+    const db = await pool.connect();
+    const scheduleOf = async (): Promise<unknown> => {
+      const r = await pool.query<{ schedule: unknown }>(
+        `SELECT schedule FROM supplements WHERE client_id = $1 AND name = 'Zypan'`,
+        [clientId],
+      );
+      return r.rows[0]?.schedule;
+    };
+    try {
+      // Session one states when it's taken.
+      await syncClientSupplements(
+        db,
+        clientId,
+        '2026-07-01',
+        note([
+          {
+            name: 'Zypan',
+            dose: '1 w/ meals',
+            quantity: 2,
+            change: 'start',
+            schedule: { breakfast: '1 tab', dinner: '1 tab' },
+          },
+        ]),
+      );
+      // The schema normalises to all seven slots; unstated ones are explicitly
+      // null, which is what keeps "not taken then" distinct from "unknown".
+      expect(await scheduleOf()).toMatchObject({ breakfast: '1 tab', dinner: '1 tab', lunch: null });
+
+      // Session two continues it without restating the timing. The established
+      // pattern must survive — clearing it would silently blank the protocol
+      // sheet's dosing columns for a supplement she never changed.
+      await syncClientSupplements(
+        db,
+        clientId,
+        '2026-08-01',
+        note([{ name: 'Zypan', dose: '1 w/ meals', quantity: 2, change: 'continue' }]),
+      );
+      expect(await scheduleOf()).toMatchObject({ breakfast: '1 tab', dinner: '1 tab' });
+
+      // A restated schedule replaces the old one outright.
+      await syncClientSupplements(
+        db,
+        clientId,
+        '2026-09-01',
+        note([
+          {
+            name: 'Zypan',
+            dose: '2 w/ meals',
+            quantity: 2,
+            change: 'increase',
+            schedule: { lunch: '2 tabs' },
+          },
+        ]),
+      );
+      expect(await scheduleOf()).toMatchObject({ lunch: '2 tabs', breakfast: null, dinner: null });
     } finally {
       db.release();
     }

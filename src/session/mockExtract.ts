@@ -65,14 +65,56 @@ const capture = (raw: string, re: RegExp): string | null => {
   return m?.[1]?.trim().replace(/[,\s]+$/, '') || null;
 };
 
+// FOUNDATION (col D) and BODY SCAN (col E) are prompt-by-prompt on the real sheet.
+// The mock captures whichever prompts the transcript happens to name; anything it
+// finds under a bare "foundation …" / "body scan …" phrasing lands in the
+// ADDITIONAL slot rather than being guessed into a specific prompt.
+/** A pass where no prompt was called is null, not an object of nulls. */
+const orNull = <T extends object>(o: T): T | null =>
+  Object.values(o).some(Boolean) ? o : null;
+
+function mockFoundation(raw: string): NonNullable<SessionNote['nrt']>['foundation'] {
+  return orNull({
+    laying1: capture(raw, field(String.raw`laying\s*1(?:\s+foundations?)?`)),
+    standing: capture(raw, field(String.raw`standing(?:\s+foundations?)?`)),
+    hta: capture(raw, field(String.raw`hta`)),
+    hta_post_run: capture(raw, field(String.raw`hta\s+post[\s-]?run`)),
+    laying2: capture(raw, field(String.raw`laying\s*2(?:\s+foundations?)?`)),
+    art_open: capture(raw, field(String.raw`open`)),
+    art_switch: capture(raw, field(String.raw`switch(?:ed|ing)?`)),
+    art_cns: capture(raw, field(String.raw`cns`)),
+    art_dental: capture(raw, field(String.raw`dental`)),
+    art_hormonal: capture(raw, field(String.raw`hormonal`)),
+    additional: capture(raw, field(String.raw`foundations?(?:\s+testing)?`)),
+  });
+}
+
+function mockBodyScan(raw: string): NonNullable<SessionNote['nrt']>['body_scan'] {
+  return orNull({
+    art_ectoderm: capture(raw, field(String.raw`ectoderm`)),
+    art_priority: capture(raw, field(String.raw`art\s+priority`)),
+    art_matrix: capture(raw, field(String.raw`art\s+matrix`)),
+    art_cell: capture(raw, field(String.raw`art\s+cell`)),
+    additional_art: capture(raw, field(String.raw`additional\s+art`)),
+    // These must NOT fall back to a bare "matrix"/"cell": the ART pass states
+    // the same three readings earlier in the session, so a bare match would take
+    // the ART value and file it under NRT — silently attributing a finding to a
+    // test that was never run. The prefix is required.
+    scan_priority: capture(raw, field(String.raw`scan\s+priority`)),
+    scan_matrix: capture(raw, field(String.raw`scan\s+matrix`)),
+    scan_cell: capture(raw, field(String.raw`scan\s+cell`)),
+    additional_nrt: capture(raw, field(String.raw`body[\s-]?scan`)),
+  });
+}
+
 function mockNrt(raw: string): SessionNote['nrt'] {
   return {
     pulse0: capture(raw, field(String.raw`pulse\s*0?`)),
     priority1: capture(raw, field(String.raw`priority\s*#?\s*1`)),
     k27: capture(raw, field(String.raw`k[\s-]?27`)),
     stressors: capture(raw, field(String.raw`stressors?`)),
-    foundation: capture(raw, field(String.raw`foundations?(?:\s+testing)?`)),
-    body_scan: capture(raw, field(String.raw`body[\s-]?scan`)),
+    foundation: mockFoundation(raw),
+    body_scan: mockBodyScan(raw),
   };
 }
 

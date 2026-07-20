@@ -31,6 +31,38 @@ describe('toSupplementData', () => {
     expect(data.notes).toBe('Recheck in 2 weeks');
     expect(data.toDo).toBe('Add liver support');
   });
+
+  it('fills the Daily Schedule slots and the Here/Fullscript column', () => {
+    const data = toSupplementData(
+      [
+        {
+          name: 'Cataplex B',
+          dose: '2 daily',
+          qty: 1,
+          schedule: { breakfast: '1 tab', beforeBed: '1 tab' },
+          source: 'Fullscript',
+        },
+      ],
+      note,
+    );
+    expect(data.rows[0]).toEqual({
+      name: 'Cataplex B',
+      specialInstructions: '2 daily',
+      bottleQuantity: 1,
+      schedule: { breakfast: '1 tab', beforeBed: '1 tab' },
+      source: 'Fullscript',
+    });
+  });
+
+  it('omits the schedule when no dosing time was stated', () => {
+    // Blank slots must stay blank — never spread a daily dose across meals.
+    const data = toSupplementData(
+      [{ name: 'Zypan', dose: '1 w/ meals', qty: 2, schedule: { lunch: '  ', dinner: null } }],
+      note,
+    );
+    expect(data.rows[0].schedule).toBeUndefined();
+    expect(data.rows[0].source).toBeUndefined();
+  });
 });
 
 // A session where Nicole called out the NRT findings and the client reported their
@@ -43,8 +75,30 @@ const richNote: SessionNote = {
     priority1: 'Immune stressor — upper GI',
     k27: 'Switched, corrected with rub',
     stressors: 'Immune, food (dairy)',
-    foundation: 'HTA positive; CNS switched',
-    body_scan: 'Matrix: liver; Cell: spleen',
+    foundation: {
+      laying1: null,
+      standing: null,
+      hta: 'positive',
+      hta_post_run: null,
+      laying2: null,
+      art_open: null,
+      art_switch: null,
+      art_cns: 'switched',
+      art_dental: null,
+      art_hormonal: null,
+      additional: null,
+    },
+    body_scan: {
+      art_ectoderm: null,
+      art_priority: null,
+      art_matrix: null,
+      art_cell: null,
+      additional_art: null,
+      scan_priority: null,
+      scan_matrix: 'liver',
+      scan_cell: 'spleen',
+      additional_nrt: null,
+    },
   },
   lifestyle: {
     bm: 'daily, formed',
@@ -86,16 +140,28 @@ describe('toFlowSheetEntry', () => {
     const entry = toFlowSheetEntry(note, { date: 'Jul 9, 2026' });
     expect(entry.date).toBe('Jul 9, 2026');
     expect(entry.symptoms).toBe('Fatigue; Bloating');
-    expect(entry.foundation).toBe('Adrenal stress\nLow stomach acid');
+    // No muscle-testing findings, so the assessments fall through to ADDITIONAL and
+    // every other prompt stays bare for Nicole to complete in-session.
+    expect(entry.foundation).toContain('ADDITIONAL: Adrenal stress\nLow stomach acid');
+    expect(entry.foundation).toContain('HTA:\nHTA POST RUN:');
     expect(entry.protocol).toBe('Start Cataplex B 2 daily (qty 1)\nContinue Zypan 1 w/ meals (qty 2)\nStop Old Supp');
     // Lifestyle log isn't extracted → left for Nicole.
     expect(entry.notes).toBeUndefined();
   });
 
-  it('prefers real muscle-testing findings over assessments, and fills the lifestyle log', () => {
+  it('writes each finding onto its own prompt line, and fills the lifestyle log', () => {
     const entry = toFlowSheetEntry(richNote, { date: 'Jul 9, 2026' });
-    expect(entry.foundation).toBe('HTA positive; CNS switched');
-    expect(entry.bodyScan).toBe('Matrix: liver; Cell: spleen');
+    // Findings land on their own prompt; untested prompts stay bare so Nicole can
+    // see at a glance what the session never covered.
+    expect(entry.foundation).toContain('HTA: positive');
+    expect(entry.foundation).toContain('CNS: switched');
+    expect(entry.foundation).toContain('HTA POST RUN:\n'); // never called → still bare
+    expect(entry.foundation).toContain('DENTAL: \n');
+    // Real muscle-testing findings win over the assessments fallback.
+    expect(entry.foundation).not.toContain('Adrenal stress');
+    expect(entry.bodyScan).toContain('MATRIX: liver');
+    expect(entry.bodyScan).toContain('CELL: spleen');
+    expect(entry.bodyScan).toContain('ECTODERM:\n'); // ART pass untested → bare
     expect(entry.notes).toEqual({
       bm: 'daily, formed',
       sleep: '6 hrs, waking at 3am',

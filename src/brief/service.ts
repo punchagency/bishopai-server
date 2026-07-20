@@ -63,15 +63,27 @@ export interface Brief {
   outstanding_billing: { status: string; amount_cents: number; appointment_date: string } | null;
 }
 
-function gaps(note: SessionNote): string[] {
+/**
+ * Was anything recorded for this field? Foundation and Body scan are whole
+ * multi-prompt testing passes, so a pass counts as covered when ANY of its
+ * prompts was called — the brief stays at the practitioner's granularity
+ * ("Foundation") rather than listing twenty bare prompts every morning.
+ */
+function stated(v: unknown): boolean {
+  if (typeof v === 'string') return v.trim().length > 0;
+  if (v && typeof v === 'object') return Object.values(v).some(stated);
+  return false;
+}
+
+export function gaps(note: SessionNote): string[] {
   const out: string[] = [];
-  const nrt = (note.nrt ?? {}) as Record<string, string | null | undefined>;
-  const ls = (note.lifestyle ?? {}) as Record<string, string | null | undefined>;
+  const nrt = (note.nrt ?? {}) as Record<string, unknown>;
+  const ls = (note.lifestyle ?? {}) as Record<string, unknown>;
   for (const [key, label] of Object.entries(NRT_LABELS)) {
-    if (!nrt[key]?.trim()) out.push(label);
+    if (!stated(nrt[key])) out.push(label);
   }
   for (const [key, label] of Object.entries(LIFESTYLE_LABELS)) {
-    if (!ls[key]?.trim()) out.push(label);
+    if (!stated(ls[key])) out.push(label);
   }
   return out;
 }

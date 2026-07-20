@@ -66,4 +66,40 @@ describe('coerceSessionNote', () => {
     expect(n.concerns).toEqual([]);
     expect(n.supplements).toEqual([]);
   });
+
+  // Regression: the fallback path used to rebuild only the six array fields, so a
+  // note that failed strict parse silently lost every NRT finding and the whole
+  // lifestyle log. Downstream that reads as "never tested", not "failed to parse".
+  it('keeps nrt and lifestyle when the note fails strict parse', () => {
+    const n = coerceSessionNote({
+      concerns: 'not-an-array', // forces the fallback path
+      nrt: { pulse0: '72', priority1: 'liver', k27: 'positive', stressors: 'immune, food' },
+      lifestyle: { bm: 'daily', sleep: '6 hours', water: '80oz' },
+    });
+    expect(n.concerns).toEqual([]); // fallback path confirmed
+    expect(n.nrt?.pulse0).toBe('72');
+    expect(n.nrt?.priority1).toBe('liver');
+    expect(n.nrt?.k27).toBe('positive');
+    expect(n.nrt?.stressors).toBe('immune, food');
+    expect(n.nrt?.foundation).toBeNull(); // unstated stays null, never invented
+    expect(n.lifestyle?.bm).toBe('daily');
+    expect(n.lifestyle?.sleep).toBe('6 hours');
+    expect(n.lifestyle?.cycle).toBeNull();
+  });
+
+  it('salvages nrt even when lifestyle is malformed', () => {
+    const n = coerceSessionNote({
+      concerns: 'not-an-array',
+      nrt: { pulse0: '68' },
+      lifestyle: 'not-an-object',
+    });
+    expect(n.nrt?.pulse0).toBe('68');
+    expect(n.lifestyle).toBeUndefined();
+  });
+
+  it('omits nrt and lifestyle entirely when absent', () => {
+    const n = coerceSessionNote({ concerns: 'not-an-array' });
+    expect(n.nrt).toBeUndefined();
+    expect(n.lifestyle).toBeUndefined();
+  });
 });

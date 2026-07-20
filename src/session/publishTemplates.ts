@@ -13,6 +13,7 @@ import type { SessionNote } from './extract';
 import {
   publishBinaryDoc,
   publishFlowSheet,
+  rewriteFlowSheetBlock,
   resolveDocFolder,
   ensureConvertedSheet,
   isDriveConfigured,
@@ -257,4 +258,84 @@ async function persistIds(
           OR flow_sheet_id   IS DISTINCT FROM COALESCE($3, flow_sheet_id))`,
     [clientId, ids.driveFolderId, ids.flowSheetId],
   );
+}
+
+/**
+ * Bring the client documents back into line after an approved protocol is amended.
+ *
+ * The three templates cannot be treated alike, which is why this is separate from
+ * publishClientTemplates rather than a flag on it:
+ *
+ *  - ROF is fill-once at intake. It is a record of the initial consultation, not
+ *    a living document, so an amendment to a later session must not touch it.
+ *  - Supplement Protocol is versioned by date, so a corrected version is simply
+ *    published alongside the old one. Nothing is destroyed.
+ *  - Flow Sheet is a running log with one block per visit. The block for this
+ *    session is rewritten in place; appending would give the client two blocks
+ *    for one appointment.
+ *
+ * Best-effort and off the request path, matching the approve publish.
+ */
+export async function republishAmended(protocolId: string): Promise<ClientTemplatesResult> {
+  const r = await pool.query(
+    `SELECT p.content_json, p.client_id, c.name AS client_name,
+            c.drive_folder_id, c.flow_sheet_id, a.starts_at
+       FROM protocols p
+  LEFT JOIN clients c ON c.id = p.client_id
+  LEFT JOIN appointments a ON a.id = p.appointment_id
+      WHERE p.id = $1`,
+    [protocolId],
+  );
+  if (r.rowCount === 0) throw new Error(`protocol ${protocolId} not found`);
+  const row = r.rows[0];
+  const clientName: string = row.client_name ?? 'Unknown client';
+  const note = coerceSessionNote(row.content_json);
+  const currentSupplements = row.client_id ? await fetchCurrentSupplements(row.client_id) : [];
+  const rendered = await renderClientTemplates(
+    note,
+    { clientName, date: row.starts_at },
+    currentSupplements,
+  );
+
+  const result: ClientTemplatesResult = {};
+
+  // Supplement Protocol — a new dated version. The superseded one stays in Drive.
+  const supp = await publishBinaryDoc({
+    clientName,
+    driveFolderId: row.drive_folder_id,
+    docType: 'SupplementProtocol',
+    fileName: rendered.supplementFileName,
+    bytes: rendered.supplement,
+    mimeType: XLSX_MIME,
+  });
+  result.dryRun = supp.dryRun;
+  result.supplementFileId = supp.fileId;
+
+  // Flow Sheet — rewrite this session's own block.
+  if (row.flow_sheet_id) {
+    try {
+      const flow = await rewriteFlowSheetBlock({
+        clientName,
+        spreadsheetId: row.flow_sheet_id,
+        entry: rendered.flowEntry,
+      });
+      result.flowSheetId = row.flow_sheet_id;
+      result.flowBlock = flow.blockIndex;
+    } catch (err) {
+      logError('session.flowsheet_amend', 'Flow Sheet rewrite failed', err, { client: clientName });
+    }
+  } else {
+    logEvent('info', 'session.flowsheet_amend', 'no Flow Sheet for client — nothing to rewrite', {
+      client: clientName,
+    });
+  }
+
+  // Deliberately NOT re-emailed. The client already has the original; a silent
+  // second copy with different contents is worse than Nicole telling them.
+  logEvent('info', 'session.templates_amend', 'republished after amendment', {
+    client: clientName,
+    protocolId,
+    supplementFile: rendered.supplementFileName,
+  });
+  return result;
 }

@@ -1,0 +1,11 @@
+-- The Supplement Protocol sheet's Daily Schedule grid has a column per dosing
+-- slot (Upon Waking / Breakfast / Mid-Morning / Lunch / Mid-Afternoon / Dinner /
+-- Before Bed). Those columns rendered blank on every published protocol because
+-- the plan had nowhere to record WHEN a supplement is taken — only its dose.
+--
+-- jsonb rather than seven columns: the slot set belongs to Nicole's template, and
+-- a template revision shouldn't need a migration. Shape is
+--   {"uponWaking": "2 caps", "beforeBed": "1 cap"}
+-- with a slot absent meaning "not taken then" — the same blank-is-meaningful rule
+-- the rest of the extraction follows.
+ALTER TABLE supplements ADD COLUMN IF NOT EXISTS schedule jsonb;

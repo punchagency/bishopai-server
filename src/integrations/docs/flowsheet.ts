@@ -26,15 +26,90 @@ const NOTE_LABEL = {
 } as const;
 
 // The FOUNDATION (col D) and BODY SCAN (col E) cells hold a fixed scaffold of
-// muscle-testing prompts. When the session captured findings we re-emit the
-// scaffold with the findings appended below it, so the prompts are preserved.
-export const FOUNDATION_SCAFFOLD =
-  'LAYING 1 FOUNDATIONS:\n\n\nSTANDING FOUNDATIONS: \n\nHTA:\nHTA POST RUN:\n\n' +
-  'LAYING 2 FOUNDATIONS: \n\nART\nOPEN: \nSWITCH: \nCNS:\nDENTAL: \nHORMONAL: \n\nADDITIONAL:';
+// muscle-testing prompts. Each prompt is a slot: when the session captured a
+// finding for it we write the value onto that prompt's own line, so Nicole reads
+// "HTA: 68" where she expects it and a bare "HTA POST RUN:" tells her at a glance
+// that prompt was never called. The prompt text is preserved either way.
+//
+// A line is either a blank spacer, a bare heading, or a prompt bound to a findings
+// key. The scaffold constants below are DERIVED from these specs, so the blank
+// template and the filled version can never drift apart.
+interface ScaffoldLine {
+  /** Literal prompt text, including the template's own trailing spaces. */
+  text: string;
+  /** Findings key whose value fills this line, when the line is a prompt. */
+  key?: string;
+}
 
-export const BODY_SCAN_SCAFFOLD =
-  'ART W/ POL\n\nECTODERM:\nPRIORITY:\nMATRIX:\nCELL:\n\nADDITIONAL ART:\n\n' +
-  'NRT W/O POL\n\nBODY SCAN:\nPRIORITY:\nMATRIX:\nCELL: \n\nADDITIONAL NRT: ';
+const FOUNDATION_LINES: ScaffoldLine[] = [
+  { text: 'LAYING 1 FOUNDATIONS:', key: 'laying1' },
+  { text: '' },
+  { text: '' },
+  { text: 'STANDING FOUNDATIONS: ', key: 'standing' },
+  { text: '' },
+  { text: 'HTA:', key: 'hta' },
+  { text: 'HTA POST RUN:', key: 'hta_post_run' },
+  { text: '' },
+  { text: 'LAYING 2 FOUNDATIONS: ', key: 'laying2' },
+  { text: '' },
+  { text: 'ART' },
+  { text: 'OPEN: ', key: 'art_open' },
+  { text: 'SWITCH: ', key: 'art_switch' },
+  { text: 'CNS:', key: 'art_cns' },
+  { text: 'DENTAL: ', key: 'art_dental' },
+  { text: 'HORMONAL: ', key: 'art_hormonal' },
+  { text: '' },
+  { text: 'ADDITIONAL:', key: 'additional' },
+];
+
+const BODY_SCAN_LINES: ScaffoldLine[] = [
+  { text: 'ART W/ POL' },
+  { text: '' },
+  { text: 'ECTODERM:', key: 'art_ectoderm' },
+  { text: 'PRIORITY:', key: 'art_priority' },
+  { text: 'MATRIX:', key: 'art_matrix' },
+  { text: 'CELL:', key: 'art_cell' },
+  { text: '' },
+  { text: 'ADDITIONAL ART:', key: 'additional_art' },
+  { text: '' },
+  { text: 'NRT W/O POL' },
+  { text: '' },
+  { text: 'BODY SCAN:' },
+  { text: 'PRIORITY:', key: 'scan_priority' },
+  { text: 'MATRIX:', key: 'scan_matrix' },
+  { text: 'CELL: ', key: 'scan_cell' },
+  { text: '' },
+  { text: 'ADDITIONAL NRT: ', key: 'additional_nrt' },
+];
+
+/** Findings keyed by scaffold slot; a null/absent value leaves the prompt bare. */
+export type ScaffoldFindings = Record<string, string | null | undefined>;
+
+function renderScaffold(lines: ScaffoldLine[], findings?: ScaffoldFindings | null): string {
+  return lines
+    .map((line) => {
+      const value = line.key ? findings?.[line.key]?.trim() : undefined;
+      if (!value) return line.text;
+      // The template's own prompts carry inconsistent trailing spaces; respect
+      // whatever is there rather than normalising it away.
+      return line.text.endsWith(' ') ? `${line.text}${value}` : `${line.text} ${value}`;
+    })
+    .join('\n');
+}
+
+/** The blank prompt scaffolds, exactly as the template spells them. */
+export const FOUNDATION_SCAFFOLD = renderScaffold(FOUNDATION_LINES);
+export const BODY_SCAN_SCAFFOLD = renderScaffold(BODY_SCAN_LINES);
+
+/** Fill the FOUNDATION prompts (col D) with this session's findings. */
+export function renderFoundation(findings?: ScaffoldFindings | null): string {
+  return renderScaffold(FOUNDATION_LINES, findings);
+}
+
+/** Fill the BODY SCAN prompts (col E) with this session's findings. */
+export function renderBodyScan(findings?: ScaffoldFindings | null): string {
+  return renderScaffold(BODY_SCAN_LINES, findings);
+}
 
 /** A single cell write: an A1 reference (sheet-qualified) and its value. */
 export interface CellWrite {
@@ -130,15 +205,21 @@ export function buildFlowSheetBlock(
   put(`F${first}`, entry.protocol);
   put(`G${first}`, entry.virtual);
 
-  // FOUNDATION / BODY SCAN: keep the scaffold, append findings when present.
-  if (entry.foundation) put(`D${first}`, `${FOUNDATION_SCAFFOLD}\n\n${entry.foundation}`);
-  if (entry.bodyScan) put(`E${first}`, `${BODY_SCAN_SCAFFOLD}\n\n${entry.bodyScan}`);
+  // FOUNDATION / BODY SCAN arrive already rendered against their prompt scaffolds
+  // (see renderFoundation / renderBodyScan) — the prompts are inside the value.
+  put(`D${first}`, entry.foundation);
+  put(`E${first}`, entry.bodyScan);
 
   // Lifestyle log — column B labels sit on merged pairs at data rows 1,3,5,7,9,11.
   const notes = entry.notes ?? {};
   for (const [key, offset] of Object.entries(NOTE_OFFSET) as [keyof typeof NOTE_LABEL, number][]) {
-    const val = notes[key];
-    if (val) put(`B${header + offset}`, `${NOTE_LABEL[key]} ${val}`);
+    const val = notes[key]?.trim();
+    if (val) {
+      // The template's labels carry inconsistent trailing spaces ('BM: ' vs
+      // 'SLEEP:'); honour each one rather than emitting a double space.
+      const label = NOTE_LABEL[key];
+      put(`B${header + offset}`, label.endsWith(' ') ? `${label}${val}` : `${label} ${val}`);
+    }
   }
 
   return writes;

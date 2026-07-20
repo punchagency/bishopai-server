@@ -7,6 +7,8 @@ import {
   BLOCK_ROWS,
   FOUNDATION_SCAFFOLD,
   BODY_SCAN_SCAFFOLD,
+  renderFoundation,
+  renderBodyScan,
 } from './flowsheet';
 
 // A block write list is easiest to assert as a range→value map.
@@ -32,7 +34,8 @@ describe('buildFlowSheetBlock', () => {
     expect(m['Sheet1!F2']).toBe('Cataplex B');
     expect(m['Sheet1!G2']).toBe('Y');
     // Lifestyle labels are prepended; rows step 1,3,…,11 down the block.
-    expect(m['Sheet1!B2']).toBe('BM:  regular');
+    // 'BM: ' already carries a trailing space in the template; don't add a second.
+    expect(m['Sheet1!B2']).toBe('BM: regular');
     expect(m['Sheet1!B4']).toBe('SLEEP: 7h');
     expect(m['Sheet1!B12']).toBe('DIET: clean');
     // Untouched notes/columns are not emitted (blank scaffold stays intact).
@@ -50,15 +53,46 @@ describe('buildFlowSheetBlock', () => {
     expect(m['Sheet1!A41']).toBe('x');
   });
 
-  it('appends findings below the scaffold and honours the sheet title', () => {
+  it('writes the pre-rendered FOUNDATION/BODY SCAN columns and honours the sheet title', () => {
+    // The prompt scaffold is rendered upstream (renderFoundation/renderBodyScan),
+    // so the block builder writes the column value through untouched.
     const writes = buildFlowSheetBlock(
-      { date: 'd', foundation: 'weak switching', bodyScan: 'ectoderm priority' },
+      { date: 'd', foundation: 'HTA: 68', bodyScan: 'MATRIX: liver' },
       0,
       'Log',
     );
     const m = asMap(writes);
-    expect(m['Log!D2']).toBe(`${FOUNDATION_SCAFFOLD}\n\nweak switching`);
-    expect(m['Log!E2']).toBe(`${BODY_SCAN_SCAFFOLD}\n\nectoderm priority`);
+    expect(m['Log!D2']).toBe('HTA: 68');
+    expect(m['Log!E2']).toBe('MATRIX: liver');
+  });
+
+  describe('renderFoundation / renderBodyScan', () => {
+    it('leaves every prompt bare when nothing was tested', () => {
+      expect(renderFoundation(null)).toBe(FOUNDATION_SCAFFOLD);
+      expect(renderBodyScan({})).toBe(BODY_SCAN_SCAFFOLD);
+    });
+
+    it('fills each finding onto its own prompt line, leaving the rest bare', () => {
+      const d = renderFoundation({ hta: '68', art_cns: 'switched', art_dental: 'clear' });
+      expect(d).toContain('HTA: 68');
+      expect(d).toContain('CNS: switched');
+      expect(d).toContain('DENTAL: clear'); // template prompt has a trailing space
+      expect(d).toContain('HTA POST RUN:\n'); // untested → bare
+      expect(d).toContain('LAYING 1 FOUNDATIONS:\n'); // untested → bare
+      // Line count is fixed: filling values never adds or drops a prompt.
+      expect(d.split('\n')).toHaveLength(FOUNDATION_SCAFFOLD.split('\n').length);
+    });
+
+    it('keeps the ART and NRT passes in their own slots', () => {
+      const e = renderBodyScan({ art_matrix: 'kidney', scan_matrix: 'liver' });
+      const lines = e.split('\n');
+      // Two MATRIX prompts exist; each takes only its own pass's reading.
+      expect(lines.filter((l) => l.startsWith('MATRIX:'))).toEqual([
+        'MATRIX: kidney',
+        'MATRIX: liver',
+      ]);
+      expect(e.split('\n')).toHaveLength(BODY_SCAN_SCAFFOLD.split('\n').length);
+    });
   });
 
   it('emits nothing but the date for a sparse entry', () => {
