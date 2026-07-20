@@ -189,6 +189,11 @@ export const SessionNoteSchema = z.object({
       // "Here | Fullscript" on the protocol grid — where the client gets it.
       // Rarely spoken aloud, so usually filled in by Nicole during review.
       obtained_from: stated().optional(),
+      // The ROF's "Function" column — what this supplement is FOR, in terms the
+      // client reads ("supports adrenal recovery"). It is practitioner knowledge
+      // rather than something said in session, so it stays null unless she
+      // writes it; the ROF simply leaves that cell blank.
+      func: stated().optional(),
     }),
   ).default([]),
   follow_ups: z.array(z.union([z.string(), FollowUpSchema])).default([]),
@@ -227,6 +232,7 @@ const SESSION_NOTE_JSON_SCHEMA = {
           dose: { type: 'string', nullable: true },
           quantity: { type: 'number', nullable: true },
           change: { type: 'string', enum: ['start', 'stop', 'increase', 'decrease', 'continue'] },
+          func: { type: 'string', nullable: true },
           schedule: {
             type: 'object',
             nullable: true,
@@ -365,6 +371,8 @@ const SYSTEM = [
   '  If product names are garbled in transcription, preserve the best phonetic match.',
   '  Include ALL changes mentioned: continues, removals, additions.',
   '- supplements: only for NEW supplements being added with explicit name + change type.',
+  '- supplements[].func: what the supplement is FOR, only if the practitioner says',
+  '  so ("this one is for the adrenals"). Never invent a purpose from the name.',
   '- supplements[].schedule: when the practitioner states WHEN a supplement is taken,',
   '  put the amount in that slot: uponWaking, breakfast, midMorning, lunch,',
   '  midAfternoon, dinner, beforeBed. "two caps with breakfast and one before bed"',

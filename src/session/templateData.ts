@@ -79,7 +79,9 @@ export function toSupplementData(current: CurrentSupplementRow[], note: SessionN
 export function toRofData(note: SessionNote, ctx: { name: string; date: string }): RofData {
   const protocol: ProtocolLine[] = note.supplements
     .filter((s) => s.change !== 'stop')
-    .map((s) => ({ supplement: s.name, dosage: s.dose ?? '', function: '' }));
+    // The template's Function column. Blank when unknown — an empty cell on a
+    // client's Report of Findings is honest; an invented purpose is not.
+    .map((s) => ({ supplement: s.name, dosage: s.dose ?? '', function: s.func ?? '' }));
   const nrt = note.nrt;
   return {
     name: ctx.name,

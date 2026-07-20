@@ -8,6 +8,7 @@ import { toRofData, toSupplementData, toFlowSheetEntry } from './templateData';
 import { fillRof } from '../integrations/docs/rof';
 import { fillSupplementProtocol } from '../integrations/docs/supplement';
 import { fetchCurrentSupplements, type CurrentSupplementRow } from './supplements';
+import { recordDocument } from './documents';
 import type { FlowSheetEntry } from '../integrations/docs/types';
 import type { SessionNote } from './extract';
 import {
@@ -79,6 +80,9 @@ export interface ClientTemplatesResult {
   supplementFileId?: string;
   flowSheetId?: string | null;
   flowBlock?: number;
+  /** Set when the Flow Sheet append failed while the other documents succeeded.
+   *  A publish is not "done" just because it didn't throw. */
+  flowSheetError?: string;
   emailed?: boolean;
 }
 
@@ -184,6 +188,8 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
   result.dryRun = rof.dryRun;
   result.rofFileId = rof.fileId;
   result.rofSkipped = rof.skipped;
+  // Only when it was actually created — a skipped fill-once ROF was already recorded.
+  if (!rof.skipped) await recordDocument(row.client_id, 'ROF', rof.fileId);
   let clientFolderId = rof.clientFolderId ?? row.drive_folder_id ?? null;
 
   // Supplement Protocol — new dated version each time.
@@ -196,6 +202,7 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
     mimeType: XLSX_MIME,
   });
   result.supplementFileId = supp.fileId;
+  await recordDocument(row.client_id, 'SupplementProtocol', supp.fileId);
   clientFolderId = supp.clientFolderId ?? clientFolderId;
 
   // Flow Sheet — provision once (xlsx → Google Sheet), then append a block.
@@ -224,10 +231,17 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
     });
     result.flowSheetId = flowSheetId;
     result.flowBlock = flow.blockIndex;
+    if (!flow.dryRun) await recordDocument(row.client_id, 'AppointmentFlowSheet', flowSheetId);
   } catch (err) {
-    // ROF/Supplement already landed above — a Sheets-API hiccup (e.g. the API
-    // not yet enabled on the Cloud project) must not lose that work or block
-    // persistIds/email below, so this doc's failure stays local to it.
+    // ROF/Supplement already landed above — a Sheets-API failure must not lose
+    // that work or block persistIds/email below, so it stays local to this doc.
+    //
+    // But it must not stay INVISIBLE either. This is how the Flow Sheet went
+    // months without ever being written: the other two documents succeeded, the
+    // publish reported success, and the one failure went to a log nobody reads.
+    // Surfacing it on the result means the caller — and the dashboard — can say
+    // that a session's Flow Sheet block is missing.
+    result.flowSheetError = err instanceof Error ? err.message : String(err);
     logError('session.flowsheet_publish', 'Flow Sheet publish failed', err, { client: clientName });
   }
 
@@ -310,6 +324,7 @@ export async function republishAmended(protocolId: string): Promise<ClientTempla
   });
   result.dryRun = supp.dryRun;
   result.supplementFileId = supp.fileId;
+  await recordDocument(row.client_id, 'SupplementProtocol', supp.fileId);
 
   // Flow Sheet — rewrite this session's own block.
   if (row.flow_sheet_id) {

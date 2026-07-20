@@ -2,7 +2,7 @@
   "name": "bishopai-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Innerlume Healing automation backend — correlation engine + checkout state machine",
+  "description": "Innerlume Healing automation backend \u2014 correlation engine + checkout state machine",
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -18,7 +18,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "qb-auth": "node scripts/qb-auth.mjs"
+    "qb-auth": "node scripts/qb-auth.mjs",
+    "check:google": "tsx scripts/check-google.mts"
   },
   "engines": {
     "node": ">=20"
