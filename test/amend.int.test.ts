@@ -222,6 +222,65 @@ suite('amending an approved note (integration, real Postgres)', () => {
     await pool.query(`DELETE FROM clients WHERE id = $1`, [cid]);
   });
 
+  it('reconciles tasks on amend: creates added follow-ups, dismisses removed ones', async () => {
+    const c = await pool.query<{ id: string }>(
+      `INSERT INTO clients (name, pb_id) VALUES ('AM Tasks', 'amtest-tasks') RETURNING id`,
+    );
+    const cid = c.rows[0].id;
+    const a = await pool.query<{ id: string }>(
+      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
+       VALUES ($1, 'amtest-tasks-appt', now() - interval '3 days', now() - interval '3 days', 'completed')
+       RETURNING id`,
+      [cid],
+    );
+    const withFollowUps = {
+      ...note('x'),
+      follow_ups: [
+        { text: 'Recheck iron in 4 weeks', due_in_days: 28 },
+        { text: 'Send lab requisition', due_in_days: null },
+      ],
+    };
+    const p = await pool.query<{ id: string }>(
+      `INSERT INTO protocols (client_id, appointment_id, content_json, status)
+       VALUES ($1, $2, $3, 'draft') RETURNING id`,
+      [cid, a.rows[0].id, JSON.stringify(withFollowUps)],
+    );
+    const pid = p.rows[0].id;
+    expect((await send('POST', `/review/protocols/${pid}/approve`, {})).status).toBe(200);
+
+    const openTitles = async () => {
+      const r = await pool.query<{ title: string }>(
+        `SELECT title FROM tasks WHERE client_id = $1 AND status = 'open' ORDER BY title`, [cid]);
+      return r.rows.map((x) => x.title);
+    };
+    expect(await openTitles()).toEqual(['Recheck iron in 4 weeks', 'Send lab requisition']);
+
+    // Amend: drop the lab requisition (misheard), keep the iron recheck, add a new one.
+    const r = await send('POST', `/review/protocols/${pid}/amend`, {
+      content_json: {
+        ...note('x'),
+        follow_ups: [
+          { text: 'Recheck iron in 4 weeks', due_in_days: 28 },
+          { text: 'Book a 6-week review', due_in_days: 42 },
+        ],
+      },
+      reason: 'lab requisition was not needed',
+    });
+    expect(r.status).toBe(200);
+
+    expect(await openTitles()).toEqual(['Book a 6-week review', 'Recheck iron in 4 weeks']);
+    // The removed one is dismissed, not deleted — its history survives.
+    const dropped = await pool.query<{ status: string }>(
+      `SELECT status FROM tasks WHERE client_id = $1 AND title = 'Send lab requisition'`, [cid]);
+    expect(dropped.rows[0].status).toBe('dismissed');
+
+    await pool.query(`DELETE FROM note_revisions WHERE source_id = $1`, [pid]);
+    await pool.query(`DELETE FROM tasks WHERE client_id = $1`, [cid]);
+    await pool.query(`DELETE FROM protocols WHERE client_id = $1`, [cid]);
+    await pool.query(`DELETE FROM appointments WHERE client_id = $1`, [cid]);
+    await pool.query(`DELETE FROM clients WHERE id = $1`, [cid]);
+  });
+
   it('never offers this session back as its own history', async () => {
     // A protocol and its appointment sheet share an appointment but live in
     // different tables with different ids. Excluding only by row id let the

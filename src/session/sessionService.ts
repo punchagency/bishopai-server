@@ -3,8 +3,9 @@ import { pool } from '../db/pool';
 import { logEvent } from '../observability/logger';
 import { coerceSessionNote } from './render';
 import { syncClientSupplements, removeSupplementsDroppedByAmendment } from './supplements';
-import { createTasksFromNote } from '../tasks/service';
+import { createTasksFromNote, reconcileTasksAfterAmend } from '../tasks/service';
 import { snapshotRevision } from './revisions';
+import { recordAudit } from '../audit/log';
 
 // A session is ONE clinical note, not two documents.
 //
@@ -99,22 +100,61 @@ const toSession = (r: RawSession): SessionRow => ({
   content_json: r.content_json,
 });
 
-/** Sessions awaiting review, or already approved. One row per appointment. */
+/** Escape LIKE wildcards so a client name with % or _ is matched literally. */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+// When searching we scan a much larger window than the default page, so a name
+// hit anywhere in the archive surfaces rather than only in the recent 100. A
+// solo practice never approaches this many rows; it's a safety ceiling, not a page.
+const SEARCH_SCAN_LIMIT = 2000;
+
+/**
+ * Sessions awaiting review, or already approved. One row per appointment.
+ *
+ * `query` filters by client name. Status is combined from two documents in JS,
+ * so it can't be a SQL WHERE — but the name filter can, which is what lets an
+ * approved-archive search reach past the default cap: with a query we widen the
+ * SQL scan and only then apply the status filter and the display limit.
+ */
 export async function listSessions(
   scope: 'pending' | 'approved',
   limit = 100,
+  query?: string,
 ): Promise<SessionRow[]> {
+  const q = query?.trim();
+  const params: unknown[] = [];
+  let nameClause = '';
+  if (q) {
+    params.push(`%${escapeLike(q)}%`);
+    // A name search shouldn't match sessions with no client attached.
+    nameClause = ` AND c.name ILIKE $${params.length}`;
+  }
+  // Pending is a daily working set; approved is capped unless a query widens it.
+  const scanLimit = q ? SEARCH_SCAN_LIMIT : scope === 'approved' ? limit : 500;
+  params.push(scanLimit);
+
+  // The combined status lives in JS, but "every present document approved" is
+  // expressible in SQL — so the pending scan excludes fully-approved sessions
+  // up front. Without this, the newest-500 window silently hid any stuck draft
+  // older than the last 500 sessions: exactly the row most likely to be old.
+  const pendingClause =
+    scope === 'pending'
+      ? ` AND NOT ((s.id IS NULL OR s.status = 'approved') AND (p.id IS NULL OR p.status = 'approved'))`
+      : '';
+
   const r = await pool.query<RawSession>(
     `${SESSION_SELECT}
-      WHERE (s.id IS NOT NULL OR p.id IS NOT NULL)
+      WHERE (s.id IS NOT NULL OR p.id IS NOT NULL)${nameClause}${pendingClause}
    ORDER BY a.starts_at DESC
-      LIMIT $1`,
-    [scope === 'approved' ? limit : 500],
+      LIMIT $${params.length}`,
+    params,
   );
   const all = r.rows.map(toSession);
   const wanted = scope === 'approved' ? 'approved' : null;
   const filtered = all.filter((x) => (wanted ? x.status === 'approved' : x.status !== 'approved'));
-  return scope === 'approved' ? filtered.slice(0, limit) : filtered;
+  return scope === 'approved' ? filtered.slice(0, q ? SEARCH_SCAN_LIMIT : limit) : filtered;
 }
 
 export async function getSession(appointmentId: string): Promise<SessionRow | null> {
@@ -211,7 +251,19 @@ export async function approveSession(
       await db.query('ROLLBACK');
       return { ok: false, code: 404, error: 'not found' };
     }
-    const firstApproval = cur.status !== 'approved';
+    // Approving twice would insert a second audit row and replay the side
+    // effects. The UI never offers it, but the API must refuse it too — "one
+    // approval per session" is an invariant, not a convention.
+    if (cur.status === 'approved') {
+      await db.query('ROLLBACK');
+      return {
+        ok: false,
+        code: 409,
+        error: 'already approved',
+        detail: 'This session is already approved. Use amend to correct it.',
+      };
+    }
+    const firstApproval = true;
 
     await db.query(
       `UPDATE appointment_sheets SET status = 'approved' WHERE appointment_id = $1`,
@@ -253,6 +305,14 @@ export async function approveSession(
     }
 
     await db.query('COMMIT');
+    await recordAudit({
+      entityType: 'session',
+      entityId: appointmentId,
+      action: 'session.approved',
+      actor: approvedBy === 'nicole' ? 'nicole' : 'system',
+      summary: `Approved session for ${cur.client_name ?? 'unknown client'} — documents published`,
+      metadata: { client_id: cur.client_id, approved_by: approvedBy },
+    });
     return { ok: true, session: (await getSession(appointmentId))!, firstApproval };
   } catch (err) {
     await db.query('ROLLBACK').catch(() => {});
@@ -319,6 +379,15 @@ export async function amendSession(
       const startDate = cur.starts_at ? new Date(cur.starts_at).toISOString().slice(0, 10) : null;
       await syncClientSupplements(db, cur.client_id, startDate, note);
       await removeSupplementsDroppedByAmendment(db, cur.client_id, cur.content_json, note);
+      // Follow-ups changed too: create tasks the amendment added, dismiss open
+      // ones it removed. Supplements and tasks move together or the prep brief
+      // keeps briefing from the superseded note.
+      await reconcileTasksAfterAmend(db, {
+        clientId: cur.client_id,
+        appointmentId,
+        sessionDate: cur.starts_at ? new Date(cur.starts_at) : new Date(),
+        note: coerceSessionNote(note),
+      });
     }
 
     await db.query('COMMIT');
@@ -326,6 +395,14 @@ export async function amendSession(
       appointment_id: appointmentId,
       revision,
       amendedBy,
+    });
+    await recordAudit({
+      entityType: 'session',
+      entityId: appointmentId,
+      action: 'session.amended',
+      actor: amendedBy === 'nicole' ? 'nicole' : 'system',
+      summary: `Amended approved session (v${revision})${reason ? ` — ${reason}` : ''}`,
+      metadata: { revision, reason, client_id: cur.client_id, amended_by: amendedBy },
     });
     return { ok: true, session: (await getSession(appointmentId))!, revision };
   } catch (err) {

@@ -114,6 +114,17 @@ suite('session as one unit (integration, real Postgres)', () => {
     expect(protocol.status).toBe('approved');
   });
 
+  it('refuses to approve an already-approved session (no duplicate audit row)', async () => {
+    const r = await send('POST', `/review/sheets/${sheetId}/approve`, {});
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toMatch(/approved/i);
+
+    const approvals = await pool.query(
+      `SELECT count(*)::int n FROM approvals
+        WHERE payload_json->>'appointment_id' = $1 AND status = 'approved'`, [apptId]);
+    expect(approvals.rows[0].n).toBe(1);
+  });
+
   it('records one approval for the session, not one per document', async () => {
     const r = await pool.query(
       `SELECT type FROM approvals
@@ -128,6 +139,20 @@ suite('session as one unit (integration, real Postgres)', () => {
     expect(mine).toHaveLength(1);
     expect(mine[0].sheet_id).toBe(sheetId);
     expect(mine[0].protocol_id).toBe(protocolId);
+  });
+
+  it('filters the approved queue by client name (server-side)', async () => {
+    // A name hit surfaces the session…
+    const hit = await (await fetch(`${base}/review/queue?status=approved&q=SU%20Session`)).json();
+    expect(hit.sessions.some((x: { appointment_id: string }) => x.appointment_id === apptId)).toBe(true);
+
+    // …a partial, case-insensitive fragment still matches…
+    const partial = await (await fetch(`${base}/review/queue?status=approved&q=su%20sess`)).json();
+    expect(partial.sessions.some((x: { appointment_id: string }) => x.appointment_id === apptId)).toBe(true);
+
+    // …and a non-matching query excludes it rather than returning everything.
+    const miss = await (await fetch(`${base}/review/queue?status=approved&q=zzz-no-such-client`)).json();
+    expect(miss.sessions.some((x: { appointment_id: string }) => x.appointment_id === apptId)).toBe(false);
   });
 
   it('amending writes both documents and files history against each', async () => {

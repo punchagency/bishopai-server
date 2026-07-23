@@ -66,9 +66,10 @@ describe('pickTargetInvoice — which invoice the charge settles', () => {
     expect(chosen?.id).toBe('mid-unpaid'); // newest among unpaid
   });
 
-  it('falls back to the most recent overall when all are paid', () => {
-    const chosen = pickTargetInvoice([inv('a', '2026-06-01', 0), inv('b', '2026-07-05', 0)]);
-    expect(chosen?.id).toBe('b');
+  it('returns null when every invoice is already paid (never settle a paid one)', () => {
+    // Charging against a paid invoice would overpay it / post a credit; the
+    // caller falls through to the computed summary instead.
+    expect(pickTargetInvoice([inv('a', '2026-06-01', 0), inv('b', '2026-07-05', 0)])).toBeNull();
   });
 });
 

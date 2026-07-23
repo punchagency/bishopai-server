@@ -7,6 +7,7 @@ import { listSessions } from '../integrations/pb/reads';
 import { clientRecordName } from '../integrations/pb/types';
 import type { PbSession } from '../integrations/pb/types';
 import { buildBrief } from '../brief/service';
+import { recordAudit } from '../audit/log';
 
 // ---------------------------------------------------------------------------
 // Schedule / Appointments route
@@ -399,6 +400,7 @@ appointmentsRouter.put('/office-hours', async (req, res) => {
   try {
     await saveOfficeHours(parsed.data);
     logEvent('info', 'appointments.office-hours', 'office hours updated', parsed.data);
+    await recordAudit({ entityType: 'office_hours', entityId: 'office_hours', action: 'office_hours.updated', actor: 'nicole', summary: 'Office hours / availability updated', metadata: { ...parsed.data } });
     return res.json(parsed.data);
   } catch (err) {
     logError('appointments.office-hours', 'save failed', err);

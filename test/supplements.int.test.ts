@@ -107,6 +107,45 @@ suite('supplement sync (integration, real Postgres)', () => {
     }
   });
 
+  it('does not let an out-of-order (older) approval walk the plan backwards', async () => {
+    clientId = await makeClient('-chrono');
+    const db = await pool.connect();
+    const row = async () => {
+      const r = await pool.query<{ dose: string; qty: number; start_date: string }>(
+        `SELECT dose, qty, start_date::text AS start_date FROM supplements WHERE client_id = $1 AND name = 'Iron'`,
+        [clientId],
+      );
+      return r.rows[0];
+    };
+    try {
+      // The NEWER session (July) is approved first and establishes the plan.
+      await syncClientSupplements(
+        db, clientId, '2026-07-01',
+        note([{ name: 'Iron', dose: '2 caps', quantity: 60, change: 'increase' }]),
+      );
+      expect(await row()).toMatchObject({ dose: '2 caps', qty: 60, start_date: '2026-07-01' });
+
+      // The OLDER session (June) is approved late. Its dose must NOT overwrite
+      // the newer one, and its start_date must not move backwards.
+      const r = await syncClientSupplements(
+        db, clientId, '2026-06-01',
+        note([{ name: 'Iron', dose: '1 cap', quantity: 30, change: 'start' }]),
+      );
+      expect(r.upserted).toBe(0); // guarded out
+      expect(await row()).toMatchObject({ dose: '2 caps', qty: 60, start_date: '2026-07-01' });
+
+      // And an OLDER `stop` must not remove a supplement a newer session kept.
+      const r2 = await syncClientSupplements(
+        db, clientId, '2026-06-15',
+        note([{ name: 'Iron', dose: null, quantity: null, change: 'stop' }]),
+      );
+      expect(r2.removed).toBe(0);
+      expect(await row()).toMatchObject({ dose: '2 caps' });
+    } finally {
+      db.release();
+    }
+  });
+
   it('keeps a stated dosing schedule and does not clear it on a silent session', async () => {
     clientId = await makeClient('-sched');
     const db = await pool.connect();

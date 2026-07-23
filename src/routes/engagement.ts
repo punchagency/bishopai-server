@@ -5,6 +5,7 @@ import { logError, logEvent } from '../observability/logger';
 import { nextCadenceAction, type LeadState } from '../reengagement/cadence';
 import { runReengagement } from '../reengagement/runner';
 import { getOutlookConnection } from '../integrations/outlook';
+import { recordAudit } from '../audit/log';
 
 // WF3 dashboard surface: the lead list with each lead's next cadence step, the
 // live site-activity feed (lead_activity), and Nicole's actions — stop the
@@ -73,6 +74,7 @@ engagementRouter.post('/leads/:id/stop', async (req, res) => {
       req.params.id,
     ]);
     if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    await recordAudit({ entityType: 'lead', entityId: req.params.id, action: 'lead.stopped', actor: 'nicole', summary: 'Lead removed from the re-engagement automation' });
     return res.json(r.rows[0]);
   } catch (err) {
     logError('engagement.stop', 'stop failed', err, { id: req.params.id });
@@ -116,6 +118,7 @@ engagementRouter.post('/run', async (_req, res) => {
   try {
     const result = await runReengagement();
     logEvent('info', 'engagement.run', 'manual cadence run', { ...result });
+    await recordAudit({ entityType: 'lead', entityId: 'cadence', action: 'cadence.run', actor: 'nicole', summary: `Re-engagement cadence run — ${result.sent ?? 0} sent, ${result.deactivated ?? 0} deactivated`, metadata: { ...result } });
     return res.json(result);
   } catch (err) {
     logError('engagement.run', 'manual run failed', err);

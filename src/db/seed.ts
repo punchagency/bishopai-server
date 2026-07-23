@@ -123,6 +123,7 @@ const CLIENTS: SeedClient[] = [
 
 async function clearSeed(): Promise<void> {
   // FKs cascade from clients → appointments/supplements/refills/protocols/etc.
+  await pool.query(`DELETE FROM audit_log WHERE entity_id LIKE 'seed-%' OR summary LIKE '%Seed %'`);
   await pool.query(
     `DELETE FROM refill_orders WHERE client_id IN (SELECT id FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %')`,
   );
@@ -289,11 +290,25 @@ async function main(): Promise<void> {
   if (firstCheckoutId) await approveAndCharge(firstCheckoutId, { approvedBy: 'nicole' });
 
   // One unmatched conversation (no overlapping appointment) → Unmatched view.
+  // A full multi-turn transcript, well past the 240-char list preview, so the
+  // detail pane visibly shows the whole recording rather than the same snippet.
   await ingestConversation({
     bee_id: 'seed-unmatched-1',
     starts_at: iso(-9 * DAY),
     ends_at: iso(-9 * DAY + 40 * 60 * 1000),
-    transcript: 'Walk-in style chat about general wellness — no booking on the calendar for this one.',
+    transcript: [
+      'Nicole: Come on in — I don\'t think we had you on the calendar today, did we?',
+      'Client: No, I was just in the area and wanted to ask a couple of quick things.',
+      'Nicole: Of course, no problem at all. What\'s been going on?',
+      'Client: Honestly my energy has been all over the place. Fine in the morning, then completely flat by about two or three in the afternoon.',
+      'Nicole: How\'s your sleep been through all this?',
+      'Client: Not great. I fall asleep okay but I\'m wide awake around three or four most nights.',
+      'Nicole: And water — are you drinking much through the day?',
+      'Client: Probably not enough. Mostly coffee if I\'m honest, two or three cups before lunch.',
+      'Nicole: That afternoon crash makes a lot of sense then. Before we change anything, let\'s get you properly booked so I can do a full assessment and testing — this was really just a hallway chat.',
+      'Client: That\'s fair. Can we do sometime next week?',
+      'Nicole: Absolutely. I\'ll have the front desk find you a slot and we\'ll go through all of it properly.',
+    ].join('\n'),
   });
 
   const projection = await projectRefills();

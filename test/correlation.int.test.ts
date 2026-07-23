@@ -74,6 +74,43 @@ suite('correlation (integration, real Postgres)', () => {
     expect(r.correlation).toMatchObject({ status: 'unmatched', reason: 'ambiguous' });
   });
 
+  it('never auto-matches a cancelled appointment (its client may not be in the room)', async () => {
+    const clientId = await seedAppointment(
+      'it-cancel',
+      'it-c-cancel',
+      '2026-12-01T15:00:00Z',
+      '2026-12-01T16:00:00Z',
+    );
+    await pool.query(`UPDATE appointments SET status = 'cancelled' WHERE pb_id = 'it-cancel'`);
+    void clientId;
+    const r = await ingestConversation({
+      bee_id: 'it-b-cancel',
+      starts_at: '2026-12-01T15:05:00Z',
+      ends_at: '2026-12-01T15:50:00Z',
+    });
+    // The only overlap is cancelled → treated as no candidate at all.
+    expect(r.correlation).toMatchObject({ status: 'unmatched', reason: 'no_candidates' });
+  });
+
+  it('sends a second overlapping recording to unmatched instead of overwriting the first', async () => {
+    await seedAppointment('it-a-taken', 'it-c-taken', '2026-12-02T15:00:00Z', '2026-12-02T16:00:00Z');
+    const first = await ingestConversation({
+      bee_id: 'it-b-taken-1',
+      starts_at: '2026-12-02T15:00:00Z',
+      ends_at: '2026-12-02T15:30:00Z',
+    });
+    expect(first.correlation.status).toBe('matched');
+
+    // A split recording's second chunk overlaps the same booking — but that
+    // booking now carries a recording, so this one must NOT silently take it.
+    const second = await ingestConversation({
+      bee_id: 'it-b-taken-2',
+      starts_at: '2026-12-02T15:30:00Z',
+      ends_at: '2026-12-02T15:55:00Z',
+    });
+    expect(second.correlation).toMatchObject({ status: 'unmatched', reason: 'no_candidates' });
+  });
+
   it('is idempotent on bee_id (re-ingest updates, no duplicate row)', async () => {
     await ingestConversation({
       bee_id: 'it-b1',

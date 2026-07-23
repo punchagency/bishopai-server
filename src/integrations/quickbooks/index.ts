@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { fetchJson } from '../http';
+import { fetchJson, HttpError } from '../http';
 import { logEvent } from '../../observability/logger';
 import { isQuickbooksConfigured, quickbooksConfig } from './config';
 import { getQuickbooksAccessToken } from './oauth';
@@ -50,6 +50,14 @@ export interface ChargeResult {
   /** QB charge status: AUTHORIZED | CAPTURED | DECLINED | ... */
   status?: string;
   error?: string;
+  /**
+   * The outcome is UNKNOWN, not a clean decline: the request threw on the network
+   * or a 5xx, so the charge MAY have captured. Callers must NOT treat this as a
+   * definite failure (that risks marking captured money as failed) — route it to
+   * manual review instead. A clean decline (non-capturable status) or a
+   * deterministic 4xx is `ambiguous: false`.
+   */
+  ambiguous?: boolean;
 }
 
 // A charge is money-good only in these states. A DECLINED charge comes back 200
@@ -126,7 +134,12 @@ export async function chargeCard(input: ChargeInput): Promise<ChargeResult> {
     );
     return interpretChargeResponse(res, input.amountCents);
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    // A deterministic 4xx (validation, auth) means the request was rejected
+    // before any capture — a definite failure, safe to retry with a fresh key. A
+    // 5xx / network / timeout is AMBIGUOUS: the charge may have captured before
+    // the response was lost, so it must not be recorded as a clean failure.
+    const definite4xx = err instanceof HttpError && err.status >= 400 && err.status < 500 && err.status !== 429;
+    return { ok: false, error: err instanceof Error ? err.message : String(err), ambiguous: !definite4xx };
   }
 }
 

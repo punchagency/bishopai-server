@@ -17,10 +17,19 @@ export async function correlateConversation(
   startsAt: string,
   endsAt: string,
 ): Promise<CorrelationResult> {
+  // Two exclusions, both misattribution guards:
+  // - cancelled bookings: the slot may have been filled by someone else (a
+  //   walk-in), and matching their recording to the cancelled client's chart is
+  //   exactly the wrong-person error auto-matching must never make;
+  // - appointments that already carry a recording: a second overlapping chunk
+  //   (a split Bee recording) must go to a human, not silently overwrite the
+  //   first chunk's extracted note.
   const { rows } = await db.query<{ id: string; client_id: string | null }>(
     `SELECT id, client_id
-       FROM appointments
+       FROM appointments a
       WHERE tstzrange(starts_at, ends_at) && tstzrange($1, $2)
+        AND status <> 'cancelled'
+        AND NOT EXISTS (SELECT 1 FROM conversations cv WHERE cv.appointment_id = a.id)
       ORDER BY starts_at`,
     [startsAt, endsAt],
   );

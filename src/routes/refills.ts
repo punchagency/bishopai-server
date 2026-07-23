@@ -5,6 +5,7 @@ import { pool } from '../db/pool';
 import { logError, logEvent } from '../observability/logger';
 import { fullscriptDispensaryUrl } from '../integrations/fullscript';
 import { computeAdherence, suggestedMonths } from '../refills/adherence';
+import { recordAudit } from '../audit/log';
 import { sendEmail, resolveOutlookAccess } from '../integrations/outlook';
 
 // WF4 dashboard surface: the daily refill digest (who's running low, tiered by
@@ -83,6 +84,7 @@ refillsRouter.post('/:id/snooze', async (req, res) => {
       [req.params.id, String(days)],
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    await recordAudit({ entityType: 'refill', entityId: req.params.id, action: 'refill.snoozed', actor: 'nicole', summary: `Refill snoozed ${days} days`, metadata: { days } });
     return res.json(r.rows[0]);
   } catch (err) {
     logError('refills.snooze', 'snooze failed', err, { id: req.params.id });
@@ -98,6 +100,7 @@ refillsRouter.post('/:id/skip', async (req, res) => {
       [req.params.id],
     );
     if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    await recordAudit({ entityType: 'refill', entityId: req.params.id, action: 'refill.skipped', actor: 'nicole', summary: 'Refill closed for this cycle' });
     return res.json(r.rows[0]);
   } catch (err) {
     logError('refills.skip', 'skip failed', err, { id: req.params.id });

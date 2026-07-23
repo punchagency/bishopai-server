@@ -178,12 +178,28 @@ import { createApp } from '../src/app';
 describe.skipIf(!dbUp)('appointments route (integration)', () => {
   let server: http.Server;
   let base = '';
+  // office_hours is a single global row; tests here mutate it. Capture it up
+  // front and put it back at the end so a customized config can't leak into
+  // other suites sharing this database.
+  let originalOfficeHours: OfficeHours | null = null;
 
   beforeAll(async () => {
     await pool.query('INSERT INTO auth_config (id, enabled) VALUES (true, false) ON CONFLICT DO NOTHING');
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    originalOfficeHours = (await (await fetch(`${base}/appointments/office-hours`)).json()) as OfficeHours;
+  });
+
+  afterAll(async () => {
+    if (originalOfficeHours) {
+      await fetch(`${base}/appointments/office-hours`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(originalOfficeHours),
+      }).catch(() => {});
+    }
+    await new Promise<void>((r) => server.close(() => r()));
   });
 
   const get = (path: string) => fetch(`${base}${path}`);
@@ -286,6 +302,15 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
       await pool.query(`DELETE FROM leads WHERE id = $1`, [testLeadId]);
       await pool.query(`DELETE FROM clients WHERE email = 'test-lead@example.com'`);
     };
+
+    // Own the office-hours config for this suite rather than inheriting whatever
+    // an earlier test left in the global row. Mon–Fri 09:00–17:00 makes the
+    // derived weekday slot (10:00 UTC) a genuinely bookable time; without this
+    // the booking POSTs 409 on a correct "slot not offered" for a day the leaked
+    // config had switched off.
+    beforeAll(async () => {
+      await putOfficeHours({});
+    });
 
     beforeEach(async () => {
       mockListSessions.mockReset().mockResolvedValue({ items: [] });

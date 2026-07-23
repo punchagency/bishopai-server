@@ -13,6 +13,12 @@ import { publishApproved } from '../session/publish';
 import { enqueueReconciliation, reconcileCheckout } from './reconcile';
 import { resolveQboCustomerId } from './customerMap';
 import { recordCheckoutOutcome } from './docWriteback';
+import { recordAudit } from '../audit/log';
+
+/** Cents → a short "$150.00" for human-readable audit summaries. */
+function money(cents: number, currency = 'USD'): string {
+  return `${currency} ${(cents / 100).toFixed(2)}`;
+}
 
 // WF2 checkout state machine (§6). The one money flow, so every transition is an
 // atomic guarded UPDATE (never restarts a charge), the charge carries a stable
@@ -49,12 +55,14 @@ export function summaryHash(s: CheckoutSummary): string {
 }
 
 /** Choose the invoice a session's charge settles: the most recent UNPAID invoice
- *  for the customer (a session just rendered → newest open invoice), falling back
- *  to the most recent overall. Pure — exported for tests. */
+ *  for the customer (a session just rendered → newest open invoice). Returns null
+ *  when NONE is unpaid — settling a charge against an already-paid invoice would
+ *  overpay it and post a credit, so the caller falls through to the computed
+ *  summary instead. Pure — exported for tests. */
 export function pickTargetInvoice(invoices: Invoice[]): Invoice | null {
   if (invoices.length === 0) return null;
   const byRecent = [...invoices].sort((a, b) => (b.txnDate ?? '').localeCompare(a.txnDate ?? ''));
-  return byRecent.find((i) => i.balanceCents > 0) ?? byRecent[0];
+  return byRecent.find((i) => i.balanceCents > 0) ?? null;
 }
 
 /** Build the frozen summary from a real QBO invoice. Total comes from the
@@ -171,11 +179,13 @@ export async function detectCheckout(appointmentId: string): Promise<DetectResul
   if (appt.rowCount === 0) return null;
   const { client_id, pb_id } = appt.rows[0];
 
-  // Claim (or find) the checkout row.
+  // Claim (or find) the checkout row. Keyed on appointment_id — the real unit,
+  // and never null for a real appointment. (Keying on pb_appointment_id let an
+  // appointment with a null pb_id spawn two checkouts → two charges: see M5.)
   const ins = await pool.query<{ id: string; status: string }>(
     `INSERT INTO checkout (appointment_id, client_id, pb_appointment_id, status)
           VALUES ($1, $2, $3, 'DETECTED')
-     ON CONFLICT (pb_appointment_id) WHERE pb_appointment_id IS NOT NULL DO NOTHING
+     ON CONFLICT (appointment_id) WHERE appointment_id IS NOT NULL DO NOTHING
        RETURNING id, status`,
     [appointmentId, client_id, pb_id],
   );
@@ -184,8 +194,8 @@ export async function detectCheckout(appointmentId: string): Promise<DetectResul
     checkoutId = ins.rows[0].id;
   } else {
     const existing = await pool.query<{ id: string; status: string }>(
-      `SELECT id, status FROM checkout WHERE pb_appointment_id = $1`,
-      [pb_id],
+      `SELECT id, status FROM checkout WHERE appointment_id = $1`,
+      [appointmentId],
     );
     if (existing.rowCount === 0) return null;
     // Already past detection — return as-is (idempotent).
@@ -202,6 +212,13 @@ export async function detectCheckout(appointmentId: string): Promise<DetectResul
     );
   }
   logEvent('info', 'checkout.detect', 'checkout ready for approval', { checkout_id: checkoutId });
+  await recordAudit({
+    entityType: 'checkout',
+    entityId: checkoutId,
+    action: 'checkout.detected',
+    summary: summary ? `Checkout ready for approval — ${money(summary.total_cents, summary.currency)}` : 'Checkout detected',
+    metadata: { appointment_id: appointmentId, total_cents: summary?.total_cents },
+  });
   return { checkoutId, status: 'AWAITING_APPROVAL' };
 }
 
@@ -236,12 +253,13 @@ export async function approveAndCharge(checkoutId: string, opts: ApproveOptions 
     summary_snapshot: CheckoutSummary | null;
     appointment_id: string | null;
     client_id: string | null;
+    charge_attempts: number;
   }>(
-    `SELECT status, summary_snapshot, appointment_id, client_id FROM checkout WHERE id = $1`,
+    `SELECT status, summary_snapshot, appointment_id, client_id, charge_attempts FROM checkout WHERE id = $1`,
     [checkoutId],
   );
   if (row.rowCount === 0) return { status: 'not_found' };
-  const { status, summary_snapshot, appointment_id, client_id } = row.rows[0];
+  const { status, summary_snapshot, appointment_id, client_id, charge_attempts } = row.rows[0];
   if (status !== 'AWAITING_APPROVAL') return { status, error: 'not awaiting approval' };
   if (!summary_snapshot) return { status, error: 'no summary to approve' };
 
@@ -268,10 +286,20 @@ export async function approveAndCharge(checkoutId: string, opts: ApproveOptions 
   } finally {
     db.release();
   }
+  await recordAudit({
+    entityType: 'checkout',
+    entityId: checkoutId,
+    action: 'checkout.approved',
+    actor: approvedBy === 'nicole' ? 'nicole' : 'system',
+    summary: `Approved charge of ${money(summary_snapshot.total_cents, summary_snapshot.currency)}`,
+    metadata: { total_cents: summary_snapshot.total_cents, currency: summary_snapshot.currency, approved_by: approvedBy },
+  });
 
-  // Charge (idempotent). The key is stable per checkout, so a retry never
-  // double-charges. Persist the key first as a second guard.
-  const idempotencyKey = `checkout:${checkoutId}:charge`;
+  // Charge (idempotent). The key is stable PER ATTEMPT: a retry within an attempt
+  // (network replay, the stuck-charge sweeper) reuses it and QB replays the
+  // original charge; a retry after a clean decline goes through resetFailedCharge,
+  // which bumps charge_attempts, so it's a genuinely NEW key and a NEW charge.
+  const idempotencyKey = `checkout:${checkoutId}:charge:${charge_attempts}`;
   await pool.query(`UPDATE checkout SET charge_idempotency_key = $2 WHERE id = $1 AND charge_idempotency_key IS NULL`, [
     checkoutId,
     idempotencyKey,
@@ -287,9 +315,27 @@ export async function approveAndCharge(checkoutId: string, opts: ApproveOptions 
   });
 
   if (!charge.ok) {
-    await transition(pool, checkoutId, 'CHARGING', 'CHARGE_FAILED');
-    logEvent('warn', 'checkout.charge', 'charge failed', { checkout_id: checkoutId, error: charge.error });
-    return { status: 'CHARGE_FAILED', error: charge.error };
+    // Ambiguous (network/5xx after possible capture) → CHARGE_REVIEW, never
+    // CHARGE_FAILED: recording maybe-captured money as failed is how a charge
+    // goes silent. Only a clean decline is a safe, retryable CHARGE_FAILED.
+    const target = charge.ambiguous ? 'CHARGE_REVIEW' : 'CHARGE_FAILED';
+    await transition(pool, checkoutId, 'CHARGING', target);
+    await recordChargeOutcome(checkoutId, { ok: false, status: charge.status ?? target, error: charge.error });
+    logEvent(charge.ambiguous ? 'error' : 'warn', 'checkout.charge', charge.ambiguous ? 'charge outcome unknown — needs manual review' : 'charge failed', {
+      checkout_id: checkoutId,
+      error: charge.error,
+      ambiguous: charge.ambiguous ?? false,
+    });
+    await recordAudit({
+      entityType: 'checkout',
+      entityId: checkoutId,
+      action: charge.ambiguous ? 'checkout.charge_review' : 'checkout.charge_failed',
+      summary: charge.ambiguous
+        ? `Charge outcome UNKNOWN — verify in QuickBooks (${money(summary_snapshot.total_cents, summary_snapshot.currency)})`
+        : `Charge failed — ${charge.error ?? 'declined'}`,
+      metadata: { error: charge.error, ambiguous: charge.ambiguous ?? false },
+    });
+    return { status: target, error: charge.error };
   }
 
   // Mark CHARGED and enqueue the reconciliation intent in ONE transaction, so a
@@ -301,10 +347,23 @@ export async function approveAndCharge(checkoutId: string, opts: ApproveOptions 
   const cdb = await pool.connect();
   try {
     await cdb.query('BEGIN');
-    await cdb.query(`UPDATE checkout SET qb_txn_id = $2, status = 'CHARGED' WHERE id = $1 AND status = 'CHARGING'`, [
-      checkoutId,
-      charge.txnId ?? null,
-    ]);
+    const marked = await cdb.query(
+      `UPDATE checkout SET qb_txn_id = $2, status = 'CHARGED' WHERE id = $1 AND status = 'CHARGING'`,
+      [checkoutId, charge.txnId ?? null],
+    );
+    if (marked.rowCount !== 1) {
+      // The row moved out from under us — the stuck-charge sweeper flagged it
+      // CHARGE_REVIEW while this charge was (slowly) succeeding. Don't enqueue a
+      // reconciliation against a row that isn't CHARGED; the CHARGE_REVIEW state
+      // already routes it to a human, who now also has the captured txn id.
+      await cdb.query('ROLLBACK');
+      logError('checkout.charged', 'charge captured but checkout no longer CHARGING (swept?) — manual review', undefined, {
+        checkout_id: checkoutId,
+        txn_id: charge.txnId,
+      });
+      await recordChargeOutcome(checkoutId, { ok: true, status: charge.status ?? 'CAPTURED', txnId: charge.txnId });
+      return { status: 'CHARGE_REVIEW', qbTxnId: charge.txnId, error: 'charge captured after state moved — verify in QuickBooks' };
+    }
     await enqueueReconciliation(cdb, {
       checkoutId,
       invoiceId: summary_snapshot.qb_invoice_id,
@@ -323,6 +382,17 @@ export async function approveAndCharge(checkoutId: string, opts: ApproveOptions 
   } finally {
     cdb.release();
   }
+
+  // Stamp the successful charge outcome onto the approval audit row (M8), so the
+  // audit carries both the authorization AND what the money did.
+  await recordChargeOutcome(checkoutId, { ok: true, status: charge.status ?? 'CAPTURED', txnId: charge.txnId });
+  await recordAudit({
+    entityType: 'checkout',
+    entityId: checkoutId,
+    action: 'checkout.charge_captured',
+    summary: `${charge.dryRun ? '[dry-run] ' : ''}Charged ${money(summary_snapshot.total_cents, summary_snapshot.currency)}`,
+    metadata: { qb_txn_id: charge.txnId ?? null, dry_run: charge.dryRun ?? false, total_cents: summary_snapshot.total_cents },
+  });
 
   // Best-effort inline reconciliation (invoice shows paid promptly in the happy
   // path). Failure is fine — the durable row + scheduler guarantee completion.
@@ -368,7 +438,103 @@ export async function approveAndCharge(checkoutId: string, opts: ApproveOptions 
 /** Nicole's final Confirm: PB_MARKED → CLOSED. */
 export async function closeCheckout(checkoutId: string): Promise<{ status: string }> {
   const ok = await transition(pool, checkoutId, 'PB_MARKED', 'CLOSED');
-  if (ok) logEvent('info', 'checkout.close', 'checkout closed', { checkout_id: checkoutId });
+  if (ok) {
+    logEvent('info', 'checkout.close', 'checkout closed', { checkout_id: checkoutId });
+    await recordAudit({ entityType: 'checkout', entityId: checkoutId, action: 'checkout.closed', actor: 'nicole', summary: 'Checkout confirmed and closed' });
+  }
   const r = await pool.query<{ status: string }>(`SELECT status FROM checkout WHERE id = $1`, [checkoutId]);
   return { status: r.rows[0]?.status ?? 'not_found' };
+}
+
+/**
+ * Stamp a charge's outcome onto its most recent approval audit row (M8). The
+ * approval records the AUTHORIZATION; this records what the money then did, so
+ * the row carries both. Best-effort — never blocks or fails the money path.
+ */
+async function recordChargeOutcome(
+  checkoutId: string,
+  outcome: { ok: boolean; status: string; txnId?: string | null; error?: string | null },
+): Promise<void> {
+  await pool
+    .query(
+      `UPDATE approvals
+          SET payload_json = payload_json || $2::jsonb
+        WHERE id = (
+          SELECT id FROM approvals
+           WHERE checkout_id = $1 AND type = 'checkout'
+        ORDER BY created_at DESC LIMIT 1
+        )`,
+      [
+        checkoutId,
+        JSON.stringify({
+          charge_outcome: outcome.ok ? 'captured' : 'failed',
+          charge_status: outcome.status,
+          qb_txn_id: outcome.txnId ?? null,
+          charge_error: outcome.error ?? null,
+          charge_recorded_at: new Date().toISOString(),
+        }),
+      ],
+    )
+    .catch((err) => logError('checkout.audit', 'failed to stamp charge outcome on approval', err, { checkout_id: checkoutId }));
+}
+
+// A charge that stays CHARGING past this is presumed crashed mid-flight (a real
+// charge resolves in seconds within one request). Well beyond any legitimate
+// in-flight charge, so the sweeper can't race a slow-but-live one.
+const STUCK_CHARGE_MS = 10 * 60_000;
+
+/**
+ * Recover charges stranded in CHARGING by a crash between capture and the
+ * CHARGED+outbox commit (M1). We can't know whether money moved without the card
+ * token (never persisted) or a provider lookup, so we make it LOUD, not silent:
+ * move it to CHARGE_REVIEW for a human to verify in QuickBooks. Returns how many
+ * were flagged. Idempotent; safe to run on a schedule.
+ */
+export async function sweepStuckCharges(olderThanMs = STUCK_CHARGE_MS): Promise<{ flagged: number }> {
+  const cutoff = new Date(Date.now() - olderThanMs);
+  const r = await pool.query<{ id: string }>(
+    `UPDATE checkout SET status = 'CHARGE_REVIEW'
+      WHERE status = 'CHARGING' AND updated_at < $1
+    RETURNING id`,
+    [cutoff],
+  );
+  for (const row of r.rows) {
+    logError('checkout.stuck_charge', 'checkout stuck in CHARGING — flagged for manual review', undefined, {
+      checkout_id: row.id,
+    });
+    await recordAudit({
+      entityType: 'checkout',
+      entityId: row.id,
+      action: 'checkout.charge_review',
+      summary: 'Charge stuck mid-flight — flagged for manual review (verify in QuickBooks)',
+    });
+  }
+  return { flagged: r.rowCount ?? 0 };
+}
+
+/**
+ * Reopen a cleanly-declined checkout so Nicole can retry with another card (M4).
+ * Only CHARGE_FAILED (definitely no money moved) is reopened — never
+ * CHARGE_REVIEW, where a re-charge could double-charge. Bumps charge_attempts
+ * and clears the stored key, so the next approve mints a NEW idempotency key and
+ * is a genuinely new charge rather than a replay of the decline.
+ */
+export async function resetFailedCharge(checkoutId: string): Promise<{ status: string }> {
+  const r = await pool.query<{ status: string }>(
+    `UPDATE checkout
+        SET status = 'AWAITING_APPROVAL',
+            charge_attempts = charge_attempts + 1,
+            charge_idempotency_key = NULL,
+            qb_txn_id = NULL
+      WHERE id = $1 AND status = 'CHARGE_FAILED'
+    RETURNING status`,
+    [checkoutId],
+  );
+  if (r.rowCount === 1) {
+    logEvent('info', 'checkout.retry', 'reopened a failed charge for retry', { checkout_id: checkoutId });
+    await recordAudit({ entityType: 'checkout', entityId: checkoutId, action: 'checkout.retry_reopened', actor: 'nicole', summary: 'Reopened a declined charge to retry with another card' });
+    return { status: 'AWAITING_APPROVAL' };
+  }
+  const cur = await pool.query<{ status: string }>(`SELECT status FROM checkout WHERE id = $1`, [checkoutId]);
+  return { status: cur.rows[0]?.status ?? 'not_found' };
 }

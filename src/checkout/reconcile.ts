@@ -14,6 +14,17 @@ import { resolveQboCustomerId } from './customerMap';
 const MAX_ATTEMPTS = 8;
 const BASE_BACKOFF_MS = 60_000; // 1 min
 const MAX_BACKOFF_MS = 6 * 60 * 60_000; // 6h
+// A row claimed into RECORDING but not advanced within this window is presumed
+// crashed mid-record (M2). Reclaiming it is safe: the QBO `requestid` makes the
+// Payment write idempotent, so a reclaim of a genuinely in-flight row replays
+// the same Payment rather than creating a second.
+const RECORDING_LEASE = `interval '15 minutes'`;
+// Reusable predicate: a row is due if it's PENDING/FAILED and past its backoff,
+// OR it's a RECORDING whose lease has expired.
+const DUE_PREDICATE = `(
+  (status IN ('PENDING', 'FAILED') AND next_attempt_at <= now())
+  OR (status = 'RECORDING' AND updated_at < now() - ${RECORDING_LEASE})
+)`;
 
 /** Exponential backoff with jitter, capped. Persisted, so it survives restarts. */
 export function backoffMs(attempts: number): number {
@@ -93,10 +104,11 @@ async function deadLetter(id: string, reason: string): Promise<void> {
  * Payment and advances the row. Never throws for expected outcomes.
  */
 export async function runReconciliation(row: ReconRow, deps: ReconcileDeps = {}): Promise<void> {
-  // Atomic claim — guards against the inline attempt and the job racing.
+  // Atomic claim — guards against the inline attempt and the job racing, and
+  // reclaims a RECORDING row whose lease has expired (crashed mid-record, M2).
   const claim = await pool.query(
     `UPDATE payment_reconciliation SET status = 'RECORDING'
-      WHERE id = $1 AND status IN ('PENDING', 'FAILED') AND next_attempt_at <= now()`,
+      WHERE id = $1 AND ${DUE_PREDICATE}`,
     [row.id],
   );
   if (claim.rowCount !== 1) return; // lost the race, or not due yet
@@ -186,7 +198,7 @@ export async function processDueReconciliations(limit = 25, deps: ReconcileDeps 
   const due = await pool.query<ReconRow>(
     `SELECT id, checkout_id, invoice_id, customer_id, amount_cents, currency, idempotency_key, attempts, provider_txn_id
        FROM payment_reconciliation
-      WHERE status IN ('PENDING', 'FAILED') AND next_attempt_at <= now()
+      WHERE ${DUE_PREDICATE}
       ORDER BY next_attempt_at ASC
       LIMIT $1`,
     [limit],

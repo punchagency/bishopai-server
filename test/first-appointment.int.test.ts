@@ -96,5 +96,8 @@ suite('first-appointment conversion (integration)', () => {
       [ONE],
     );
     expect(n.rows[0].n).toBe(1);
-  });
+    // Heavy: 8 inserts + an enroll + two cadence passes + an idempotency check.
+    // In isolation it runs in ~3s, but sharing Postgres with the parallel suite
+    // it can brush the default 5s. A wider ceiling keeps it from flaking there.
+  }, 15_000);
 });

@@ -9,6 +9,7 @@ import {
   isOutlookAppConfigured,
   setPrimarySender,
 } from '../integrations/outlook';
+import { recordAudit } from '../audit/log';
 
 // The "Connect Outlook" (delegated OAuth) surface for WF3.
 //
@@ -116,6 +117,7 @@ outlookRouter.get('/callback', async (req, res) => {
 
   try {
     const { sender } = await exchangeCodeForTokens(code, state);
+    await recordAudit({ entityType: 'outlook', entityId: sender, action: 'outlook.connected', actor: 'nicole', summary: `Connected Outlook mailbox ${sender}` });
     return res.send(
       resultPage({
         ok: true,
@@ -141,6 +143,7 @@ outlookRouter.post('/disconnect', requireAuth, async (req, res) => {
   const sender = typeof req.body?.sender === 'string' ? req.body.sender : undefined;
   try {
     await disconnectOutlook(sender);
+    await recordAudit({ entityType: 'outlook', entityId: sender ?? 'all', action: 'outlook.disconnected', actor: 'nicole', summary: sender ? `Disconnected Outlook mailbox ${sender}` : 'Disconnected all Outlook mailboxes' });
     res.json(await getOutlookConnection());
   } catch (err) {
     logError('outlook.disconnect', 'disconnect failed', err);
@@ -154,6 +157,7 @@ outlookRouter.post('/primary', requireAuth, async (req, res) => {
   if (!sender) return res.status(400).json({ error: 'sender required' });
   try {
     await setPrimarySender(sender);
+    await recordAudit({ entityType: 'outlook', entityId: sender, action: 'outlook.primary_set', actor: 'nicole', summary: `Set ${sender} as the sending mailbox` });
     return res.json(await getOutlookConnection());
   } catch (err) {
     if (err instanceof Error && /no connected Outlook mailbox/.test(err.message)) {

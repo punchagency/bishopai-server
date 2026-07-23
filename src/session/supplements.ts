@@ -43,19 +43,37 @@ export async function syncClientSupplements(
     if (!name) continue; // skip nameless entries — nothing to key on
 
     if (s.change === 'stop') {
+      // Chronology guard: a `stop` from an older session (approved late, out of
+      // order) must not remove a plan a NEWER session already established. Only
+      // stop rows dated at or before this session. A row with no date, or an
+      // undated session, falls through to the old unconditional behaviour.
       const r = await db.query(
-        `DELETE FROM supplements WHERE client_id = $1 AND lower(name) = lower($2)`,
-        [clientId, name],
+        `DELETE FROM supplements
+          WHERE client_id = $1 AND lower(name) = lower($2)
+            AND ($3::date IS NULL OR start_date IS NULL OR start_date <= $3::date)`,
+        [clientId, name, startDate],
       );
       removed += r.rowCount ?? 0;
       continue;
     }
 
     // start | increase | decrease | continue → keep one current row per name.
-    const existing = await db.query<{ id: string }>(
-      `SELECT id FROM supplements WHERE client_id = $1 AND lower(name) = lower($2) LIMIT 1`,
+    const existing = await db.query<{ id: string; start_date: string | null }>(
+      `SELECT id, start_date::text AS start_date FROM supplements
+        WHERE client_id = $1 AND lower(name) = lower($2) LIMIT 1`,
       [clientId, name],
     );
+    // Don't let an out-of-order approval walk the plan backwards: if the stored
+    // row is dated NEWER than this session, a later session already owns it —
+    // leave it. (Both dates must be known to compare; otherwise proceed.)
+    if (
+      existing.rowCount &&
+      startDate &&
+      existing.rows[0].start_date &&
+      existing.rows[0].start_date > startDate
+    ) {
+      continue;
+    }
     // Only overwrite the stored schedule when this session actually stated timing;
     // otherwise the row keeps whatever slot pattern an earlier session established.
     const schedule = s.schedule && Object.values(s.schedule).some(Boolean)

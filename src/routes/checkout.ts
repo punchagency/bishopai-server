@@ -2,11 +2,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../db/pool';
 import { logError } from '../observability/logger';
-import { approveAndCharge, closeCheckout, detectCheckout } from '../checkout/machine';
+import { approveAndCharge, closeCheckout, detectCheckout, resetFailedCharge } from '../checkout/machine';
 import { reconcileCheckout } from '../checkout/reconcile';
 import { syncCustomerMappings } from '../checkout/customerSync';
 import { setQboCustomerId } from '../checkout/customerMap';
 import { isQuickbooksConfigured } from '../integrations/quickbooks';
+import { recordAudit } from '../audit/log';
 
 // WF2 dashboard surface: post-session charges awaiting approval, and the unified
 // confirmation. Nicole has two actions — approve the charge, confirm the close —
@@ -80,11 +81,32 @@ checkoutRouter.post('/:id/approve', async (req, res) => {
   try {
     const result = await approveAndCharge(req.params.id, { approvedBy: approved_by ?? 'nicole', token, card });
     if (result.status === 'not_found') return res.status(404).json({ error: 'not found' });
-    if (result.status === 'CHARGE_FAILED') return res.status(402).json(result); // payment required
+    if (result.status === 'CHARGE_FAILED') return res.status(402).json(result); // payment required — retryable
+    // Outcome unknown (crash / ambiguous provider response): money MAY have moved.
+    // 202 Accepted, not an error code — the truth is pending human verification.
+    if (result.status === 'CHARGE_REVIEW') return res.status(202).json(result);
     if (result.error) return res.status(409).json(result);
     return res.json(result);
   } catch (err) {
     logError('checkout.approve', 'approve failed', err, { id: req.params.id }); // err carries no card data
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// POST /checkout/:id/retry-charge — reopen a cleanly-declined checkout so Nicole
+// can approve again with another card. Refused for CHARGE_REVIEW (money may have
+// moved — a re-charge could double-charge; that needs manual QuickBooks review).
+checkoutRouter.post('/:id/retry-charge', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  try {
+    const result = await resetFailedCharge(req.params.id);
+    if (result.status === 'not_found') return res.status(404).json({ error: 'not found' });
+    if (result.status !== 'AWAITING_APPROVAL') {
+      return res.status(409).json({ error: 'not retryable in current status', status: result.status });
+    }
+    return res.json(result);
+  } catch (err) {
+    logError('checkout.retry', 'retry-charge failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
   }
 });
@@ -156,6 +178,7 @@ checkoutRouter.post('/customer-map/sync', async (_req, res) => {
   try {
     const report = await syncCustomerMappings();
     if (!report.ok) return res.status(400).json(report);
+    await recordAudit({ entityType: 'customer_map', entityId: 'sync', action: 'customer_map.synced', actor: 'nicole', summary: `Synced from QuickBooks — ${report.mapped.length} mapped, ${report.ambiguous.length} ambiguous, ${report.unmatched.length} unmatched`, metadata: { mapped: report.mapped.length, ambiguous: report.ambiguous.length, unmatched: report.unmatched.length } });
     return res.json(report);
   } catch (err) {
     logError('checkout.customer_map', 'sync failed', err);
@@ -173,6 +196,7 @@ checkoutRouter.put('/customer-map/:clientId', async (req, res) => {
     const exists = await pool.query(`SELECT 1 FROM clients WHERE id = $1`, [req.params.clientId]);
     if (exists.rowCount === 0) return res.status(404).json({ error: 'client not found' });
     await setQboCustomerId(req.params.clientId, parsed.data.qbo_customer_id);
+    await recordAudit({ entityType: 'customer_map', entityId: req.params.clientId, action: 'customer_map.set', actor: 'nicole', summary: `Mapped client to QuickBooks customer #${parsed.data.qbo_customer_id}`, metadata: { qbo_customer_id: parsed.data.qbo_customer_id } });
     return res.json({ client_id: req.params.clientId, qbo_customer_id: parsed.data.qbo_customer_id });
   } catch (err) {
     logError('checkout.customer_map', 'set failed', err, { client_id: req.params.clientId });
@@ -185,6 +209,7 @@ checkoutRouter.delete('/customer-map/:clientId', async (req, res) => {
   if (!isUuid(req.params.clientId)) return res.status(404).json({ error: 'not found' });
   try {
     await pool.query(`DELETE FROM client_qbo_map WHERE client_id = $1`, [req.params.clientId]);
+    await recordAudit({ entityType: 'customer_map', entityId: req.params.clientId, action: 'customer_map.cleared', actor: 'nicole', summary: 'Removed the QuickBooks customer mapping' });
     return res.json({ ok: true });
   } catch (err) {
     logError('checkout.customer_map', 'delete failed', err, { client_id: req.params.clientId });

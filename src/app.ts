@@ -5,6 +5,7 @@ import { reviewRouter } from './routes/review';
 import { refillsRouter } from './routes/refills';
 import { engagementRouter } from './routes/engagement';
 import { checkoutRouter } from './routes/checkout';
+import { auditRouter } from './routes/audit';
 import { dashboardRouter } from './routes/dashboard';
 import { consentsRouter } from './routes/consents';
 import { authRouter } from './routes/auth';
@@ -53,6 +54,7 @@ export function createApp(): express.Express {
   app.use('/appointments', requireAuth, appointmentsRouter);
   app.use('/tasks', requireAuth, tasksRouter);
   app.use('/clients', requireAuth, clientsRouter);
+  app.use('/audit', requireAuth, auditRouter);
 
   return app;
 }

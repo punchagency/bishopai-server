@@ -107,6 +107,87 @@ suite('session assignment (integration, real Postgres)', () => {
     expect(dana.name_mentions).toBe(0);
   });
 
+  it('returns one unmatched recording in full for the detail view', async () => {
+    const convId = await makeConversation(
+      'Nicole: full transcript for the detail pane. Client: I have been sleeping better.',
+      at(18, 0),
+      at(18, 45),
+    );
+
+    const r = await get(`/review/unmatched/${convId}`);
+    expect(r.status).toBe(200);
+    const { conversation } = await r.json();
+    expect(conversation.id).toBe(convId);
+    // The whole transcript, not the 240-char list preview.
+    expect(conversation.transcript).toContain('sleeping better');
+    expect(conversation.correlation_status).toBe('unmatched');
+    expect(conversation.extraction_status).toBe('pending');
+  });
+
+  it('refuses the detail view for a recording already tied to an appointment', async () => {
+    const apptId = await makeAppt(danaId, 'asgn-detail-matched', at(19, 0), at(19, 45));
+    const convId = await makeConversation('Nicole: matched.', at(19, 0), at(19, 45));
+    await pool.query(
+      `UPDATE conversations SET appointment_id = $2, client_id = $3, correlation_status = 'matched'
+        WHERE id = $1`,
+      [convId, apptId, danaId],
+    );
+
+    const r = await get(`/review/unmatched/${convId}`);
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toBe('already matched');
+  });
+
+  it('404s the detail view for an unknown recording', async () => {
+    const r = await get('/review/unmatched/00000000-0000-0000-0000-000000000000');
+    expect(r.status).toBe(404);
+  });
+
+  it('refuses to match a recording onto an appointment that already has one', async () => {
+    const apptId = await makeAppt(martaId, 'asgn-taken', at(20, 0), at(20, 45));
+    // First recording claims the appointment.
+    const firstConv = await makeConversation('Nicole: first.', at(20, 0), at(20, 45));
+    await pool.query(
+      `UPDATE conversations SET appointment_id = $2, client_id = $3, correlation_status = 'matched' WHERE id = $1`,
+      [firstConv, apptId, martaId],
+    );
+    // A second, unmatched recording tries to attach to the same appointment.
+    const secondConv = await makeConversation('Nicole: second.', at(20, 0), at(20, 45));
+    const r = await post(`/review/unmatched/${secondConv}/match`, { appointment_id: apptId });
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toMatch(/recording/i);
+  });
+
+  it('refuses to match a recording onto an already-approved session', async () => {
+    const apptId = await makeAppt(danaId, 'asgn-appr-match', at(21, 0), at(21, 45));
+    await pool.query(
+      `INSERT INTO appointment_sheets (appointment_id, client_id, content_json, status)
+       VALUES ($1, $2, '{}'::jsonb, 'approved')`,
+      [apptId, danaId],
+    );
+    const conv = await makeConversation('Nicole: stray.', at(21, 0), at(21, 45));
+    const r = await post(`/review/unmatched/${conv}/match`, { appointment_id: apptId });
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toMatch(/approved/i);
+
+    // The approved note is untouched — no demotion to draft.
+    const sheet = await pool.query<{ status: string }>(
+      `SELECT status FROM appointment_sheets WHERE appointment_id = $1`, [apptId]);
+    expect(sheet.rows[0].status).toBe('approved');
+  });
+
+  it('refuses to match a recording onto a cancelled appointment', async () => {
+    const c = await pool.query<{ id: string }>(
+      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
+       VALUES ($1, 'asgn-cancelled', $2, $3, 'cancelled') RETURNING id`,
+      [martaId, at(22, 0), at(22, 45)],
+    );
+    const conv = await makeConversation('Nicole: walk-in in a cancelled slot.', at(22, 0), at(22, 45));
+    const r = await post(`/review/unmatched/${conv}/match`, { appointment_id: c.rows[0].id });
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toMatch(/cancelled/i);
+  });
+
   it('assigns a walk-in to a client, creating the appointment from the recording', async () => {
     const convId = await makeConversation(
       'Nicole: no booking for this one, just a quick check.',
