@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 
 // client → QuickBooks Online Customer.Id mapping. QBO has no notion of a Practice
 // Better client, so reconciliation needs this bridge to know which customer a
@@ -8,17 +8,19 @@ import { pool } from '../db/pool';
 
 export async function resolveQboCustomerId(clientId: string | null | undefined): Promise<string | null> {
   if (!clientId) return null;
-  const r = await pool.query<{ qbo_customer_id: string }>(
-    `SELECT qbo_customer_id FROM client_qbo_map WHERE client_id = $1`,
-    [clientId],
-  );
-  return r.rows[0]?.qbo_customer_id ?? null;
+  // Document id == client_id, which was the primary key in Postgres.
+  const map = await getDatabase().checkouts.findQboMapByClient(clientId);
+  return map?.qbo_customer_id ?? null;
 }
 
 export async function setQboCustomerId(clientId: string, qboCustomerId: string): Promise<void> {
-  await pool.query(
-    `INSERT INTO client_qbo_map (client_id, qbo_customer_id) VALUES ($1, $2)
-     ON CONFLICT (client_id) DO UPDATE SET qbo_customer_id = EXCLUDED.qbo_customer_id`,
-    [clientId, qboCustomerId],
-  );
+  const db = getDatabase();
+  const existing = await db.checkouts.findQboMapByClient(clientId);
+  const now = new Date().toISOString();
+  await db.checkouts.saveQboMap({
+    client_id: clientId,
+    qbo_customer_id: qboCustomerId,
+    created_at: existing?.created_at ?? now,
+    updated_at: now,
+  });
 }

@@ -9,6 +9,7 @@ import type {
   Approval,
   NoteRevision,
   Checkout,
+  CheckoutStatus,
   PaymentReconciliation,
   ClientQboMap,
   Supplement,
@@ -221,6 +222,8 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
   private checkouts = new Map<string, Checkout>();
   private reconciliations = new Map<string, PaymentReconciliation>();
   private qboMaps = new Map<string, ClientQboMap>();
+  // `approvals` is one unified collection shared with the session flow.
+  private approvals: Approval[] = [];
 
   async findById(id: string): Promise<Checkout | null> {
     return this.checkouts.get(id) ?? null;
@@ -243,6 +246,121 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
   async save(checkout: Checkout): Promise<Checkout> {
     this.checkouts.set(checkout.id, checkout);
     return checkout;
+  }
+  async createIfAbsent(checkout: Checkout): Promise<{ checkout: Checkout; created: boolean }> {
+    const existing = this.checkouts.get(checkout.id);
+    if (existing) return { checkout: existing, created: false };
+    this.checkouts.set(checkout.id, checkout);
+    return { checkout, created: true };
+  }
+  // Single-threaded JS makes this atomic by construction; the point is to mirror
+  // the Firestore contract exactly — returns true only if the row was in `from`.
+  async transition(
+    id: string,
+    from: CheckoutStatus,
+    to: CheckoutStatus,
+    patch: Partial<Checkout> = {},
+  ): Promise<boolean> {
+    const row = this.checkouts.get(id);
+    if (!row || row.status !== from) return false;
+    this.checkouts.set(id, { ...row, ...patch, status: to, updated_at: new Date().toISOString() });
+    return true;
+  }
+  async transitionWithApproval(
+    id: string,
+    from: CheckoutStatus,
+    to: CheckoutStatus,
+    approval: Approval,
+  ): Promise<boolean> {
+    const row = this.checkouts.get(id);
+    if (!row || row.status !== from) return false;
+    this.checkouts.set(id, { ...row, status: to, updated_at: new Date().toISOString() });
+    this.approvals.push(approval);
+    return true;
+  }
+  async markChargedWithReconciliation(
+    checkoutId: string,
+    patch: Partial<Checkout>,
+    reconciliation: PaymentReconciliation,
+  ): Promise<boolean> {
+    const row = this.checkouts.get(checkoutId);
+    if (!row || row.status !== 'CHARGING') return false;
+    this.checkouts.set(checkoutId, {
+      ...row,
+      ...patch,
+      status: 'CHARGED',
+      updated_at: new Date().toISOString(),
+    });
+    if (!this.reconciliations.has(reconciliation.id)) {
+      this.reconciliations.set(reconciliation.id, reconciliation);
+    }
+    return true;
+  }
+  async claimIdempotencyKey(id: string, key: string): Promise<void> {
+    const row = this.checkouts.get(id);
+    if (!row || row.charge_idempotency_key) return;
+    this.checkouts.set(id, { ...row, charge_idempotency_key: key });
+  }
+  async listStuckCharging(cutoff: string): Promise<Checkout[]> {
+    return Array.from(this.checkouts.values()).filter(
+      (c) => c.status === 'CHARGING' && c.updated_at < cutoff,
+    );
+  }
+  async reopenFailedCharge(id: string): Promise<boolean> {
+    const row = this.checkouts.get(id);
+    if (!row || row.status !== 'CHARGE_FAILED') return false;
+    this.checkouts.set(id, {
+      ...row,
+      status: 'AWAITING_APPROVAL',
+      charge_attempts: (row.charge_attempts ?? 0) + 1,
+      charge_idempotency_key: null,
+      qb_txn_id: null,
+      updated_at: new Date().toISOString(),
+    });
+    return true;
+  }
+  async listApprovalsByCheckout(checkoutId: string, limit = 10): Promise<Approval[]> {
+    return this.approvals
+      .filter((a) => a.checkout_id === checkoutId && a.type === 'checkout')
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, limit);
+  }
+  async saveApproval(approval: Approval): Promise<Approval> {
+    const i = this.approvals.findIndex((a) => a.id === approval.id);
+    if (i >= 0) this.approvals[i] = approval;
+    else this.approvals.push(approval);
+    return approval;
+  }
+  async patchApprovalPayload(id: string, patch: Record<string, unknown>): Promise<void> {
+    const i = this.approvals.findIndex((a) => a.id === id);
+    if (i < 0) return;
+    this.approvals[i] = {
+      ...this.approvals[i],
+      payload_json: { ...(this.approvals[i].payload_json ?? {}), ...patch },
+    };
+  }
+  async listDueReconciliations(now: string, leaseCutoff: string): Promise<PaymentReconciliation[]> {
+    return Array.from(this.reconciliations.values())
+      .filter(
+        (r) =>
+          ((r.status === 'PENDING' || r.status === 'FAILED') && r.next_attempt_at <= now) ||
+          (r.status === 'RECORDING' && r.updated_at < leaseCutoff),
+      )
+      .sort((a, b) => a.next_attempt_at.localeCompare(b.next_attempt_at));
+  }
+  async claimReconciliation(id: string): Promise<boolean> {
+    const row = this.reconciliations.get(id);
+    if (!row) return false;
+    if (row.status !== 'PENDING' && row.status !== 'FAILED' && row.status !== 'RECORDING') {
+      return false;
+    }
+    this.reconciliations.set(id, {
+      ...row,
+      status: 'RECORDING',
+      attempts: (row.attempts ?? 0) + 1,
+      updated_at: new Date().toISOString(),
+    });
+    return true;
   }
   async saveReconciliation(rec: PaymentReconciliation): Promise<PaymentReconciliation> {
     this.reconciliations.set(rec.id, rec);
@@ -274,6 +392,7 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
     this.checkouts.clear();
     this.reconciliations.clear();
     this.qboMaps.clear();
+    this.approvals = [];
   }
 }
 

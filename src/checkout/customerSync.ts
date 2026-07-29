@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent } from '../observability/logger';
 import { isQuickbooksConfigured } from '../integrations/quickbooks';
 import { queryCustomers, type Customer } from '../integrations/quickbooks/customer';
@@ -73,18 +73,18 @@ export async function syncCustomerMappings(deps: SyncDeps = {}): Promise<SyncRep
   if (!isQuickbooksConfigured()) return { ok: false, error: 'QuickBooks not configured', ...emptyCounts };
 
   const customers = await (deps.fetchCustomers ?? queryCustomers)();
-  const alreadyMapped = Number(
-    (await pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM client_qbo_map`)).rows[0].n,
-  );
+  const db = getDatabase();
+
+  // Firestore has no NOT EXISTS anti-join, so the mapping set is loaded once and
+  // the filter runs in memory. Both collections are per-client and small.
+  const maps = await db.checkouts.listQboMaps();
+  const alreadyMapped = maps.length;
+  const mappedIds = new Set(maps.map((m) => m.client_id));
 
   // Only clients without an existing mapping — never clobber a manual/prior map.
-  const clients = (
-    await pool.query<{ id: string; name: string; email: string | null }>(
-      `SELECT c.id, c.name, c.email FROM clients c
-        WHERE NOT EXISTS (SELECT 1 FROM client_qbo_map m WHERE m.client_id = c.id)
-        ORDER BY c.name`,
-    )
-  ).rows;
+  const clients = (await db.clients.listAll())
+    .filter((c) => !mappedIds.has(c.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
 
   const report: SyncReport = {
     ok: true,

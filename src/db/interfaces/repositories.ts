@@ -9,6 +9,7 @@ import type {
   Approval,
   NoteRevision,
   Checkout,
+  CheckoutStatus,
   PaymentReconciliation,
   ClientQboMap,
   Supplement,
@@ -84,11 +85,88 @@ export interface ICheckoutsRepository {
   findByPbAppointmentId(pbAppointmentId: string): Promise<Checkout | null>;
   listAll(): Promise<Checkout[]>;
   save(checkout: Checkout): Promise<Checkout>;
-  
+
+  /**
+   * Insert-if-absent, keyed on the document id (== appointment_id). Returns the
+   * existing row when one is already there, so re-detection is idempotent — the
+   * `ON CONFLICT (appointment_id) DO NOTHING` equivalent.
+   */
+  createIfAbsent(checkout: Checkout): Promise<{ checkout: Checkout; created: boolean }>;
+
+  /**
+   * Atomic guarded transition — the compare-and-set that the entire
+   * no-double-charge guarantee rests on. Returns true ONLY if the checkout was
+   * in `from` and is now in `to`; a caller that loses the race MUST back off.
+   *
+   * `patch` is applied in the same atomic write, for fields that must land with
+   * the transition (qb_txn_id on CHARGED) and never separately.
+   */
+  transition(
+    id: string,
+    from: CheckoutStatus,
+    to: CheckoutStatus,
+    patch?: Partial<Checkout>,
+  ): Promise<boolean>;
+
+  /**
+   * AWAITING_APPROVAL → CHARGING *and* the approval record, in ONE transaction.
+   * The approval is the authorization for the charge that follows; it must never
+   * be missing for a checkout that went CHARGING, nor exist for one that didn't.
+   * Returns false when the transition was lost, in which case NO approval is
+   * written and the caller must not charge.
+   */
+  transitionWithApproval(
+    id: string,
+    from: CheckoutStatus,
+    to: CheckoutStatus,
+    approval: Approval,
+  ): Promise<boolean>;
+
+  /**
+   * CHARGING → CHARGED *and* the reconciliation intent, in ONE transaction.
+   * A captured charge must never exist without its outbox row, and an outbox row
+   * must never exist for a checkout that isn't CHARGED.
+   *
+   * Returns false when the transition was lost (e.g. the stuck-charge sweeper
+   * moved the row to CHARGE_REVIEW while a slow charge was succeeding), in which
+   * case NO reconciliation is enqueued.
+   */
+  markChargedWithReconciliation(
+    checkoutId: string,
+    patch: Partial<Checkout>,
+    reconciliation: PaymentReconciliation,
+  ): Promise<boolean>;
+
+  /** Claim the idempotency key only if unset — mirrors the `IS NULL` guard. */
+  claimIdempotencyKey(id: string, key: string): Promise<void>;
+
+  /** Checkouts stranded in CHARGING before `cutoff` — presumed crashed mid-flight. */
+  listStuckCharging(cutoff: string): Promise<Checkout[]>;
+
+  /**
+   * CHARGE_FAILED → AWAITING_APPROVAL, bumping charge_attempts and clearing the
+   * stored key so the next approve mints a NEW idempotency key and is genuinely a
+   * new charge rather than a replay of the decline.
+   *
+   * Deliberately refuses CHARGE_REVIEW: there, money may already have moved, and
+   * re-charging would double-charge.
+   */
+  reopenFailedCharge(id: string): Promise<boolean>;
+
+  /** Money approvals for a checkout, newest first. */
+  listApprovalsByCheckout(checkoutId: string, limit?: number): Promise<Approval[]>;
+  saveApproval(approval: Approval): Promise<Approval>;
+  /** Merge fields into an approval's payload_json (the charge-outcome stamp). */
+  patchApprovalPayload(id: string, patch: Record<string, unknown>): Promise<void>;
+
   saveReconciliation(rec: PaymentReconciliation): Promise<PaymentReconciliation>;
   findReconciliationByCheckout(checkoutId: string): Promise<PaymentReconciliation | null>;
   listPendingReconciliations(): Promise<PaymentReconciliation[]>;
-  
+  /** Rows due for a reconciliation attempt: backoff elapsed, or lease expired. */
+  listDueReconciliations(now: string, leaseCutoff: string): Promise<PaymentReconciliation[]>;
+  /** Claim PENDING/FAILED → RECORDING atomically so two workers can't both record. */
+  claimReconciliation(id: string): Promise<boolean>;
+
   saveQboMap(map: ClientQboMap): Promise<ClientQboMap>;
   findQboMapByClient(clientId: string): Promise<ClientQboMap | null>;
   listQboMaps(): Promise<ClientQboMap[]>;

@@ -1,5 +1,5 @@
-import type { PoolClient } from 'pg';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
+import type { PaymentReconciliation } from '../db/interfaces/types.js';
 import { logEvent, logError } from '../observability/logger';
 import { isQuickbooksConfigured } from '../integrations/quickbooks';
 import { recordInvoicePayment, type RecordPaymentResult } from '../integrations/quickbooks/payment';
@@ -18,13 +18,16 @@ const MAX_BACKOFF_MS = 6 * 60 * 60_000; // 6h
 // crashed mid-record (M2). Reclaiming it is safe: the QBO `requestid` makes the
 // Payment write idempotent, so a reclaim of a genuinely in-flight row replays
 // the same Payment rather than creating a second.
-const RECORDING_LEASE = `interval '15 minutes'`;
-// Reusable predicate: a row is due if it's PENDING/FAILED and past its backoff,
-// OR it's a RECORDING whose lease has expired.
-const DUE_PREDICATE = `(
-  (status IN ('PENDING', 'FAILED') AND next_attempt_at <= now())
-  OR (status = 'RECORDING' AND updated_at < now() - ${RECORDING_LEASE})
-)`;
+const RECORDING_LEASE_MS = 15 * 60_000;
+
+/** A row is due if PENDING/FAILED past its backoff, or a RECORDING whose lease expired. */
+function dueWindow(): { now: string; leaseCutoff: string } {
+  const t = Date.now();
+  return {
+    now: new Date(t).toISOString(),
+    leaseCutoff: new Date(t - RECORDING_LEASE_MS).toISOString(),
+  };
+}
 
 /** Exponential backoff with jitter, capped. Persisted, so it survives restarts. */
 export function backoffMs(attempts: number): number {
@@ -54,26 +57,36 @@ export interface EnqueueArgs {
 }
 
 /**
- * Insert the durable reconciliation intent. MUST be called with the same db
- * client / transaction that marks the checkout CHARGED, so charge + intent
- * commit together. Idempotent on checkout_id (one row per checkout).
+ * Build the durable reconciliation intent.
+ *
+ * It is NOT written here. The caller hands it to
+ * `checkouts.markChargedWithReconciliation`, which commits it in the SAME
+ * transaction that marks the checkout CHARGED — so a captured charge can never
+ * exist without its intent, and an intent can never exist for a checkout that
+ * never charged.
+ *
+ * The document id is the checkout id, which is what makes the write idempotent:
+ * the pg table carried UNIQUE(checkout_id) for the same reason.
  */
-export async function enqueueReconciliation(db: PoolClient, args: EnqueueArgs): Promise<void> {
-  await db.query(
-    `INSERT INTO payment_reconciliation
-       (checkout_id, invoice_id, customer_id, amount_cents, currency, provider_txn_id, idempotency_key, status, next_attempt_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', now())
-     ON CONFLICT (checkout_id) DO NOTHING`,
-    [
-      args.checkoutId,
-      args.invoiceId,
-      args.customerId,
-      args.amountCents,
-      args.currency,
-      args.providerTxnId,
-      `checkout:${args.checkoutId}:payment`,
-    ],
-  );
+export function buildReconciliation(args: EnqueueArgs): PaymentReconciliation {
+  const now = new Date().toISOString();
+  return {
+    id: args.checkoutId,
+    checkout_id: args.checkoutId,
+    invoice_id: args.invoiceId,
+    customer_id: args.customerId,
+    amount_cents: args.amountCents,
+    currency: args.currency,
+    provider_txn_id: args.providerTxnId,
+    status: 'PENDING',
+    // Stable, and doubles as the QBO `requestid` that makes the Payment write
+    // idempotent — so a reclaim replays the same Payment, never a second one.
+    idempotency_key: `checkout:${args.checkoutId}:payment`,
+    attempts: 0,
+    next_attempt_at: now,
+    created_at: now,
+    updated_at: now,
+  };
 }
 
 /** Test seam: swap the accounting write. */
@@ -88,10 +101,18 @@ export interface ReconcileDeps {
 }
 
 async function deadLetter(id: string, reason: string): Promise<void> {
-  await pool.query(
-    `UPDATE payment_reconciliation SET status = 'NEEDS_REVIEW', last_error = $2 WHERE id = $1`,
-    [id, reason],
-  );
+  const db = getDatabase();
+  // The outbox document id IS the checkout id (buildReconciliation), which is what
+  // makes one-row-per-checkout hold, so this lookup is exact rather than a scan.
+  const existing = await db.checkouts.findReconciliationByCheckout(id);
+  if (existing) {
+    await db.checkouts.saveReconciliation({
+      ...existing,
+      status: 'NEEDS_REVIEW',
+      last_error: reason,
+      updated_at: new Date().toISOString(),
+    });
+  }
   logError('checkout.reconcile', 'reconciliation needs manual review', undefined, {
     reconciliation_id: id,
     reason,
@@ -104,25 +125,22 @@ async function deadLetter(id: string, reason: string): Promise<void> {
  * Payment and advances the row. Never throws for expected outcomes.
  */
 export async function runReconciliation(row: ReconRow, deps: ReconcileDeps = {}): Promise<void> {
+  const db = getDatabase();
   // Atomic claim — guards against the inline attempt and the job racing, and
   // reclaims a RECORDING row whose lease has expired (crashed mid-record, M2).
-  const claim = await pool.query(
-    `UPDATE payment_reconciliation SET status = 'RECORDING'
-      WHERE id = $1 AND ${DUE_PREDICATE}`,
-    [row.id],
-  );
-  if (claim.rowCount !== 1) return; // lost the race, or not due yet
+  // The claim also bumps attempts, so it is the single place that counts a try.
+  if (!(await db.checkouts.claimReconciliation(row.id))) return; // lost the race
 
   // Resolve a missing customer id from the mapping table (may have been added since enqueue).
   let customerId = row.customer_id;
   if (!customerId) {
-    const c = await pool.query<{ client_id: string | null }>(
-      `SELECT client_id FROM checkout WHERE id = $1`,
-      [row.checkout_id],
-    );
-    customerId = await resolveQboCustomerId(c.rows[0]?.client_id);
+    const checkout = await db.checkouts.findById(row.checkout_id);
+    customerId = await resolveQboCustomerId(checkout?.client_id ?? null);
     if (customerId) {
-      await pool.query(`UPDATE payment_reconciliation SET customer_id = $2 WHERE id = $1`, [row.id, customerId]);
+      const current = await db.checkouts.findReconciliationByCheckout(row.checkout_id);
+      if (current) {
+        await db.checkouts.saveReconciliation({ ...current, customer_id: customerId });
+      }
     }
   }
 
@@ -146,10 +164,16 @@ export async function runReconciliation(row: ReconRow, deps: ReconcileDeps = {})
   });
 
   if (res.ok) {
-    await pool.query(
-      `UPDATE payment_reconciliation SET status = 'RECORDED', accounting_payment_id = $2, last_error = NULL WHERE id = $1`,
-      [row.id, res.paymentId ?? null],
-    );
+    const current = await db.checkouts.findReconciliationByCheckout(row.checkout_id);
+    if (current) {
+      await db.checkouts.saveReconciliation({
+        ...current,
+        status: 'RECORDED',
+        accounting_payment_id: res.paymentId ?? null,
+        last_error: null,
+        updated_at: new Date().toISOString(),
+      });
+    }
     logEvent('info', 'checkout.reconcile', 'invoice payment recorded', {
       reconciliation_id: row.id,
       checkout_id: row.checkout_id,
@@ -171,10 +195,17 @@ export async function runReconciliation(row: ReconRow, deps: ReconcileDeps = {})
     return;
   }
   const next = new Date(Date.now() + backoffMs(attempts));
-  await pool.query(
-    `UPDATE payment_reconciliation SET status = 'FAILED', attempts = $2, last_error = $3, next_attempt_at = $4 WHERE id = $1`,
-    [row.id, attempts, res.error ?? null, next],
-  );
+  const current = await db.checkouts.findReconciliationByCheckout(row.checkout_id);
+  if (current) {
+    await db.checkouts.saveReconciliation({
+      ...current,
+      status: 'FAILED',
+      attempts,
+      last_error: res.error ?? null,
+      next_attempt_at: next.toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  }
   logEvent('warn', 'checkout.reconcile', 'reconcile attempt failed; will retry', {
     reconciliation_id: row.id,
     attempts,
@@ -185,26 +216,33 @@ export async function runReconciliation(row: ReconRow, deps: ReconcileDeps = {})
 
 /** Load and run the reconciliation for one checkout (used for the inline best-effort kick). */
 export async function reconcileCheckout(checkoutId: string, deps: ReconcileDeps = {}): Promise<void> {
-  const r = await pool.query<ReconRow>(
-    `SELECT id, checkout_id, invoice_id, customer_id, amount_cents, currency, idempotency_key, attempts, provider_txn_id
-       FROM payment_reconciliation WHERE checkout_id = $1`,
-    [checkoutId],
-  );
-  if (r.rowCount === 1) await runReconciliation(r.rows[0], deps);
+  const row = await getDatabase().checkouts.findReconciliationByCheckout(checkoutId);
+  if (row) await runReconciliation(toReconRow(row), deps);
+}
+
+/** The outbox document, narrowed to what a reconciliation attempt reads. */
+function toReconRow(r: PaymentReconciliation): ReconRow {
+  return {
+    id: r.id,
+    checkout_id: r.checkout_id,
+    invoice_id: r.invoice_id ?? null,
+    customer_id: r.customer_id ?? null,
+    amount_cents: r.amount_cents,
+    currency: r.currency,
+    idempotency_key: r.idempotency_key,
+    attempts: r.attempts,
+    provider_txn_id: r.provider_txn_id ?? null,
+  };
 }
 
 /** Background worker: process all due reconciliations. Guarded claim makes concurrent runs safe. */
 export async function processDueReconciliations(limit = 25, deps: ReconcileDeps = {}): Promise<{ processed: number }> {
-  const due = await pool.query<ReconRow>(
-    `SELECT id, checkout_id, invoice_id, customer_id, amount_cents, currency, idempotency_key, attempts, provider_txn_id
-       FROM payment_reconciliation
-      WHERE ${DUE_PREDICATE}
-      ORDER BY next_attempt_at ASC
-      LIMIT $1`,
-    [limit],
-  );
+  const { now, leaseCutoff } = dueWindow();
+  const due = (await getDatabase().checkouts.listDueReconciliations(now, leaseCutoff))
+    .slice(0, limit)
+    .map(toReconRow);
   let processed = 0;
-  for (const row of due.rows) {
+  for (const row of due) {
     try {
       await runReconciliation(row, deps);
       processed++;

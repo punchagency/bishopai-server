@@ -10,6 +10,7 @@ import type {
   Approval,
   NoteRevision,
   Checkout,
+  CheckoutStatus,
   PaymentReconciliation,
   ClientQboMap,
   Supplement,
@@ -338,6 +339,10 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
   private get qboDb() {
     return getFirestoreInstance().collection('client_qbo_map');
   }
+  // Shared with the session flow — `approvals` is one unified table (0001).
+  private get approvalsDb() {
+    return getFirestoreInstance().collection('approvals');
+  }
 
   async findById(id: string): Promise<Checkout | null> {
     const doc = await this.db.doc(id).get();
@@ -349,8 +354,11 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
     return snap.docs[0].data() as Checkout;
   }
   async findByPbAppointmentId(pbAppointmentId: string): Promise<Checkout | null> {
-    const doc = await this.db.doc(pbAppointmentId).get();
-    return doc.exists ? (doc.data() as Checkout) : null;
+    // A query, not a doc lookup: the document id is appointment_id (0023), so
+    // pb_appointment_id is an ordinary field.
+    const snap = await this.db.where('pb_appointment_id', '==', pbAppointmentId).limit(1).get();
+    if (snap.empty) return null;
+    return snap.docs[0].data() as Checkout;
   }
   async listAll(): Promise<Checkout[]> {
     const snap = await this.db.get();
@@ -360,6 +368,195 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
     await this.db.doc(checkout.id).set(checkout, { merge: true });
     return checkout;
   }
+
+  async createIfAbsent(checkout: Checkout): Promise<{ checkout: Checkout; created: boolean }> {
+    const ref = this.db.doc(checkout.id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (doc.exists) {
+        return { checkout: doc.data() as Checkout, created: false };
+      }
+      tx.create(ref, checkout);
+      return { checkout, created: true };
+    });
+  }
+
+  /**
+   * The compare-and-set at the heart of the money path. In Postgres this was
+   * `UPDATE checkout SET status=$to WHERE id=$1 AND status=$from` and the caller
+   * read rowCount. Here the read and the write must sit in one transaction, or
+   * two concurrent approvals could both observe AWAITING_APPROVAL and both charge.
+   */
+  async transition(
+    id: string,
+    from: CheckoutStatus,
+    to: CheckoutStatus,
+    patch: Partial<Checkout> = {},
+  ): Promise<boolean> {
+    const ref = this.db.doc(id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return false;
+      if ((doc.data() as Checkout).status !== from) return false;
+      tx.update(ref, { ...patch, status: to, updated_at: new Date().toISOString() });
+      return true;
+    });
+  }
+
+  async transitionWithApproval(
+    id: string,
+    from: CheckoutStatus,
+    to: CheckoutStatus,
+    approval: Approval,
+  ): Promise<boolean> {
+    const checkoutRef = this.db.doc(id);
+    const approvalRef = this.approvalsDb.doc(approval.id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(checkoutRef);
+      if (!doc.exists) return false;
+      if ((doc.data() as Checkout).status !== from) return false;
+      tx.update(checkoutRef, { status: to, updated_at: new Date().toISOString() });
+      tx.create(approvalRef, approval);
+      return true;
+    });
+  }
+
+  async markChargedWithReconciliation(
+    checkoutId: string,
+    patch: Partial<Checkout>,
+    reconciliation: PaymentReconciliation,
+  ): Promise<boolean> {
+    const checkoutRef = this.db.doc(checkoutId);
+    // Document id == checkout_id, which is what makes enqueue idempotent —
+    // the pg table had UNIQUE(checkout_id) for exactly this reason.
+    const reconRef = this.reconciliationsDb.doc(reconciliation.id);
+
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      // ALL reads before ANY write — Firestore rejects a transaction that reads
+      // after writing, so both documents must be fetched up front.
+      const [doc, existing] = await Promise.all([tx.get(checkoutRef), tx.get(reconRef)]);
+      if (!doc.exists) return false;
+      if ((doc.data() as Checkout).status !== 'CHARGING') return false;
+
+      // Both writes or neither: a captured charge without its outbox row would
+      // silently never reach Nicole's books.
+      tx.update(checkoutRef, { ...patch, status: 'CHARGED', updated_at: new Date().toISOString() });
+      if (!existing.exists) tx.create(reconRef, reconciliation);
+      return true;
+    });
+  }
+
+  async claimIdempotencyKey(id: string, key: string): Promise<void> {
+    const ref = this.db.doc(id);
+    await getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return;
+      // Only if unset — mirrors `WHERE charge_idempotency_key IS NULL`, so a
+      // replay within an attempt reuses the original key and QB replays the
+      // original charge instead of creating a second one.
+      if ((doc.data() as Checkout).charge_idempotency_key) return;
+      tx.update(ref, { charge_idempotency_key: key });
+    });
+  }
+
+  async listStuckCharging(cutoff: string): Promise<Checkout[]> {
+    const snap = await this.db
+      .where('status', '==', 'CHARGING')
+      .where('updated_at', '<', cutoff)
+      .get();
+    return snap.docs.map((doc) => doc.data() as Checkout);
+  }
+
+  async reopenFailedCharge(id: string): Promise<boolean> {
+    const ref = this.db.doc(id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return false;
+      const row = doc.data() as Checkout;
+      // ONLY a clean decline. CHARGE_REVIEW means money may have moved.
+      if (row.status !== 'CHARGE_FAILED') return false;
+      tx.update(ref, {
+        status: 'AWAITING_APPROVAL',
+        charge_attempts: (row.charge_attempts ?? 0) + 1,
+        charge_idempotency_key: null,
+        qb_txn_id: null,
+        updated_at: new Date().toISOString(),
+      });
+      return true;
+    });
+  }
+
+  async listApprovalsByCheckout(checkoutId: string, limit = 10): Promise<Approval[]> {
+    const snap = await this.approvalsDb
+      .where('checkout_id', '==', checkoutId)
+      .where('type', '==', 'checkout')
+      .orderBy('created_at', 'desc')
+      .limit(limit)
+      .get();
+    return snap.docs.map((doc) => doc.data() as Approval);
+  }
+
+  async saveApproval(approval: Approval): Promise<Approval> {
+    await this.approvalsDb.doc(approval.id).set(approval, { merge: true });
+    return approval;
+  }
+
+  async patchApprovalPayload(id: string, patch: Record<string, unknown>): Promise<void> {
+    const ref = this.approvalsDb.doc(id);
+    await getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return;
+      const row = doc.data() as Approval;
+      // Merge into the existing payload, mirroring `payload_json || $2::jsonb`.
+      tx.update(ref, { payload_json: { ...(row.payload_json ?? {}), ...patch } });
+    });
+  }
+
+  async listDueReconciliations(now: string, leaseCutoff: string): Promise<PaymentReconciliation[]> {
+    // Two queries merged, because Firestore cannot express
+    // `(status IN (..) AND next_attempt_at <= now) OR (status = RECORDING AND updated_at < cutoff)`
+    // as one indexable query (§3.5).
+    const [retryable, stale] = await Promise.all([
+      this.reconciliationsDb
+        .where('status', 'in', ['PENDING', 'FAILED'])
+        .where('next_attempt_at', '<=', now)
+        .get(),
+      this.reconciliationsDb
+        .where('status', '==', 'RECORDING')
+        .where('updated_at', '<', leaseCutoff)
+        .get(),
+    ]);
+
+    const byId = new Map<string, PaymentReconciliation>();
+    for (const doc of [...retryable.docs, ...stale.docs]) {
+      byId.set(doc.id, doc.data() as PaymentReconciliation);
+    }
+    return Array.from(byId.values()).sort((a, b) =>
+      a.next_attempt_at.localeCompare(b.next_attempt_at),
+    );
+  }
+
+  async claimReconciliation(id: string): Promise<boolean> {
+    const ref = this.reconciliationsDb.doc(id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return false;
+      const row = doc.data() as PaymentReconciliation;
+      // A RECORDING row whose lease expired is reclaimable: the QBO requestid
+      // makes the Payment write idempotent, so reclaiming a genuinely in-flight
+      // row replays the same Payment rather than creating a second.
+      if (row.status !== 'PENDING' && row.status !== 'FAILED' && row.status !== 'RECORDING') {
+        return false;
+      }
+      tx.update(ref, {
+        status: 'RECORDING',
+        attempts: (row.attempts ?? 0) + 1,
+        updated_at: new Date().toISOString(),
+      });
+      return true;
+    });
+  }
+
   async saveReconciliation(rec: PaymentReconciliation): Promise<PaymentReconciliation> {
     await this.reconciliationsDb.doc(rec.id).set(rec, { merge: true });
     return rec;

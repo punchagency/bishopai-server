@@ -71,13 +71,32 @@ export interface SupplementProtocol {
   updated_at: string;
 }
 
+/**
+ * The unified approvals record: money approvals (type='checkout') carry
+ * checkout_id + amount_cents + summary_hash; lighter ones (session, refill
+ * digest) reuse the same shape.
+ *
+ * Note `appointment_id` is denormalized to the top level here. In Postgres the
+ * table had NO such column — session approvals stored it inside payload_json
+ * (see the 0024 backfill, which reads `payload_json->>'appointment_id'`). A
+ * top-level field is kept because Firestore cannot query into a nested map as
+ * cheaply, and listApprovals(appointmentId) is a real access path. payload_json
+ * still carries the full original payload.
+ */
 export interface Approval {
   id: string;
-  appointment_id: string;
-  approved_by: string;
-  approved_at: string;
-  doc_hash?: string | null;
-  amount_charged?: number | null;
+  checkout_id?: string | null;
+  appointment_id?: string | null;
+  type: 'checkout' | 'session' | 'refill_bulk_send' | string;
+  payload_json: Record<string, unknown>;
+  status: 'pending' | 'approved' | 'rejected' | 'skipped';
+  amount_cents?: number | null;
+  currency?: string | null;
+  /** Binds the approval to the exact figure Nicole saw. */
+  summary_hash?: string | null;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  created_at: string;
 }
 
 export interface NoteRevision {
@@ -90,44 +109,83 @@ export interface NoteRevision {
   revised_at: string;
 }
 
+/**
+ * Exactly the checkout_status_check constraint after migration 0023.
+ *
+ * CHARGE_REVIEW is NOT a variant of CHARGE_FAILED: it means the charge outcome is
+ * UNKNOWN (the process died mid-flight, or the provider returned an ambiguous
+ * error after possibly capturing). Money may have moved, so it is never
+ * auto-retried. CHARGE_FAILED means definitively no money moved, and is safe to
+ * retry. Collapsing the two is how a captured charge goes silent.
+ */
 export type CheckoutStatus =
+  | 'DETECTED'
+  | 'SUMMARY_READY'
   | 'AWAITING_APPROVAL'
   | 'CHARGING'
   | 'CHARGED'
+  | 'DOCS_UPDATED'
   | 'PB_MARKED'
   | 'CLOSED'
   | 'CHARGE_FAILED'
-  | 'RECONCILE_FAILED';
+  | 'CHARGE_REVIEW';
 
 export interface Checkout {
+  /**
+   * Document id == appointment_id. Migration 0023 moved the uniqueness from
+   * pb_appointment_id to appointment_id precisely because an appointment with a
+   * NULL pb_id could spawn two checkouts and therefore two charges for one
+   * session (finding M5). appointment_id is the real unit.
+   */
   id: string;
-  appointment_id: string;
-  pb_appointment_id: string;
-  amount: number;
-  currency: string;
+  appointment_id: string | null;
+  client_id: string | null;
+  pb_appointment_id: string | null;
   status: CheckoutStatus;
+  detection_hash?: string | null;
+  /** Frozen at detection — the figure Nicole approved, never a live re-pull. */
   summary_snapshot?: Record<string, unknown> | null;
-  hash?: string | null;
-  qb_charge_id?: string | null;
+  qb_invoice_id?: string | null;
+  qb_txn_id?: string | null;
+  /** `checkout:{id}:charge:{charge_attempts}` — unique; never double-charge. */
+  charge_idempotency_key?: string | null;
+  /** Bumped by resetFailedCharge so a post-decline retry is a NEW charge (M4). */
+  charge_attempts: number;
   created_at: string;
   updated_at: string;
 }
 
+/**
+ * Durable reconciliation outbox: one row per checkout, written in the SAME
+ * transaction that marks the checkout CHARGED, so a captured charge can never
+ * exist without its "record this payment in QuickBooks" intent.
+ */
 export interface PaymentReconciliation {
+  /** Document id == checkout_id, which is what made enqueue idempotent in pg. */
   id: string;
   checkout_id: string;
-  status: 'PENDING' | 'COMPLETED' | 'NEEDS_REVIEW' | 'FAILED';
+  provider_txn_id?: string | null;
+  invoice_id?: string | null;
+  customer_id?: string | null;
+  amount_cents: number;
+  currency: string;
+  status: 'PENDING' | 'RECORDING' | 'RECORDED' | 'FAILED' | 'NEEDS_REVIEW';
+  /** Stable; doubles as the QBO `requestid` that makes the write idempotent. */
+  idempotency_key: string;
   attempts: number;
   last_error?: string | null;
+  next_attempt_at: string;
   accounting_payment_id?: string | null;
   created_at: string;
   updated_at: string;
 }
 
 export interface ClientQboMap {
+  /** Document id == client_id (it was the primary key in pg). */
   client_id: string;
   qbo_customer_id: string;
-  mapped_at: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Supplement {

@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent } from '../observability/logger';
 
 // WF2 doc write-backs: after a charge, stamp the outcome onto the internal
@@ -30,31 +30,33 @@ export async function recordCheckoutOutcome(appointmentId: string | null, outcom
   };
 
   // Internal sheet: stamp the billing outcome.
-  await pool.query(
-    `UPDATE appointment_sheets
-        SET content_json = jsonb_set(coalesce(content_json, '{}'::jsonb), '{billing}', $2::jsonb, true)
-      WHERE appointment_id = $1`,
-    [appointmentId, JSON.stringify(billing)],
-  );
+  const db = getDatabase();
+  // jsonb_set on a single key becomes a read-merge-write of content_json; the
+  // other keys must survive, so spread rather than replace.
+  const sheet = await db.sessionNotes.findSheetByAppointment(appointmentId);
+  if (sheet) {
+    await db.sessionNotes.saveSheet({
+      ...sheet,
+      content_json: { ...(sheet.content_json ?? {}), billing },
+    });
+  }
 
   // Client-facing protocol: refresh its supplement list from the current plan
-  // (the `supplements` table is the source of truth, kept current by WF1).
-  const cr = await pool.query<{ client_id: string | null }>(`SELECT client_id FROM appointments WHERE id = $1`, [appointmentId]);
-  const clientId = cr.rows[0]?.client_id ?? null;
+  // (the `supplements` collection is the source of truth, kept current by WF1).
+  const appt = await db.appointments.findById(appointmentId);
+  const clientId = appt?.client_id ?? null;
   if (clientId) {
-    const supps = (
-      await pool.query<{ name: string; dose: string | null; qty: number | null }>(
-        `SELECT name, dose, qty FROM supplements WHERE client_id = $1 ORDER BY name`,
-        [clientId],
-      )
-    ).rows;
-    const asNote = supps.map((s) => ({ name: s.name, dose: s.dose ?? null, quantity: s.qty ?? null, change: 'continue' as const }));
-    await pool.query(
-      `UPDATE protocols
-          SET content_json = jsonb_set(coalesce(content_json, '{}'::jsonb), '{supplements}', $2::jsonb, true)
-        WHERE appointment_id = $1`,
-      [appointmentId, JSON.stringify(asNote)],
+    const supps = (await db.refills.listSupplementsByClient(clientId)).sort((a, b) =>
+      a.name.localeCompare(b.name),
     );
+    const asNote = supps.map((s) => ({ name: s.name, dose: s.dose ?? null, quantity: s.qty ?? null, change: 'continue' as const }));
+    const protocol = await db.sessionNotes.findProtocolByAppointment(appointmentId);
+    if (protocol) {
+      await db.sessionNotes.saveProtocol({
+        ...protocol,
+        content_json: { ...(protocol.content_json ?? {}), supplements: asNote },
+      });
+    }
   }
 
   logEvent('info', 'checkout.docs', 'recorded checkout outcome on docs', {
