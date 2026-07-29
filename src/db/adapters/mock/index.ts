@@ -33,6 +33,7 @@ import type {
   ITasksRepository,
   IDocumentsRepository,
   IConsentsRepository,
+  IStateRepository,
   IAuditRepository,
   IDatabase,
 } from '../../interfaces/repositories.js';
@@ -541,6 +542,23 @@ export class MockConsentsRepository implements IConsentsRepository {
   }
 }
 
+export class MockStateRepository implements IStateRepository {
+  private state = new Map<string, string>();
+
+  async get(key: string): Promise<string | null> {
+    return this.state.get(key) ?? null;
+  }
+  async set(key: string, value: string): Promise<void> {
+    this.state.set(key, value);
+  }
+  async delete(key: string): Promise<void> {
+    this.state.delete(key);
+  }
+  async clearAll(): Promise<void> {
+    this.state.clear();
+  }
+}
+
 export class MockAuditRepository implements IAuditRepository {
   private logs: AuditLog[] = [];
 
@@ -581,5 +599,6 @@ export class InMemoryMockDatabase implements IDatabase {
   tasks = new MockTasksRepository();
   documents = new MockDocumentsRepository();
   consents = new MockConsentsRepository();
+  state = new MockStateRepository();
   audit = new MockAuditRepository();
 }

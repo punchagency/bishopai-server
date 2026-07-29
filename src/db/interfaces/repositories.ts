@@ -226,6 +226,20 @@ export interface IConsentsRepository {
   clearAll(): Promise<void>;
 }
 
+/**
+ * Durable key/value for integration sync cursors and OAuth state
+ * (`integration_state`). MUST be persistent: the Outlook and QuickBooks token
+ * managers keep refresh cursors here, so an in-memory implementation loses them
+ * on every restart — and on every Cloud Function cold start — which silently
+ * breaks token refresh.
+ */
+export interface IStateRepository {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+  delete(key: string): Promise<void>;
+  clearAll(): Promise<void>;
+}
+
 export interface IAuditRepository {
   log(event: AuditLog): Promise<AuditLog>;
   listForEntity(entityType: string, entityId: string, limit?: number): Promise<AuditLog[]>;
@@ -244,5 +258,6 @@ export interface IDatabase {
   tasks: ITasksRepository;
   documents: IDocumentsRepository;
   consents: IConsentsRepository;
+  state: IStateRepository;
   audit: IAuditRepository;
 }

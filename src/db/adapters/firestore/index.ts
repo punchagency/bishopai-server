@@ -21,6 +21,7 @@ import type {
   TaskItem,
   DocumentRecord,
   Consent,
+  IntegrationState,
   AuditLog,
 } from '../../interfaces/types.js';
 import type {
@@ -34,6 +35,7 @@ import type {
   ITasksRepository,
   IDocumentsRepository,
   IConsentsRepository,
+  IStateRepository,
   IAuditRepository,
   IDatabase,
 } from '../../interfaces/repositories.js';
@@ -766,6 +768,30 @@ export class FirestoreConsentsRepository implements IConsentsRepository {
   }
 }
 
+export class FirestoreStateRepository implements IStateRepository {
+  private get db() {
+    return getFirestoreInstance().collection('integration_state');
+  }
+
+  async get(key: string): Promise<string | null> {
+    // Document id == key, so this is an exact lookup, never a scan.
+    const doc = await this.db.doc(key).get();
+    return doc.exists ? ((doc.data() as IntegrationState).value ?? null) : null;
+  }
+  async set(key: string, value: string): Promise<void> {
+    await this.db.doc(key).set(
+      { key, value, updated_at: new Date().toISOString() } satisfies IntegrationState,
+      { merge: true },
+    );
+  }
+  async delete(key: string): Promise<void> {
+    await this.db.doc(key).delete();
+  }
+  async clearAll(): Promise<void> {
+    await deleteAllDocs([this.db]);
+  }
+}
+
 export class FirestoreAuditRepository implements IAuditRepository {
   private get db() {
     return getFirestoreInstance().collection('audit_logs');
@@ -811,5 +837,6 @@ export class FirestoreDatabase implements IDatabase {
   tasks = new FirestoreTasksRepository();
   documents = new FirestoreDocumentsRepository();
   consents = new FirestoreConsentsRepository();
+  state = new FirestoreStateRepository();
   audit = new FirestoreAuditRepository();
 }

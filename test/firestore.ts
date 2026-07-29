@@ -56,6 +56,7 @@ export async function clearFirestore(db: IDatabase): Promise<void> {
     db.tasks.clearAll(),
     db.documents.clearAll(),
     db.consents.clearAll(),
+    db.state.clearAll(),
     db.audit.clearAll(),
   ]);
 }
