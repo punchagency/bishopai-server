@@ -16,7 +16,7 @@ import { extractionJob } from './jobs/extraction';
 // In-process scheduler for the WF3/WF4 cadences (§14). Opt-in via
 // SCHEDULER_ENABLED=true so dev/tests don't run background jobs. Each tick is
 // wrapped so one failing job never takes down the timer or the process.
-const jobs: Job[] = [
+export const jobs: Job[] = [
   reengagementJob,
   refillsJob,
   maintenanceJob,
@@ -50,7 +50,7 @@ export function startScheduler(): void {
   console.log(`Scheduler started: ${tasks.length} job(s)`);
 }
 
-async function runJob(job: Job): Promise<void> {
+export async function runJob(job: Job): Promise<void> {
   try {
     await job.run();
   } catch (err) {
