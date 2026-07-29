@@ -1,13 +1,7 @@
-import type { Pool, PoolClient } from 'pg';
-import { pool } from '../db/pool';
-import type { SessionNote } from '../session/extract';
-import { dueDateFrom, normalizeFollowUps } from '../session/followups';
-import { recordAudit } from '../audit/log';
-
-// Follow-ups, promoted from text to tracked work. Created on approval — the same
-// gate as every other side effect in the system: Nicole read the note and stood
-// behind it, so its commitments are real. Nothing here contacts a client; tasks
-// surface in the cockpit and in the next visit's prep brief, and that is all.
+import { getDatabase } from '../db/index.js';
+import type { SessionNote } from '../session/extract.js';
+import { dueDateFrom, normalizeFollowUps } from '../session/followups.js';
+import { recordAudit } from '../audit/log.js';
 
 export type TaskStatus = 'open' | 'done' | 'dismissed';
 
@@ -24,106 +18,126 @@ export interface TaskRow {
   completed_at: string | null;
 }
 
-type Db = Pool | PoolClient;
-
-/**
- * Promote an approved note's follow-ups into tasks. Idempotent: the partial unique
- * index on (appointment_id, title) absorbs both the sheet-then-protocol double
- * approval and any re-approval, so this can be called freely.
- *
- * Due dates anchor to the appointment, not to approval time — a note signed off
- * three days late still means "four weeks from the session".
- */
 export async function createTasksFromNote(
-  db: Db,
+  _db: unknown,
   args: { clientId: string; appointmentId: string | null; sessionDate: Date; note: SessionNote },
 ): Promise<{ created: number }> {
   const followUps = normalizeFollowUps(args.note.follow_ups);
   if (followUps.length === 0) return { created: 0 };
 
+  const db = getDatabase();
+  const existing = await db.tasks.listAll();
   let created = 0;
+
   for (const f of followUps) {
-    const r = await db.query(
-      `INSERT INTO tasks (client_id, appointment_id, title, due_date, source)
-            VALUES ($1, $2, $3, $4, 'session')
-       ON CONFLICT DO NOTHING`,
-      [args.clientId, args.appointmentId, f.text, dueDateFrom(args.sessionDate, f.dueInDays)],
+    const title = f.text;
+    const isDuplicate = existing.some(
+      (t) => t.appointment_id === args.appointmentId && (t as unknown as TaskRow).title === title,
     );
-    created += r.rowCount ?? 0;
+    if (!isDuplicate) {
+      const id = `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const dueDate = dueDateFrom(args.sessionDate, f.dueInDays);
+      await db.tasks.save({
+        id,
+        client_id: args.clientId,
+        appointment_id: args.appointmentId ?? undefined,
+        description: title,
+        due_date: dueDate ?? undefined,
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      });
+      created++;
+    }
   }
   return { created };
 }
 
-/**
- * Bring a session's tasks back into line after its note is amended.
- *
- * Amendments change follow-ups in both directions: a misheard commitment gets
- * removed, a missed one gets added. Creation reuses createTasksFromNote (the
- * unique index absorbs the overlap with the original approval); removal
- * DISMISSES rather than deletes — done work stays done, and a dismissed task
- * keeps its audit trail. Only open, session-sourced tasks for THIS appointment
- * are touched; Nicole's manual tasks are never in scope.
- */
 export async function reconcileTasksAfterAmend(
-  db: Db,
+  db: unknown,
   args: { clientId: string; appointmentId: string; sessionDate: Date; note: SessionNote },
 ): Promise<{ created: number; dismissed: number }> {
   const { created } = await createTasksFromNote(db, args);
-
   const keepTitles = normalizeFollowUps(args.note.follow_ups).map((f) => f.text);
-  const r = await db.query(
-    `UPDATE tasks
-        SET status = 'dismissed'
-      WHERE appointment_id = $1
-        AND source = 'session'
-        AND status = 'open'
-        AND NOT (title = ANY($2::text[]))`,
-    [args.appointmentId, keepTitles],
-  );
-  return { created, dismissed: r.rowCount ?? 0 };
+
+  const database = getDatabase();
+  const all = await database.tasks.listAll();
+  let dismissed = 0;
+
+  for (const t of all) {
+    const row = t as unknown as TaskRow;
+    if (
+      row.appointment_id === args.appointmentId &&
+      row.source === 'session' &&
+      row.status === 'open' &&
+      !keepTitles.includes(row.title || t.description)
+    ) {
+      await database.tasks.save({
+        ...t,
+        status: 'completed',
+      });
+      dismissed++;
+    }
+  }
+  return { created, dismissed };
 }
 
-const SELECT_TASK = `
-  SELECT t.id, t.client_id, c.name AS client_name, t.appointment_id, t.title,
-         t.due_date::text AS due_date, t.status, t.source, t.created_at, t.completed_at
-    FROM tasks t
-    LEFT JOIN clients c ON c.id = t.client_id`;
-
-/** Open tasks for the cockpit: overdue and undated first, then by due date. */
 export async function listOpenTasks(clientId?: string): Promise<TaskRow[]> {
-  const where = clientId ? `WHERE t.status = 'open' AND t.client_id = $1` : `WHERE t.status = 'open'`;
-  const r = await pool.query<TaskRow>(
-    `${SELECT_TASK} ${where}
-      ORDER BY t.due_date ASC NULLS LAST, t.created_at ASC`,
-    clientId ? [clientId] : [],
-  );
-  return r.rows;
+  const db = getDatabase();
+  const tasks = clientId ? await db.tasks.listByClient(clientId) : await db.tasks.listAll();
+  const clients = await db.clients.listAll();
+  const clientMap = new Map(clients.map((c) => [c.id, c.name]));
+
+  return tasks
+    .filter((t) => t.status === 'pending')
+    .map((t) => ({
+      id: t.id,
+      client_id: t.client_id || '',
+      client_name: clientMap.get(t.client_id || '') || null,
+      appointment_id: t.appointment_id || null,
+      title: t.description,
+      due_date: t.due_date || null,
+      status: 'open' as TaskStatus,
+      source: 'session',
+      created_at: t.created_at,
+      completed_at: null,
+    }));
 }
 
 export async function setTaskStatus(id: string, status: TaskStatus): Promise<TaskRow | null> {
-  const r = await pool.query<TaskRow>(
-    `WITH upd AS (
-       UPDATE tasks
-          SET status = $2,
-              completed_at = CASE WHEN $2 = 'open' THEN NULL ELSE now() END
-        WHERE id = $1
-        RETURNING *
-     )
-     ${SELECT_TASK.replace('FROM tasks t', 'FROM upd t')}`,
-    [id, status],
-  );
-  const task = r.rows[0] ?? null;
-  if (task) {
-    await recordAudit({
-      entityType: 'task',
-      entityId: task.id,
-      action: `task.${status}`,
-      actor: 'nicole',
-      summary: `Task ${status === 'done' ? 'completed' : status === 'dismissed' ? 'dismissed' : 'reopened'}: ${task.title}`,
-      metadata: { client_id: task.client_id },
-    });
-  }
-  return task;
+  const db = getDatabase();
+  const task = await db.tasks.findById(id);
+  if (!task) return null;
+
+  const newStatus = status === 'open' ? 'pending' : 'completed';
+  const updated = await db.tasks.save({
+    ...task,
+    status: newStatus,
+  });
+
+  const client = task.client_id ? await db.clients.findById(task.client_id) : null;
+  const row: TaskRow = {
+    id: updated.id,
+    client_id: updated.client_id || '',
+    client_name: client?.name || null,
+    appointment_id: updated.appointment_id || null,
+    title: updated.description,
+    due_date: updated.due_date || null,
+    status,
+    source: 'session',
+    created_at: updated.created_at,
+    completed_at: status === 'open' ? null : new Date().toISOString(),
+  };
+
+  await recordAudit({
+    entityType: 'task',
+    entityId: row.id,
+    action: `task.${status}`,
+    actor: 'nicole',
+    summary: `Task ${status === 'done' ? 'completed' : status === 'dismissed' ? 'dismissed' : 'reopened'}: ${row.title}`,
+    metadata: { client_id: row.client_id },
+  });
+
+  return row;
 }
 
 export async function createManualTask(args: {
@@ -131,19 +145,39 @@ export async function createManualTask(args: {
   title: string;
   dueDate: string | null;
 }): Promise<TaskRow> {
-  const r = await pool.query<{ id: string }>(
-    `INSERT INTO tasks (client_id, title, due_date, source)
-          VALUES ($1, $2, $3, 'manual') RETURNING id`,
-    [args.clientId, args.title, args.dueDate],
-  );
-  const row = await pool.query<TaskRow>(`${SELECT_TASK} WHERE t.id = $1`, [r.rows[0].id]);
+  const db = getDatabase();
+  const id = `task_manual_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const saved = await db.tasks.save({
+    id,
+    client_id: args.clientId,
+    description: args.title,
+    due_date: args.dueDate || undefined,
+    status: 'pending',
+    created_at: new Date().toISOString(),
+  });
+
+  const client = await db.clients.findById(args.clientId);
+  const row: TaskRow = {
+    id: saved.id,
+    client_id: saved.client_id || '',
+    client_name: client?.name || null,
+    appointment_id: null,
+    title: saved.description,
+    due_date: saved.due_date || null,
+    status: 'open',
+    source: 'manual',
+    created_at: saved.created_at,
+    completed_at: null,
+  };
+
   await recordAudit({
     entityType: 'task',
-    entityId: r.rows[0].id,
+    entityId: id,
     action: 'task.created',
     actor: 'nicole',
     summary: `Manual task created: ${args.title}`,
     metadata: { client_id: args.clientId, due_date: args.dueDate },
   });
-  return row.rows[0];
+
+  return row;
 }

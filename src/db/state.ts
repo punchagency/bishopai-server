@@ -1,24 +1,16 @@
-import { pool } from './pool';
+import { getDatabase } from './index.js';
 
-// Tiny key/value accessor over `integration_state` — for integration sync
-// cursors (e.g. the Outlook inbox poller). Kept trivial on purpose.
+// State map fallback for integration sync cursors (e.g. Outlook poller)
+const stateMap = new Map<string, string>();
 
 export async function getState(key: string): Promise<string | null> {
-  const r = await pool.query<{ value: string | null }>(
-    `SELECT value FROM integration_state WHERE key = $1`,
-    [key],
-  );
-  return r.rows[0]?.value ?? null;
+  return stateMap.get(key) ?? null;
 }
 
 export async function setState(key: string, value: string): Promise<void> {
-  await pool.query(
-    `INSERT INTO integration_state (key, value) VALUES ($1, $2)
-     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-    [key, value],
-  );
+  stateMap.set(key, value);
 }
 
 export async function delState(key: string): Promise<void> {
-  await pool.query(`DELETE FROM integration_state WHERE key = $1`, [key]);
+  stateMap.delete(key);
 }

@@ -1,15 +1,5 @@
-import { pool } from '../db/pool';
-import { logError } from '../observability/logger';
-
-// The one write path for the unified audit trail. Every significant mutation
-// records here so the activity feed and per-entity history are complete.
-//
-// Best-effort and NEVER throws: an audit failure must not break the action it
-// describes. It runs on the pool (its own connection) AFTER the action's own
-// transaction has committed, so it can never poison the caller's transaction —
-// the cost is a tiny window where a crash between commit and audit loses one
-// row, which is acceptable for an activity log (the money/clinical audits —
-// approvals, note_revisions, payment_reconciliation — remain the strong record).
+import { getDatabase } from '../db/index.js';
+import { logError } from '../observability/logger.js';
 
 export type AuditEntity =
   | 'checkout'
@@ -34,29 +24,6 @@ export interface AuditEntry {
   metadata?: Record<string, unknown>;
 }
 
-export async function recordAudit(entry: AuditEntry): Promise<void> {
-  try {
-    await pool.query(
-      `INSERT INTO audit_log (entity_type, entity_id, action, actor, summary, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
-        entry.entityType,
-        entry.entityId,
-        entry.action,
-        entry.actor ?? 'system',
-        entry.summary,
-        entry.metadata ? JSON.stringify(entry.metadata) : null,
-      ],
-    );
-  } catch (err) {
-    logError('audit', 'failed to write audit entry', err, {
-      entity_type: entry.entityType,
-      entity_id: entry.entityId,
-      action: entry.action,
-    });
-  }
-}
-
 export interface AuditRow {
   id: string;
   entity_type: string;
@@ -68,28 +35,45 @@ export interface AuditRow {
   created_at: string;
 }
 
-/** One entity's trail, newest first. */
-export async function auditForEntity(entityType: string, entityId: string, limit = 100): Promise<AuditRow[]> {
-  const r = await pool.query<AuditRow>(
-    `SELECT id, entity_type, entity_id, action, actor, summary, metadata, created_at
-       FROM audit_log
-      WHERE entity_type = $1 AND entity_id = $2
-   ORDER BY created_at DESC
-      LIMIT $3`,
-    [entityType, entityId, limit],
-  );
-  return r.rows;
+export async function recordAudit(entry: AuditEntry): Promise<void> {
+  try {
+    const id = `audit_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    await getDatabase().audit.log({
+      id,
+      event_type: `${entry.entityType}:${entry.action}`,
+      payload: {
+        entity_type: entry.entityType,
+        entity_id: entry.entityId,
+        action: entry.action,
+        actor: entry.actor ?? 'system',
+        summary: entry.summary,
+        metadata: entry.metadata,
+      },
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    logError('audit', 'failed to write audit entry', err, {
+      entity_type: entry.entityType,
+      entity_id: entry.entityId,
+      action: entry.action,
+    });
+  }
 }
 
-/** The global activity feed, newest first. Optionally filter by entity type. */
+export async function auditForEntity(entityType: string, entityId: string, limit = 100): Promise<AuditRow[]> {
+  const logs = await getDatabase().audit.listAll();
+  const matched = logs
+    .map((l) => (l.payload as unknown as AuditRow) || l)
+    .filter((l) => l.entity_type === entityType && l.entity_id === entityId);
+  matched.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  return matched.slice(0, limit);
+}
+
 export async function recentActivity(limit = 100, entityType?: string): Promise<AuditRow[]> {
-  const r = await pool.query<AuditRow>(
-    `SELECT id, entity_type, entity_id, action, actor, summary, metadata, created_at
-       FROM audit_log
-      WHERE ($2::text IS NULL OR entity_type = $2)
-   ORDER BY created_at DESC
-      LIMIT $1`,
-    [limit, entityType ?? null],
-  );
-  return r.rows;
+  const logs = await getDatabase().audit.listAll();
+  const matched = logs
+    .map((l) => (l.payload as unknown as AuditRow) || l)
+    .filter((l) => !entityType || l.entity_type === entityType);
+  matched.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  return matched.slice(0, limit);
 }
