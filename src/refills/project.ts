@@ -134,38 +134,64 @@ export function pickSupplementWinner(group: SupplementRow[]): { winner: Suppleme
 
 export async function projectRefills(): Promise<ProjectionResult> {
   const db = getDatabase();
-  const refills = await db.refills.listAll();
+  const supplements = await db.refills.listAllSupplements();
+
+  const groups = new Map<string, SupplementRow[]>();
+  for (const s of supplements) {
+    const key = `${s.client_id}|${normName(s.name)}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)!).push(s);
+  }
 
   let projected = 0;
   let skipped = 0;
   let deduped = 0;
 
-  for (const refill of refills) {
-    const { dueDate } = computeRunOut({
-      dose: refill.dose,
-      qty: 60,
-      start_date: new Date().toISOString(),
-    });
+  const existingRefills = await db.refills.listAll();
+  const refillMap = new Map(existingRefills.map((r) => [r.supplement_id, r]));
+
+  for (const group of groups.values()) {
+    const { winner, loserIds } = pickSupplementWinner(group);
+    deduped += loserIds.length;
+
+    for (const loserId of loserIds) {
+      const loserRefill = refillMap.get(loserId);
+      if (loserRefill && loserRefill.status === 'pending') {
+        await db.refills.save({
+          ...loserRefill,
+          status: 'closed',
+          updated_at: new Date().toISOString(),
+        });
+      }
+    }
+
+    const { dueDate } = computeRunOut(winner);
     if (dueDate === null) {
       skipped++;
       continue;
     }
     try {
+      const existing = refillMap.get(winner.id);
       await db.refills.save({
-        ...refill,
-        run_out_date: dueDate,
+        id: existing?.id || `refill_${winner.id}`,
+        client_id: winner.client_id,
+        supplement_id: winner.id,
+        supplement_name: winner.name,
+        dose: winner.dose,
+        due_date: dueDate,
+        status: existing?.status || 'pending',
+        updated_at: new Date().toISOString(),
       });
       projected++;
     } catch (err) {
-      logError('refills.project', 'upsert failed', err, { supplement_id: refill.id });
+      logError('refills.project', 'upsert failed', err, { supplement_id: winner.id });
     }
   }
 
   logEvent('info', 'refills.project', 'refill projection complete', {
-    scanned: refills.length,
+    scanned: supplements.length,
     projected,
     skipped,
     deduped,
   });
-  return { scanned: refills.length, projected, skipped, deduped };
+  return { scanned: supplements.length, projected, skipped, deduped };
 }

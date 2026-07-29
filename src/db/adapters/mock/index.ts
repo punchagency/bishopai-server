@@ -2,15 +2,23 @@ import type {
   Client,
   Appointment,
   Conversation,
+  AppointmentClaim,
   SessionNoteRecord,
+  AppointmentSheet,
+  SupplementProtocol,
   Approval,
-  Revision,
+  NoteRevision,
   Checkout,
+  PaymentReconciliation,
+  ClientQboMap,
+  Supplement,
   Refill,
   RefillOrder,
   Lead,
   LeadActivity,
   TaskItem,
+  DocumentRecord,
+  Consent,
   AuditLog,
 } from '../../interfaces/types.js';
 import type {
@@ -22,6 +30,8 @@ import type {
   IRefillsRepository,
   IReengagementRepository,
   ITasksRepository,
+  IDocumentsRepository,
+  IConsentsRepository,
   IAuditRepository,
   IDatabase,
 } from '../../interfaces/repositories.js';
@@ -65,12 +75,12 @@ export class MockAppointmentsRepository implements IAppointmentsRepository {
   async listAll(): Promise<Appointment[]> {
     return Array.from(this.appointments.values());
   }
-  async findOverlapping(startTime: string, endTime: string): Promise<Appointment[]> {
-    const start = new Date(startTime).getTime();
-    const end = new Date(endTime).getTime();
+  async findOverlapping(startsAt: string, endsAt: string): Promise<Appointment[]> {
+    const start = new Date(startsAt).getTime();
+    const end = new Date(endsAt).getTime();
     return Array.from(this.appointments.values()).filter((app) => {
-      const appStart = new Date(app.start_time).getTime();
-      const appEnd = new Date(app.end_time).getTime();
+      const appStart = new Date(app.starts_at).getTime();
+      const appEnd = new Date(app.ends_at).getTime();
       return appStart < end && appEnd > start;
     });
   }
@@ -88,6 +98,7 @@ export class MockAppointmentsRepository implements IAppointmentsRepository {
 
 export class MockConversationsRepository implements IConversationsRepository {
   private conversations = new Map<string, Conversation>();
+  private claims = new Map<string, AppointmentClaim>();
 
   async findById(id: string): Promise<Conversation | null> {
     return this.conversations.get(id) ?? null;
@@ -108,18 +119,26 @@ export class MockConversationsRepository implements IConversationsRepository {
     this.conversations.set(conversation.id, conversation);
     return conversation;
   }
+  async claimAppointment(claim: AppointmentClaim): Promise<boolean> {
+    if (this.claims.has(claim.id)) return false;
+    this.claims.set(claim.id, claim);
+    return true;
+  }
   async delete(id: string): Promise<void> {
     this.conversations.delete(id);
   }
   async clearAll(): Promise<void> {
     this.conversations.clear();
+    this.claims.clear();
   }
 }
 
 export class MockSessionNotesRepository implements ISessionNotesRepository {
   private notes = new Map<string, SessionNoteRecord>();
+  private sheets = new Map<string, AppointmentSheet>();
+  private protocols = new Map<string, SupplementProtocol>();
   private approvals: Approval[] = [];
-  private revisions: Revision[] = [];
+  private revisions: NoteRevision[] = [];
 
   async findById(id: string): Promise<SessionNoteRecord | null> {
     return this.notes.get(id) ?? null;
@@ -152,6 +171,26 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
     }
     return false;
   }
+  async saveSheet(sheet: AppointmentSheet): Promise<AppointmentSheet> {
+    this.sheets.set(sheet.id, sheet);
+    return sheet;
+  }
+  async findSheetByAppointment(appointmentId: string): Promise<AppointmentSheet | null> {
+    for (const s of this.sheets.values()) {
+      if (s.appointment_id === appointmentId) return s;
+    }
+    return null;
+  }
+  async saveProtocol(protocol: SupplementProtocol): Promise<SupplementProtocol> {
+    this.protocols.set(protocol.id, protocol);
+    return protocol;
+  }
+  async findProtocolByAppointment(appointmentId: string): Promise<SupplementProtocol | null> {
+    for (const p of this.protocols.values()) {
+      if (p.appointment_id === appointmentId) return p;
+    }
+    return null;
+  }
   async saveApproval(approval: Approval): Promise<Approval> {
     this.approvals.push(approval);
     return approval;
@@ -159,15 +198,17 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
   async listApprovals(appointmentId: string): Promise<Approval[]> {
     return this.approvals.filter((a) => a.appointment_id === appointmentId);
   }
-  async saveRevision(revision: Revision): Promise<Revision> {
+  async saveRevision(revision: NoteRevision): Promise<NoteRevision> {
     this.revisions.push(revision);
     return revision;
   }
-  async listRevisions(appointmentId: string): Promise<Revision[]> {
+  async listRevisions(appointmentId: string): Promise<NoteRevision[]> {
     return this.revisions.filter((r) => r.appointment_id === appointmentId);
   }
   async clearAll(): Promise<void> {
     this.notes.clear();
+    this.sheets.clear();
+    this.protocols.clear();
     this.approvals = [];
     this.revisions = [];
   }
@@ -175,6 +216,8 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
 
 export class MockCheckoutsRepository implements ICheckoutsRepository {
   private checkouts = new Map<string, Checkout>();
+  private reconciliations = new Map<string, PaymentReconciliation>();
+  private qboMaps = new Map<string, ClientQboMap>();
 
   async findById(id: string): Promise<Checkout | null> {
     return this.checkouts.get(id) ?? null;
@@ -185,6 +228,12 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
     }
     return null;
   }
+  async findByPbAppointmentId(pbAppointmentId: string): Promise<Checkout | null> {
+    for (const item of this.checkouts.values()) {
+      if (item.pb_appointment_id === pbAppointmentId) return item;
+    }
+    return null;
+  }
   async listAll(): Promise<Checkout[]> {
     return Array.from(this.checkouts.values());
   }
@@ -192,13 +241,42 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
     this.checkouts.set(checkout.id, checkout);
     return checkout;
   }
+  async saveReconciliation(rec: PaymentReconciliation): Promise<PaymentReconciliation> {
+    this.reconciliations.set(rec.id, rec);
+    return rec;
+  }
+  async findReconciliationByCheckout(checkoutId: string): Promise<PaymentReconciliation | null> {
+    for (const r of this.reconciliations.values()) {
+      if (r.checkout_id === checkoutId) return r;
+    }
+    return null;
+  }
+  async listPendingReconciliations(): Promise<PaymentReconciliation[]> {
+    return Array.from(this.reconciliations.values()).filter((r) => r.status === 'PENDING');
+  }
+  async saveQboMap(map: ClientQboMap): Promise<ClientQboMap> {
+    this.qboMaps.set(map.client_id, map);
+    return map;
+  }
+  async findQboMapByClient(clientId: string): Promise<ClientQboMap | null> {
+    return this.qboMaps.get(clientId) ?? null;
+  }
+  async listQboMaps(): Promise<ClientQboMap[]> {
+    return Array.from(this.qboMaps.values());
+  }
+  async deleteQboMap(clientId: string): Promise<void> {
+    this.qboMaps.delete(clientId);
+  }
   async clearAll(): Promise<void> {
     this.checkouts.clear();
+    this.reconciliations.clear();
+    this.qboMaps.clear();
   }
 }
 
 export class MockRefillsRepository implements IRefillsRepository {
   private refills = new Map<string, Refill>();
+  private supplements = new Map<string, Supplement>();
   private orders: RefillOrder[] = [];
 
   async listAll(): Promise<Refill[]> {
@@ -211,6 +289,16 @@ export class MockRefillsRepository implements IRefillsRepository {
     this.refills.set(refill.id, refill);
     return refill;
   }
+  async saveSupplement(supp: Supplement): Promise<Supplement> {
+    this.supplements.set(supp.id, supp);
+    return supp;
+  }
+  async listSupplementsByClient(clientId: string): Promise<Supplement[]> {
+    return Array.from(this.supplements.values()).filter((s) => s.client_id === clientId);
+  }
+  async listAllSupplements(): Promise<Supplement[]> {
+    return Array.from(this.supplements.values());
+  }
   async saveOrder(order: RefillOrder): Promise<RefillOrder> {
     this.orders.push(order);
     return order;
@@ -221,6 +309,7 @@ export class MockRefillsRepository implements IRefillsRepository {
   }
   async clearAll(): Promise<void> {
     this.refills.clear();
+    this.supplements.clear();
     this.orders = [];
   }
 }
@@ -234,6 +323,12 @@ export class MockReengagementRepository implements IReengagementRepository {
   }
   async findLeadById(id: string): Promise<Lead | null> {
     return this.leads.get(id) ?? null;
+  }
+  async findLeadByEmail(email: string): Promise<Lead | null> {
+    for (const lead of this.leads.values()) {
+      if (lead.email.toLowerCase() === email.toLowerCase()) return lead;
+    }
+    return null;
   }
   async saveLead(lead: Lead): Promise<Lead> {
     this.leads.set(lead.id, lead);
@@ -261,6 +356,9 @@ export class MockTasksRepository implements ITasksRepository {
   async listByClient(clientId: string): Promise<TaskItem[]> {
     return Array.from(this.tasks.values()).filter((t) => t.client_id === clientId);
   }
+  async listOpen(): Promise<TaskItem[]> {
+    return Array.from(this.tasks.values()).filter((t) => t.status === 'open');
+  }
   async listAll(): Promise<TaskItem[]> {
     return Array.from(this.tasks.values());
   }
@@ -276,6 +374,39 @@ export class MockTasksRepository implements ITasksRepository {
   }
 }
 
+export class MockDocumentsRepository implements IDocumentsRepository {
+  private docs = new Map<string, DocumentRecord>();
+
+  async save(doc: DocumentRecord): Promise<DocumentRecord> {
+    this.docs.set(doc.id, doc);
+    return doc;
+  }
+  async listByAppointment(appointmentId: string): Promise<DocumentRecord[]> {
+    return Array.from(this.docs.values()).filter((d) => d.appointment_id === appointmentId);
+  }
+  async clearAll(): Promise<void> {
+    this.docs.clear();
+  }
+}
+
+export class MockConsentsRepository implements IConsentsRepository {
+  private consents = new Map<string, Consent>();
+
+  async save(consent: Consent): Promise<Consent> {
+    this.consents.set(consent.id, consent);
+    return consent;
+  }
+  async findByClientAndType(clientId: string, type: string): Promise<Consent | null> {
+    for (const c of this.consents.values()) {
+      if (c.client_id === clientId && c.type === type) return c;
+    }
+    return null;
+  }
+  async clearAll(): Promise<void> {
+    this.consents.clear();
+  }
+}
+
 export class MockAuditRepository implements IAuditRepository {
   private logs: AuditLog[] = [];
 
@@ -283,8 +414,17 @@ export class MockAuditRepository implements IAuditRepository {
     this.logs.push(event);
     return event;
   }
-  async listAll(): Promise<AuditLog[]> {
-    return this.logs;
+  async listForEntity(entityType: string, entityId: string, limit = 100): Promise<AuditLog[]> {
+    return this.logs
+      .filter((l) => l.entity_type === entityType && l.entity_id === entityId)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, limit);
+  }
+  async listRecent(limit = 100, entityType?: string): Promise<AuditLog[]> {
+    return this.logs
+      .filter((l) => !entityType || l.entity_type === entityType)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, limit);
   }
   async clearAll(): Promise<void> {
     this.logs = [];
@@ -300,5 +440,7 @@ export class InMemoryMockDatabase implements IDatabase {
   refills = new MockRefillsRepository();
   reengagement = new MockReengagementRepository();
   tasks = new MockTasksRepository();
+  documents = new MockDocumentsRepository();
+  consents = new MockConsentsRepository();
   audit = new MockAuditRepository();
 }

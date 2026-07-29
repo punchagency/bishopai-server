@@ -1,0 +1,11 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Admin SDK handles all document uploads/downloads server-side.
+    // Deny direct unauthenticated client SDK access by default.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
