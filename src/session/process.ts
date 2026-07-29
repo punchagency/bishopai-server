@@ -1,6 +1,9 @@
 import { pool } from '../db/pool';
 import { extractSessionNote } from './extract';
 import { logError, logEvent } from '../observability/logger';
+import { rawFromError } from '../llm/errors';
+import { markExtractionFailed } from './reclaim';
+import { fetchSupplementVocabulary } from './supplements';
 
 /**
  * Turn a matched conversation's transcript into an Appointment Sheet + Protocol.
@@ -14,28 +17,54 @@ export async function processConversation(conversationId: string): Promise<void>
   // Claim: proceed only if matched (has appointment), has a transcript, and
   // isn't already done or in-flight. The UPDATE is the lock — if it returns no
   // row, someone else owns it or there's nothing to do.
+  // `extraction_leased_at` is what makes the claim recoverable: without it a
+  // process that dies here leaves the row in `processing` forever, and the
+  // reclaim sweep has no way to tell a live call from an abandoned one.
   const claim = await pool.query<{
     appointment_id: string;
     client_id: string | null;
     transcript: string;
+    client_name: string | null;
+    appointment_date: string | null;
   }>(
-    `UPDATE conversations
-        SET extraction_status = 'processing', updated_at = now()
-      WHERE id = $1
-        AND appointment_id IS NOT NULL
-        AND transcript IS NOT NULL
-        AND extraction_status IN ('pending', 'failed')
-      RETURNING appointment_id, client_id, transcript`,
+    `UPDATE conversations c
+        SET extraction_status = 'processing',
+            extraction_leased_at = now(),
+            updated_at = now()
+      WHERE c.id = $1
+        AND c.appointment_id IS NOT NULL
+        AND c.transcript IS NOT NULL
+        AND c.extraction_status IN ('pending', 'failed')
+      RETURNING c.appointment_id, c.client_id, c.transcript,
+                (SELECT name FROM clients WHERE id = c.client_id) AS client_name,
+                (SELECT starts_at::date::text FROM appointments WHERE id = c.appointment_id)
+                  AS appointment_date`,
     [conversationId],
   );
   if (claim.rowCount === 0) return;
-  const { appointment_id, client_id, transcript } = claim.rows[0];
+  const { appointment_id, client_id, transcript, client_name, appointment_date } = claim.rows[0];
 
   let note;
   try {
-    note = await extractSessionNote(transcript);
+    // Who the client is, and which products this practice actually sells, are
+    // both known here and were previously withheld from the model — leaving it
+    // to infer which speaker is which, and to spell garbled product names from
+    // scratch. Neither is a guess we need it to make.
+    const catalog = await fetchSupplementVocabulary(client_id).catch(() => []);
+    note = await extractSessionNote(transcript, {
+      clientName: client_name,
+      practitionerName: process.env.PRACTITIONER_NAME ?? 'Nicole',
+      appointmentDate: appointment_date,
+      catalog,
+    });
   } catch (err) {
-    await markStatus(conversationId, 'failed');
+    // Keep the raw model output: without it, truncation, a schema violation and
+    // a refusal all look identical in the logs after the fact.
+    await markExtractionFailed(
+      conversationId,
+      err instanceof Error ? err.message : String(err),
+      rawFromError(err),
+    );
     await logError('session.extract', 'transcript extraction failed', err, {
       conversation_id: conversationId,
     });
@@ -55,7 +84,12 @@ export async function processConversation(conversationId: string): Promise<void>
     // doubles as the check and the row lock: no matching row → drop the result.
     const still = await db.query(
       `UPDATE conversations
-          SET extraction_status = 'done', updated_at = now()
+          SET extraction_status = 'done',
+              extraction_leased_at = NULL,
+              extraction_next_attempt_at = NULL,
+              extraction_error = NULL,
+              extraction_raw = NULL,
+              updated_at = now()
         WHERE id = $1 AND appointment_id = $2 AND extraction_status = 'processing'
     RETURNING id`,
       [conversationId, appointment_id],
@@ -107,22 +141,15 @@ export async function processConversation(conversationId: string): Promise<void>
     }
   } catch (err) {
     await db.query('ROLLBACK');
-    await markStatus(conversationId, 'failed');
+    await markExtractionFailed(
+      conversationId,
+      err instanceof Error ? err.message : String(err),
+      null,
+    );
     await logError('session.extract', 'persisting session note failed', err, {
       conversation_id: conversationId,
     });
   } finally {
     db.release();
   }
-}
-
-async function markStatus(id: string, status: 'failed'): Promise<void> {
-  await pool
-    .query(`UPDATE conversations SET extraction_status = $2, updated_at = now() WHERE id = $1`, [
-      id,
-      status,
-    ])
-    .catch(() => {
-      /* best-effort; the original error is already logged */
-    });
 }

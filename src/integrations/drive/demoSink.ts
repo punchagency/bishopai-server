@@ -2,13 +2,8 @@ import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import ExcelJS from 'exceljs';
 import type { FlowSheetEntry } from '../docs/types';
-import {
-  buildFlowSheetBlock,
-  blankBlockWrites,
-  blockMergeRanges,
-  blockHeaderRow,
-  BLOCK_ROWS,
-} from '../docs/flowsheet';
+import { buildFlowSheetBlock, blankBlockWrites, blockHeaderRow, BLOCK_ROWS } from '../docs/flowsheet';
+import { growFlowSheetBlock } from '../docs/flowsheetWorkbook';
 
 // Demo sink: when DEMO_OUTPUT_DIR is set, dry-run publishes ALSO write the real
 // rendered files to a local folder so a presentation has tangible artifacts to
@@ -84,7 +79,7 @@ export async function appendDemoFlowSheet(
   let grew = false;
   if (target < 0) {
     target = blocks;
-    growLocalBlock(ws, target);
+    growFlowSheetBlock(ws, target);
     grew = true;
   }
 
@@ -101,26 +96,4 @@ export async function appendDemoFlowSheet(
   }
   await wb.xlsx.writeFile(path);
   return path;
-}
-
-/**
- * Clone block 0's formatting (cell styles, row heights, merges) into a new block.
- * exceljs has no copy-paste, so we replicate style-by-style; content is reset by
- * the caller's `blankBlockWrites`.
- */
-function growLocalBlock(ws: ExcelJS.Worksheet, blockIndex: number): void {
-  const srcTop = blockHeaderRow(0);
-  const dstTop = blockHeaderRow(blockIndex);
-  const cols = Math.max(7, ws.columnCount);
-
-  for (let r = 0; r < BLOCK_ROWS; r++) {
-    const src = ws.getRow(srcTop + r);
-    const dst = ws.getRow(dstTop + r);
-    dst.height = src.height;
-    for (let c = 1; c <= cols; c++) {
-      dst.getCell(c).style = { ...src.getCell(c).style };
-    }
-    dst.commit();
-  }
-  for (const range of blockMergeRanges(blockIndex)) ws.mergeCells(range);
 }

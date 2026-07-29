@@ -1,5 +1,6 @@
 import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
+import { normalizeSupplementName } from '../session/supplementName';
 
 // WF4 — Refill projection. Turn each client's supplements (dose, qty, start
 // date) into a projected run-out date and upsert it onto `refills.due_date`, so
@@ -7,10 +8,24 @@ import { logEvent, logError } from '../observability/logger';
 // `computeRunOut`/`parseDailyDose` (unit-tested); `projectRefills` is the DB
 // pass the nightly scheduler runs.
 
+/**
+ * Per-slot dosing from `supplements.schedule` — the Daily Schedule grid on the
+ * Supplement Protocol ({"uponWaking": "2 caps", "beforeBed": "1 cap"}). A slot
+ * that is absent/blank means "not taken then", so the stated slots ARE the daily
+ * frequency — more reliable than parsing it back out of the free-text dose.
+ */
+export type DoseSchedule = Record<string, string | null | undefined>;
+
 export interface SupplementInput {
   dose?: string | null; // e.g. "2 caps twice daily", "400mg"
   qty?: number | null; // units in the bottle Nicole dispensed / ordered
   start_date?: string | Date | null;
+  schedule?: DoseSchedule | null;
+  /** Structured dose, when extraction captured it. The model already read
+   *  "two caps twice a day"; taking the numbers from it beats regex-parsing
+   *  them back out of the string here and silently defaulting to 1 on a miss. */
+  units_per_dose?: number | null;
+  doses_per_day?: number | null;
 }
 
 export interface RunOut {
@@ -23,25 +38,51 @@ export interface RunOut {
 }
 
 const FREQUENCY: ReadonlyArray<[RegExp, number]> = [
+  [/\b(?:qid|four times|4\s*x)\b/, 4],
   [/\b(?:tid|three times|thrice|3\s*x)\b/, 3],
   [/\b(?:bid|twice|two times|2\s*x)\b/, 2],
+  // "1 cap morning and night" / "am and pm" — two dosings stated longhand.
+  [/\b(?:morning and (?:night|evening|bed)|am and pm|breakfast and dinner)\b/, 2],
   [/\b(?:every other day|eod|alternate days?)\b/, 0.5],
   [/\b(?:qd|once|one time|1\s*x|daily|per day|a day|nightly|each morning|each night)\b/, 1],
 ];
 
+const FORM_WORDS = 'caps?|capsules?|tab(?:let)?s?|pills?|softgels?|scoops?|gummies|drops?|tsp|teaspoons?|tbsp|tablespoons?';
+
 /**
- * Estimate units consumed per day from a free-text dose. Multiplies the leading
- * unit count ("2 caps") by the daily frequency ("twice daily" → 2). Unknown
+ * Units in a single dosing, from text like "2 caps", "1/2 tab", "1-2 capsules".
+ * A range takes the high end: the point of the projection is to warn before the
+ * bottle empties, and the client taking the top of the range empties it first.
+ * Returns null when no unit count is stated (the caller decides the default).
+ */
+function parseUnits(text: string): number | null {
+  const s = text.toLowerCase().replace(/½/g, '1/2').replace(/¼/g, '1/4').replace(/\bhalf\b/g, '1/2');
+
+  // "1-2 caps" / "1 to 2 caps" — high end.
+  const range = s.match(new RegExp(String.raw`(\d+(?:\.\d+)?)\s*(?:-|–|to)\s*(\d+(?:\.\d+)?)\s*(?:${FORM_WORDS})?\b`));
+  if (range) return Math.max(Number(range[1]), Number(range[2]));
+
+  // "1/2 tab" — a fraction of a unit.
+  const fraction = s.match(new RegExp(String.raw`(\d+)\s*/\s*(\d+)\s*(?:${FORM_WORDS})?\b`));
+  if (fraction && Number(fraction[2]) !== 0) return Number(fraction[1]) / Number(fraction[2]);
+
+  // "2 capsules", "3 tabs", "1 scoop" — a count attached to a form word.
+  const unit = s.match(new RegExp(String.raw`(\d+(?:\.\d+)?)\s*(?:${FORM_WORDS})\b`));
+  if (unit) return Number(unit[1]);
+
+  return null;
+}
+
+/**
+ * Estimate units consumed per day from a free-text dose. Multiplies the units
+ * per dosing ("2 caps") by the daily frequency ("twice daily" → 2). Unknown
  * frequency defaults to once daily; unknown unit count defaults to 1. Never
  * returns <= 0 (callers divide by it).
  */
 export function parseDailyDose(dose: string | null | undefined): number {
   if (!dose) return 1;
   const s = dose.toLowerCase();
-
-  // Leading unit count before a form word ("2 capsules", "3 tabs", "1 scoop").
-  const unitMatch = s.match(/(\d+(?:\.\d+)?)\s*(?:caps?|capsules?|tab(?:let)?s?|pills?|softgels?|scoops?|gummies|drops?)\b/);
-  const unitsPerDose = unitMatch ? Number(unitMatch[1]) : 1;
+  const unitsPerDose = parseUnits(s) ?? 1;
 
   let dosesPerDay = 1;
   for (const [re, n] of FREQUENCY) {
@@ -52,6 +93,36 @@ export function parseDailyDose(dose: string | null | undefined): number {
   }
 
   const perDay = unitsPerDose * dosesPerDay;
+  return perDay > 0 ? perDay : 1;
+}
+
+/**
+ * Units consumed per day for a supplement, in descending order of trust:
+ *
+ *   1. the per-slot Daily Schedule — Nicole states it explicitly, and "2 caps
+ *      upon waking, 1 before bed" is 3/day, a shape no frequency word captures;
+ *   2. structured dose fields from extraction, read once from the sentence
+ *      itself rather than recovered from a stringified version of it;
+ *   3. regex over the free-text dose — the legacy path, still needed for rows
+ *      that predate structured extraction.
+ */
+export function dailyUnits(
+  supp: Pick<SupplementInput, 'dose' | 'schedule' | 'units_per_dose' | 'doses_per_day'>,
+): number {
+  const slots = Object.values(supp.schedule ?? {}).filter((v): v is string => typeof v === 'string' && v.trim() !== '');
+  if (slots.length === 0) {
+    const perDose = supp.units_per_dose;
+    const perDay = supp.doses_per_day;
+    // Only when at least one was actually stated; a pair of nulls means the
+    // transcript never gave a countable dose, which is the regex path's job.
+    if ((perDose != null && perDose > 0) || (perDay != null && perDay > 0)) {
+      const total = (perDose ?? 1) * (perDay ?? 1);
+      if (total > 0) return total;
+    }
+    return parseDailyDose(supp.dose);
+  }
+  // Every stated slot is one dosing that day; a slot with no number counts as 1.
+  const perDay = slots.reduce((sum, amount) => sum + (parseUnits(amount) ?? 1), 0);
   return perDay > 0 ? perDay : 1;
 }
 
@@ -67,7 +138,7 @@ function toDate(v: string | Date | null | undefined): Date | null {
  * missing (nothing to project) — perDay is still reported for diagnostics.
  */
 export function computeRunOut(supp: SupplementInput): RunOut {
-  const perDay = parseDailyDose(supp.dose);
+  const perDay = dailyUnits(supp);
   const start = toDate(supp.start_date ?? null);
   const qty = typeof supp.qty === 'number' && supp.qty > 0 ? supp.qty : null;
 
@@ -94,13 +165,18 @@ export interface SupplementRow {
   qty: number | null;
   start_date: string | null;
   source: string | null;
+  schedule?: DoseSchedule | null;
+  units_per_dose?: number | null;
+  doses_per_day?: number | null;
 }
 
 // Source authority for reconciliation: the practitioner's note beats a vendor
 // feed. Lower rank wins; ties break on the more recent start_date.
 const SOURCE_RANK: Record<string, number> = { notes: 0, fullscript: 1, pb: 2 };
 const rankOf = (s: string | null): number => SOURCE_RANK[s ?? ''] ?? 3;
-const normName = (n: string): string => n.trim().toLowerCase();
+// Same identity rule the plan tables key on, so cross-source dedupe collapses
+// "Bio-C Plus" and "Bio C Plus" here too rather than projecting two refills.
+const normName = (n: string): string => normalizeSupplementName(n) || n.trim().toLowerCase();
 
 /**
  * Pure: from all of one client's supplement rows with the same normalized name
@@ -126,7 +202,9 @@ export function pickSupplementWinner(group: SupplementRow[]): { winner: Suppleme
  */
 export async function projectRefills(): Promise<ProjectionResult> {
   const { rows } = await pool.query<SupplementRow>(
-    `SELECT id, client_id, name, dose, qty, start_date, source FROM supplements`,
+    `SELECT id, client_id, name, dose, qty, start_date, source, schedule,
+            units_per_dose::float8 AS units_per_dose,
+            doses_per_day::float8 AS doses_per_day FROM supplements`,
   );
 
   // Multi-source reconciliation: collapse the same supplement (client + name)

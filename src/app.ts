@@ -13,6 +13,7 @@ import { outlookRouter } from './routes/outlook';
 import { appointmentsRouter } from './routes/appointments';
 import { tasksRouter } from './routes/tasks';
 import { clientsRouter } from './routes/clients';
+import { remindersRouter } from './routes/reminders';
 import { requireAuth } from './auth/middleware';
 
 // Build the Express app (routes + middleware) without listening. server.ts adds
@@ -47,6 +48,7 @@ export function createApp(): express.Express {
   // login turned off (default), token-gated when she turns it on in Settings.
   app.use('/review', requireAuth, reviewRouter);
   app.use('/refills', requireAuth, refillsRouter);
+  app.use('/reminders', requireAuth, remindersRouter);
   app.use('/engagement', requireAuth, engagementRouter);
   app.use('/checkout', requireAuth, checkoutRouter);
   app.use('/dashboard', requireAuth, dashboardRouter);

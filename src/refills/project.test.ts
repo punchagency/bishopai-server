@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseDailyDose, computeRunOut } from './project';
+import { parseDailyDose, dailyUnits, computeRunOut } from './project';
 
 describe('parseDailyDose', () => {
   it('defaults to 1/day for empty or bare-strength doses', () => {
@@ -25,8 +25,46 @@ describe('parseDailyDose', () => {
     expect(parseDailyDose('1 cap every other day')).toBe(0.5);
   });
 
+  it('takes the high end of a range — that client empties the bottle first', () => {
+    expect(parseDailyDose('1-2 caps daily')).toBe(2);
+    expect(parseDailyDose('1 to 2 capsules twice daily')).toBe(4);
+  });
+
+  it('reads fractional doses', () => {
+    expect(parseDailyDose('1/2 tab daily')).toBe(0.5);
+    expect(parseDailyDose('½ tablet twice daily')).toBe(1);
+    expect(parseDailyDose('half a tablet daily')).toBe(0.5);
+  });
+
+  it('reads longhand twice-a-day phrasing and qid', () => {
+    expect(parseDailyDose('1 cap morning and night')).toBe(2);
+    expect(parseDailyDose('2 caps am and pm')).toBe(4);
+    expect(parseDailyDose('1 tab qid')).toBe(4);
+  });
+
   it('never returns <= 0', () => {
     expect(parseDailyDose('0 caps')).toBe(1);
+  });
+});
+
+describe('dailyUnits', () => {
+  it('sums the per-slot Daily Schedule — each stated slot is one dosing', () => {
+    expect(dailyUnits({ dose: '2 caps daily', schedule: { uponWaking: '2 caps', beforeBed: '1 cap' } })).toBe(3);
+  });
+
+  it('counts a slot with no number as one unit', () => {
+    expect(dailyUnits({ dose: null, schedule: { breakfast: 'with food', dinner: 'with food' } })).toBe(2);
+  });
+
+  it('falls back to the dose text when no slot was stated', () => {
+    expect(dailyUnits({ dose: '2 caps twice daily', schedule: { lunch: '  ', dinner: null } })).toBe(4);
+    expect(dailyUnits({ dose: '1 cap bid', schedule: null })).toBe(2);
+  });
+
+  it('prefers the schedule over the dose text when they disagree', () => {
+    // "1 cap daily" but the grid says morning AND night: the grid is what Nicole
+    // wrote into the protocol, so the bottle empties twice as fast as the text.
+    expect(dailyUnits({ dose: '1 cap daily', schedule: { uponWaking: '1 cap', beforeBed: '1 cap' } })).toBe(2);
   });
 });
 
@@ -51,6 +89,17 @@ describe('computeRunOut', () => {
     expect(computeRunOut({ dose: '2 caps daily', qty: null, start_date: '2026-01-01' }).dueDate).toBeNull();
     expect(computeRunOut({ dose: '2 caps daily', qty: 60, start_date: null }).dueDate).toBeNull();
     expect(computeRunOut({ dose: '2 caps daily', qty: 0, start_date: '2026-01-01' }).dueDate).toBeNull();
+  });
+
+  it('projects off the schedule grid rather than the dose text', () => {
+    // 90 caps, 2 upon waking + 1 before bed = 3/day → 30 days.
+    const r = computeRunOut({
+      dose: '2 caps daily',
+      qty: 90,
+      start_date: '2026-01-01',
+      schedule: { uponWaking: '2 caps', beforeBed: '1 cap' },
+    });
+    expect(r).toEqual({ dueDate: '2026-01-31', perDay: 3, daysSupply: 30 });
   });
 
   it('accepts a Date start_date', () => {

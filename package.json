@@ -19,7 +19,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "qb-auth": "node scripts/qb-auth.mjs",
-    "check:google": "tsx scripts/check-google.mts"
+    "check:google": "tsx scripts/check-google.mts",
+    "eval:extract": "tsx scripts/eval-extract.mts"
   },
   "engines": {
     "node": ">=20"

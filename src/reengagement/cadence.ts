@@ -9,6 +9,8 @@ export interface LeadState {
   last_touch: Date | null;
   sentSteps: string[]; // cadence steps already sent (from leads.sequence_state.sent)
   hasUpcomingBooking?: boolean;
+  /** Nicole cancelled this lead's remaining cadence from the dashboard. */
+  cadenceCancelled?: boolean;
 }
 
 export interface CadenceStep {
@@ -128,8 +130,9 @@ const dayspan = (from: Date, to: Date) => (to.getTime() - from.getTime()) / 86_4
  * the deactivation window, deactivate; otherwise nothing.
  */
 export function nextCadenceAction(lead: LeadState, now: Date = new Date()): CadenceAction {
-  // Replies/bookings stop automation; booked-ahead leads are left alone.
-  if (STOP_STATUSES.has(lead.status) || lead.hasUpcomingBooking) return { kind: 'none' };
+  // Replies/bookings stop automation; booked-ahead leads are left alone; and a
+  // cadence Nicole cancelled sends nothing further (not even the deactivation).
+  if (STOP_STATUSES.has(lead.status) || lead.hasUpcomingBooking || lead.cadenceCancelled) return { kind: 'none' };
 
   const ageDays = dayspan(lead.created_at, now);
   const track = trackFor(lead.status);
@@ -146,4 +149,31 @@ export function nextCadenceAction(lead: LeadState, now: Date = new Date()): Cade
   if (dayspan(lastTouch, now) >= DEACTIVATE_AFTER_DAYS) return { kind: 'deactivate' };
 
   return { kind: 'none' };
+}
+
+/** The next cadence email a lead will get, and the date it goes out. */
+export interface ScheduledStep {
+  step: string;
+  subject: string;
+  /** When it sends. A step already past due sends on the next pass — i.e. `now`. */
+  sendAt: Date;
+}
+
+/**
+ * The next email this lead is queued to receive, without sending anything —
+ * the read-only counterpart to nextCadenceAction, so the dashboard can show
+ * Nicole what is about to go out and let her stop it first. Returns null when
+ * the lead is off the cadence (replied/booked/cancelled) or has exhausted its
+ * track.
+ */
+export function nextScheduledStep(lead: LeadState, now: Date = new Date()): ScheduledStep | null {
+  if (STOP_STATUSES.has(lead.status) || lead.hasUpcomingBooking || lead.cadenceCancelled) return null;
+
+  const sent = new Set(lead.sentSteps);
+  for (const step of trackFor(lead.status)) {
+    if (sent.has(step.step)) continue;
+    const at = new Date(lead.created_at.getTime() + step.afterDays * 86_400_000);
+    return { step: step.step, subject: step.subject, sendAt: at.getTime() < now.getTime() ? now : at };
+  }
+  return null;
 }

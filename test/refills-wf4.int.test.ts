@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, afterAll } from 'vitest';
 import { pool } from '../src/db/pool';
-import { nextReminderAction, reminderMessage } from '../src/refills/reminders';
+import { nextReminderAction, reminderMessage, reminderLeadDays, followUpDays } from '../src/refills/reminders';
 import { pickSupplementWinner, projectRefills, type SupplementRow } from '../src/refills/project';
 import { suggestedMonths } from '../src/refills/adherence';
 import { runRefillReminders } from '../src/refills/remindersRunner';
@@ -34,10 +34,61 @@ describe('nextReminderAction', () => {
   });
 });
 
+// --- Pure: dose-scaled cadence timing ---------------------------------------
+describe('reminderLeadDays / followUpDays', () => {
+  it('gives a long supply the full two weeks of notice', () => {
+    expect(reminderLeadDays(90)).toBe(14);
+    expect(followUpDays(90)).toBe(7);
+  });
+  it('scales the warning down for a fast-burning supply', () => {
+    // 15 caps at 1/day: warning 5 days out, chased 3 days later — not a 14-day
+    // heads-up sent a day after she dispensed it, followed by a chase a week
+    // after the bottle was already empty.
+    expect(reminderLeadDays(15)).toBe(5);
+    expect(followUpDays(15)).toBe(3);
+  });
+  it('falls back to the fixed window when supply is unknown', () => {
+    expect(reminderLeadDays(null)).toBe(14);
+    expect(reminderLeadDays(undefined)).toBe(14);
+    expect(reminderLeadDays(0)).toBe(14);
+  });
+});
+
+describe('nextReminderAction (dose-aware)', () => {
+  const base = { status: 'pending', due_date: '2026-07-15', reminder_stage: 0, reminder_next_at: null };
+
+  it('holds off on a short supply that a 14-day window would have warned about', () => {
+    // 8 days out. Unknown supply → send; 18-day supply (lead 6) → not yet.
+    expect(nextReminderAction({ ...base, due_date: '2026-07-15' }, TODAY)).toEqual({ kind: 'send', stage: 1, tier: 'soon' });
+    expect(nextReminderAction({ ...base, due_date: '2026-07-15', days_supply: 18 }, TODAY)).toEqual({ kind: 'none' });
+  });
+
+  it('stops entirely once Nicole cancels the reminders', () => {
+    expect(nextReminderAction({ ...base, reminders_cancelled_at: '2026-07-06' }, TODAY)).toEqual({ kind: 'none' });
+  });
+});
+
 describe('reminderMessage', () => {
   it('differs by tier', () => {
     expect(reminderMessage('Maya Chen', 'Magnesium', 'overdue', 1).subject).toMatch(/overdue/i);
     expect(reminderMessage('Maya Chen', 'Magnesium', 'soon', 1).subject).toMatch(/coming up/i);
+  });
+
+  it('states the dose back to the client, with the daily rate', () => {
+    const { body } = reminderMessage('Maya Chen', 'Magnesium', 'soon', 1, {
+      dose: '2 caps twice daily',
+      perDay: 4,
+      daysLeft: 6,
+    });
+    expect(body).toContain('2 caps twice daily — about 4 a day');
+    expect(body).toContain('about 6 days from now');
+    expect(body).toMatch(/different amount/i); // invites a correction
+  });
+
+  it('omits what it does not know rather than guessing', () => {
+    const { body } = reminderMessage('Maya Chen', 'Magnesium', 'soon', 1);
+    expect(body).toContain('Your Magnesium is due to run out soon.');
+    expect(body).not.toMatch(/about \d+ a day/);
   });
 });
 

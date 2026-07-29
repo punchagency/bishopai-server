@@ -1,0 +1,179 @@
+{
+  "_meta": {
+    "source": "Health Supplement Consultation_otter.ai.txt",
+    "authored": "2026-07-28",
+    "complete": true,
+    "notes": [
+      "Hand-verified against the transcript line by line.",
+      "Only fields listed here are scored. `acceptable` items are neither rewarded",
+      "nor penalised \u2014 they are defensible readings a careful human could differ on,",
+      "and punishing them would make the eval measure taste rather than accuracy.",
+      "`expect_null` is the fabrication test: the transcript never states these, so",
+      "any value at all is a fabricated clinical finding."
+    ]
+  },
+  "concerns": [
+    "gallbladder pain a couple of years ago; ultrasound showed stones and liver enzymes were elevated; surgeon recommended removing the gallbladder and the client declined",
+    "waking up at night in sheer panic for no apparent reason"
+  ],
+  "concerns_acceptable": [
+    "hot flashes",
+    "sleep",
+    "energy",
+    "avoids certain foods because the pain is not worth it",
+    "I was getting pains in it a couple of years ago",
+    "my liver enzymes were elevated",
+    "the doctor sent me for an ultrasound and said there were stones",
+    "the surgeon wanted to take the gallbladder out"
+  ],
+  "goals": [],
+  "goals_acceptable": [
+    "reset the body's sense of safety",
+    "avoid gallbladder surgery"
+  ],
+  "assessments": [
+    "central nervous system is clear",
+    "finding some blocks in the hormonal points in the brain",
+    "pituitary is a little bit offline",
+    "pituitary is big with safety regulation in the body",
+    "gallbladder is showing stress",
+    "stressor is showing to be food, but not anything specific",
+    "inhaler is not testing well",
+    "all doses from the previous visit came down"
+  ],
+  "assessments_acceptable": [
+    "pituitary and hypothalamus work together \u2014 HPA axis",
+    "adrenals are the fight-or-flight glands; pituitary tells the adrenals to fight",
+    "the drops are clear",
+    "years of stress can throw off the natural sense of safety",
+    "elbow gets stuck rather than opening",
+    "helping the gallbladder overall with emulsifying fats and smooth bile production",
+    "it is not anything specific"
+  ],
+  "supplements": [
+    {
+      "name": "Cyto-Zyme PT/HPT",
+      "change": "start",
+      "func": "pituitary and hypothalamus glandular support",
+      "name_variants": [
+        "cytosine PTHPT",
+        "cytosine PT/HPT",
+        "Cytozyme PT/HPT"
+      ]
+    },
+    {
+      "name": "Beta Plus",
+      "change": "start",
+      "func": "for the gallbladder; bile salt to support bile production and help break down stones"
+    },
+    {
+      "name": "Bio B Complex",
+      "change": "start",
+      "func": "B vitamin, swapped in to replace the previous B vitamin"
+    },
+    {
+      "name": "MSM",
+      "change": "stop"
+    },
+    {
+      "name": "Chaste Tree",
+      "change": "stop",
+      "name_variants": [
+        "cheese tree",
+        "chase tree",
+        "Chastity"
+      ]
+    },
+    {
+      "name": "TMG",
+      "change": "continue",
+      "name_variants": [
+        "TMI"
+      ]
+    },
+    {
+      "name": "Equifem",
+      "change": "decrease",
+      "dose_contains": "1",
+      "schedule_slots": [
+        "beforeBed"
+      ]
+    },
+    {
+      "name": "Livatrit Plus",
+      "change": "decrease",
+      "dose_contains": "2",
+      "name_variants": [
+        "Livatrip Plus",
+        "litatric",
+        "Limitrit",
+        "Livatrit"
+      ]
+    }
+  ],
+  "supplements_acceptable": [
+    {
+      "name": "Catalyze the Core",
+      "change": "start"
+    },
+    {
+      "name": "adrenal support",
+      "change": "start"
+    },
+    {
+      "name": "Calpenz",
+      "change": "continue",
+      "name_variants": [
+        "calpenzp",
+        "caliperspor",
+        "Calpenz P"
+      ]
+    },
+    {
+      "name": "Cormai",
+      "change": "continue"
+    }
+  ],
+  "follow_ups": [
+    "contact the practitioner if sleep or temperature gets disrupted \u2014 if sweating returns, the chaste tree can be brought back in"
+  ],
+  "follow_ups_due_in_days": {
+    "0": null
+  },
+  "nrt": {
+    "foundation": {
+      "art_cns": "clear",
+      "art_hormonal": "blocks found"
+    },
+    "stressors": "food"
+  },
+  "lifestyle": {},
+  "expect_null": [
+    "nrt.pulse0",
+    "nrt.priority1",
+    "nrt.k27",
+    "nrt.foundation.laying1",
+    "nrt.foundation.standing",
+    "nrt.foundation.hta",
+    "nrt.foundation.hta_post_run",
+    "nrt.foundation.laying2",
+    "nrt.foundation.art_open",
+    "nrt.foundation.art_switch",
+    "nrt.foundation.art_dental",
+    "nrt.body_scan.art_ectoderm",
+    "nrt.body_scan.art_priority",
+    "nrt.body_scan.art_matrix",
+    "nrt.body_scan.art_cell",
+    "nrt.body_scan.scan_priority",
+    "nrt.body_scan.scan_matrix",
+    "nrt.body_scan.scan_cell",
+    "lifestyle.bm",
+    "lifestyle.sleep",
+    "lifestyle.water",
+    "lifestyle.cycle",
+    "lifestyle.diet"
+  ],
+  "expect_null_acceptable": [
+    "lifestyle.exercise"
+  ]
+}

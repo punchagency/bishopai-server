@@ -7,16 +7,20 @@ export type Provider = 'google' | 'anthropic' | 'groq' | 'mock';
 // SessionNote task is schema-constrained extraction, so the default is the
 // cheapest workable model.
 //
-//   google (default) — gemini-2.5-flash-lite: cheapest per token; JSON-schema
-//                       structured output. Set GOOGLE_API_KEY (or GEMINI_API_KEY).
-//   anthropic        — claude-haiku-4-5: proven path (zod structured outputs).
-//                       Set ANTHROPIC_API_KEY.
-//   mock             — deterministic heuristic extractor, no API key. Runs the
-//                       whole WF1 chain offline for demos/seed data.
-// Resolve the provider: an explicit LLM_PROVIDER always wins; otherwise default
-// to whichever real key is present, and fall back to the offline `mock`
-// extractor when none is — so a dev server with no credentials still runs the
-// whole WF1 chain instead of throwing on every transcript.
+//   groq       — openai/gpt-oss-120b: fastest + free tier; OpenAI-compatible
+//                JSON mode. Set GROQ_API_KEY.
+//   google     — gemini-2.0-flash: cheap per token; JSON-schema structured
+//                output. Set GOOGLE_API_KEY (or GEMINI_API_KEY).
+//   anthropic  — claude-haiku-4-5: proven path (zod structured outputs).
+//                Set ANTHROPIC_API_KEY.
+//   mock       — deterministic heuristic extractor, no API key. Runs the whole
+//                WF1 chain offline for demos/seed data.
+//
+// Resolve the provider: an explicit LLM_PROVIDER always wins; otherwise take
+// whichever real key is present, in the order listed above (cheapest/fastest
+// first), and fall back to the offline `mock` extractor when none is — so a dev
+// server with no credentials still runs the whole WF1 chain instead of throwing
+// on every transcript.
 function resolveProvider(): Provider {
   const explicit = process.env.LLM_PROVIDER as Provider | undefined;
   if (explicit) return explicit;
@@ -28,7 +32,34 @@ function resolveProvider(): Provider {
 
 export const llmConfig = {
   provider: resolveProvider(),
+  // Output budget for the FIRST attempt. Deliberately modest: providers bill
+  // requested completion tokens against rate limits (Groq's free tier counts
+  // max_completion_tokens toward its 12k TPM, so a pessimistic 16k budget 413s
+  // every call on a short transcript), and most sessions need nothing like it.
+  //
+  // A small budget used to be dangerous — 4096 truncated a dense session
+  // mid-JSON and the WHOLE extraction was lost. It is safe now because
+  // truncation is a typed error that retries at double the budget, so the cost
+  // of guessing low is one extra call on the rare session that needs it,
+  // instead of a rate-limit failure on every ordinary one.
   maxTokens: Number(process.env.LLM_MAX_TOKENS ?? process.env.ANTHROPIC_MAX_TOKENS ?? 4096),
+  /** Ceiling for the truncation retry, which doubles the budget and re-runs. */
+  maxTokensCeiling: Number(process.env.LLM_MAX_TOKENS_CEILING ?? 32768),
+
+  // Split a long transcript into chunks above this many input tokens. Below it a
+  // single call sees the whole session and reads better; above it, long-context
+  // recall on "find every scattered callout" decays silently, which is worse
+  // than the merge cost of chunking.
+  chunkThresholdTokens: Number(process.env.EXTRACTION_CHUNK_THRESHOLD_TOKENS ?? 6000),
+  chunkTargetTokens: Number(process.env.EXTRACTION_CHUNK_TARGET_TOKENS ?? 3000),
+  chunkOverlapTurns: Number(process.env.EXTRACTION_CHUNK_OVERLAP_TURNS ?? 2),
+  /** Parallel chunk calls. Keeps a long session inside free-tier rate limits. */
+  chunkConcurrency: Number(process.env.EXTRACTION_CHUNK_CONCURRENCY ?? 3),
+  /** How many times to wait out a 429 before giving up on a chunk. On a small
+   *  per-minute budget the chunks of one long session queue behind each other,
+   *  and abandoning a chunk on the first rate limit loses that slice of the
+   *  session over a delay we could have waited. */
+  rateLimitRetries: Number(process.env.LLM_RATE_LIMIT_RETRIES ?? 3),
 
   groq: {
     apiKey: process.env.GROQ_API_KEY ?? '',

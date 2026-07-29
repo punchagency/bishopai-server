@@ -5,6 +5,7 @@ import { pool } from '../db/pool';
 import { logError, logEvent } from '../observability/logger';
 import { fullscriptDispensaryUrl } from '../integrations/fullscript';
 import { computeAdherence, suggestedMonths } from '../refills/adherence';
+import { computeRunOut, dailyUnits, type DoseSchedule } from '../refills/project';
 import { recordAudit } from '../audit/log';
 import { sendEmail, resolveOutlookAccess } from '../integrations/outlook';
 
@@ -28,7 +29,9 @@ refillsRouter.get('/digest', async (_req, res) => {
       `SELECT rf.id, rf.due_date, rf.status,
               (rf.due_date - current_date) AS days_left,
               c.id AS client_id, c.name AS client_name,
-              s.name AS supplement_name, s.dose, s.qty,
+              s.name AS supplement_name, s.dose, s.qty, s.schedule,
+              to_char(s.start_date, 'YYYY-MM-DD') AS start_date,
+              rf.reminders_cancelled_at,
               o.fullscript_order_id AS fullscript_plan_id, o.invitation_url
          FROM refills rf
     LEFT JOIN clients c ON c.id = rf.client_id
@@ -44,10 +47,18 @@ refillsRouter.get('/digest', async (_req, res) => {
           AND rf.due_date IS NOT NULL
      ORDER BY rf.due_date ASC`,
     );
-    const items = r.rows.map((row) => ({
-      ...row,
-      tier: tierFor(row.days_left),
-    }));
+    // Surface the dosing maths the projection ran on: how many units a day the
+    // dose works out to and how long the bottle lasts at that rate. It's what
+    // makes a due date checkable at a glance rather than a number to trust.
+    const items = r.rows.map((row) => {
+      const { perDay, daysSupply } = computeRunOut(row);
+      return {
+        ...row,
+        per_day: perDay,
+        days_supply: daysSupply,
+        tier: tierFor(row.days_left),
+      };
+    });
     const outlookAccess = await resolveOutlookAccess().catch(() => null);
     const isConfigured = !!outlookAccess;
     res.json({ fullscript_configured: isConfigured, refills: items });
@@ -62,6 +73,18 @@ function tierFor(daysLeft: number | null): 'overdue' | 'soon' | 'coming' {
   if (daysLeft < 0) return 'overdue';
   if (daysLeft <= SOON_DAYS) return 'soon';
   return 'coming';
+}
+
+/**
+ * Bottles to reorder for `months` of supply. One bottle per month is only right
+ * when the bottle happens to hold a month at the stated dose: 120 caps taken 4/day
+ * is 30 days, but taken 1/day it is four months. With the dose known we can size
+ * the order properly; without a bottle count (qty) we fall back to one per month.
+ */
+export function bottlesFor(months: number, perDay: number, qty: number | null): number {
+  const m = months > 0 ? Math.floor(months) : 1;
+  if (!qty || qty <= 0 || !perDay || perDay <= 0) return Math.max(1, m);
+  return Math.max(1, Math.ceil((m * 30 * perDay) / qty));
 }
 
 // ---------------------------------------------------------------------------
@@ -138,9 +161,10 @@ refillsRouter.post('/orders', async (req, res) => {
       supplement_name: string | null;
       dose: string | null;
       qty: number | null;
+      schedule: DoseSchedule | null;
     }>(
       `SELECT rf.id, rf.client_id, c.name AS client_name, c.email AS client_email,
-              s.name AS supplement_name, s.dose, s.qty
+              s.name AS supplement_name, s.dose, s.qty, s.schedule
          FROM refills rf
     LEFT JOIN clients c ON c.id = rf.client_id
     LEFT JOIN supplements s ON s.id = rf.supplement_id
@@ -161,6 +185,7 @@ refillsRouter.post('/orders', async (req, res) => {
         dose: string | null;
         qty: number | null;
         months: number;
+        perDay: number;
       }>;
     };
 
@@ -200,6 +225,7 @@ refillsRouter.post('/orders', async (req, res) => {
         dose: row.dose,
         qty: row.qty,
         months,
+        perDay: dailyUnits(row),
       });
     }
 
@@ -233,7 +259,7 @@ refillsRouter.post('/orders', async (req, res) => {
     // 2. Process grouped clients (send one consolidated email per client)
     for (const [email, group] of groupedByEmail.entries()) {
       const suppStrings = group.refills.map(r => {
-        const bottles = r.months && r.months > 0 ? Math.floor(r.months) : 1;
+        const bottles = bottlesFor(r.months, r.perDay, r.qty);
         const bottleStr = `${bottles} bottle${bottles > 1 ? 's' : ''}`;
         return `• ${r.supplementName} - ${r.dose ?? 'dosage not specified'} (Recommended: ${bottleStr})`;
       }).join('\n');

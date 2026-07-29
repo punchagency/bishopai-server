@@ -2,6 +2,7 @@ import type { PoolClient } from 'pg';
 import { pool } from '../db/pool';
 import { coerceSessionNote } from './render';
 import type { SessionNote } from './extract';
+import { normalizeSupplementName } from './supplementName';
 import type { ScheduleSlot } from '../integrations/docs/types';
 
 // WF1 → WF2/WF4 linkage: when Nicole approves a client's Protocol, persist its
@@ -41,6 +42,11 @@ export async function syncClientSupplements(
   for (const s of note.supplements) {
     const name = s.name?.trim();
     if (!name) continue; // skip nameless entries — nothing to key on
+    // Identity is the NORMALIZED name, never the spoken one. Extraction is told
+    // to preserve garbled product names verbatim, so keying on the raw string
+    // made "Bio-C Plus" and "Bio C Plus" two rows on one plan — and two refill
+    // projections for one product. `name` stays as spoken for the document.
+    const key = normalizeSupplementName(name) || name.toLowerCase();
 
     if (s.change === 'stop') {
       // Chronology guard: a `stop` from an older session (approved late, out of
@@ -49,9 +55,9 @@ export async function syncClientSupplements(
       // undated session, falls through to the old unconditional behaviour.
       const r = await db.query(
         `DELETE FROM supplements
-          WHERE client_id = $1 AND lower(name) = lower($2)
+          WHERE client_id = $1 AND name_key = $2
             AND ($3::date IS NULL OR start_date IS NULL OR start_date <= $3::date)`,
-        [clientId, name, startDate],
+        [clientId, key, startDate],
       );
       removed += r.rowCount ?? 0;
       continue;
@@ -60,8 +66,8 @@ export async function syncClientSupplements(
     // start | increase | decrease | continue → keep one current row per name.
     const existing = await db.query<{ id: string; start_date: string | null }>(
       `SELECT id, start_date::text AS start_date FROM supplements
-        WHERE client_id = $1 AND lower(name) = lower($2) LIMIT 1`,
-      [clientId, name],
+        WHERE client_id = $1 AND name_key = $2 LIMIT 1`,
+      [clientId, key],
     );
     // Don't let an out-of-order approval walk the plan backwards: if the stored
     // row is dated NEWER than this session, a later session already owns it —
@@ -80,20 +86,37 @@ export async function syncClientSupplements(
       ? JSON.stringify(s.schedule)
       : null;
 
+    const params = [
+      clientId, name, s.dose, s.quantity, startDate, schedule, s.obtained_from ?? null, key,
+      s.units_per_dose ?? null, s.doses_per_day ?? null,
+    ];
     if (existing.rowCount) {
       await db.query(
         `UPDATE supplements
-            SET name = $2, dose = $3, qty = $4, start_date = $5, source = 'notes',
+            SET name = $2, name_key = $8, dose = $3, qty = $4, start_date = $5, source = 'notes',
                 schedule = COALESCE($6::jsonb, schedule),
-                obtained_from = COALESCE($7, obtained_from)
+                obtained_from = COALESCE($7, obtained_from),
+                -- COALESCE, not overwrite: a session that restated the product
+                -- without restating a countable dose must not erase the numbers
+                -- an earlier session captured.
+                units_per_dose = COALESCE($9::numeric, units_per_dose),
+                doses_per_day = COALESCE($10::numeric, doses_per_day)
           WHERE id = $1`,
-        [existing.rows[0].id, name, s.dose, s.quantity, startDate, schedule, s.obtained_from ?? null],
+        [existing.rows[0].id, ...params.slice(1)],
       );
     } else {
       await db.query(
-        `INSERT INTO supplements (client_id, name, dose, qty, start_date, source, schedule, obtained_from)
-         VALUES ($1, $2, $3, $4, $5, 'notes', $6::jsonb, $7)`,
-        [clientId, name, s.dose, s.quantity, startDate, schedule, s.obtained_from ?? null],
+        `INSERT INTO supplements (client_id, name, name_key, dose, qty, start_date, source,
+                                  schedule, obtained_from, units_per_dose, doses_per_day)
+              VALUES ($1, $2, $8, $3, $4, $5, 'notes', $6::jsonb, $7, $9::numeric, $10::numeric)
+         ON CONFLICT (client_id, name_key) DO UPDATE
+              SET name = EXCLUDED.name, dose = EXCLUDED.dose, qty = EXCLUDED.qty,
+                  start_date = EXCLUDED.start_date, source = 'notes',
+                  schedule = COALESCE(EXCLUDED.schedule, supplements.schedule),
+                  obtained_from = COALESCE(EXCLUDED.obtained_from, supplements.obtained_from),
+                  units_per_dose = COALESCE(EXCLUDED.units_per_dose, supplements.units_per_dose),
+                  doses_per_day = COALESCE(EXCLUDED.doses_per_day, supplements.doses_per_day)`,
+        params,
       );
     }
     upserted++;
@@ -127,6 +150,61 @@ export async function fetchCurrentSupplements(clientId: string): Promise<Current
   return r.rows;
 }
 
+// How long a fetched vocabulary stays good. Products change rarely; a few
+// minutes of staleness costs nothing and keeps this off the extraction hot path.
+const VOCAB_TTL_MS = 5 * 60_000;
+const VOCAB_LIMIT = Number(process.env.EXTRACTION_CATALOG_LIMIT ?? 120);
+let practiceVocab: { at: number; names: string[] } | null = null;
+
+/**
+ * Supplement names to ground extraction against: this client's own plan first,
+ * then the practice's most-used products.
+ *
+ * The practice sells a bounded set of products, and the transcript mangles their
+ * names — this is the closed vocabulary that turns "bio see plus" back into
+ * "Bio-C Plus" instead of leaving a phonetic guess to become a new row on the
+ * client's plan. Ordered client-first and capped, so the prompt never grows past
+ * what the budget can carry.
+ */
+export async function fetchSupplementVocabulary(clientId: string | null): Promise<string[]> {
+  const names: string[] = [];
+  if (clientId) {
+    const own = await pool.query<{ name: string }>(
+      `SELECT name FROM supplements WHERE client_id = $1 ORDER BY name`,
+      [clientId],
+    );
+    names.push(...own.rows.map((r) => r.name));
+  }
+
+  if (!practiceVocab || Date.now() - practiceVocab.at > VOCAB_TTL_MS) {
+    const all = await pool.query<{ name: string }>(
+      `SELECT name FROM supplements
+        GROUP BY name_key, name
+        ORDER BY count(*) DESC, name
+        LIMIT $1`,
+      [VOCAB_LIMIT],
+    );
+    practiceVocab = { at: Date.now(), names: all.rows.map((r) => r.name) };
+  }
+  names.push(...practiceVocab.names);
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const n of names) {
+    const key = normalizeSupplementName(n);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(n);
+    if (out.length >= VOCAB_LIMIT) break;
+  }
+  return out;
+}
+
+/** Test seam — drop the cached practice-wide vocabulary. */
+export function resetSupplementVocabulary(): void {
+  practiceVocab = null;
+}
+
 /**
  * Pure preview of what `syncClientSupplements` WOULD produce for this note,
  * without writing anything — same upsert-by-name / stop-removes rules, so the
@@ -137,11 +215,13 @@ export function previewSupplementMerge(
   current: CurrentSupplementRow[],
   note: SessionNote,
 ): CurrentSupplementRow[] {
-  const map = new Map(current.map((r) => [r.name.toLowerCase(), { ...r }]));
+  // Same identity rule as syncClientSupplements — the preview would otherwise
+  // show Nicole a grid the approval then merges differently.
+  const map = new Map(current.map((r) => [normalizeSupplementName(r.name) || r.name.toLowerCase(), { ...r }]));
   for (const s of note.supplements) {
     const name = s.name?.trim();
     if (!name) continue;
-    const key = name.toLowerCase();
+    const key = normalizeSupplementName(name) || name.toLowerCase();
     if (s.change === 'stop') {
       map.delete(key);
       continue;
@@ -187,17 +267,18 @@ export async function removeSupplementsDroppedByAmendment(
   const before = coerceSessionNote(supersededNote);
   const after = coerceSessionNote(amendedNote);
   const stillNamed = new Set(
-    after.supplements.map((s) => s.name?.trim().toLowerCase()).filter(Boolean),
+    after.supplements.map((s) => normalizeSupplementName(s.name)).filter(Boolean),
   );
 
   let removed = 0;
   for (const s of before.supplements) {
     const name = s.name?.trim();
     if (!name || s.change !== 'start') continue;
-    if (stillNamed.has(name.toLowerCase())) continue;
+    const key = normalizeSupplementName(name) || name.toLowerCase();
+    if (stillNamed.has(key)) continue;
     const r = await db.query(
-      `DELETE FROM supplements WHERE client_id = $1 AND lower(name) = lower($2)`,
-      [clientId, name],
+      `DELETE FROM supplements WHERE client_id = $1 AND name_key = $2`,
+      [clientId, key],
     );
     removed += r.rowCount ?? 0;
   }

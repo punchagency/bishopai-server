@@ -22,9 +22,10 @@ interface LeadRow {
   sequence_state: { sent?: string[] } | null;
   last_touch: string | null;
   created_at: string;
+  cadence_cancelled_at: string | null;
 }
 
-const LEAD_COLUMNS = `id, email, status, sequence_state, last_touch, created_at`;
+const LEAD_COLUMNS = `id, email, status, sequence_state, last_touch, created_at, cadence_cancelled_at`;
 
 /** Outcome of evaluating one lead — tallied by the batch runner. */
 type LeadOutcome = 'sent' | 'deactivated' | 'skipped' | 'none';
@@ -41,6 +42,7 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
     created_at: new Date(row.created_at),
     last_touch: row.last_touch ? new Date(row.last_touch) : null,
     sentSteps: row.sequence_state?.sent ?? [],
+    cadenceCancelled: row.cadence_cancelled_at !== null,
   };
   const action = nextCadenceAction(state, now);
 

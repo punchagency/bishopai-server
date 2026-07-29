@@ -787,6 +787,21 @@ function approveOne(table: Table) {
   };
 }
 
+/** The recording behind an appointment, for the review pane's source panel. */
+async function fetchTranscript(
+  appointmentId: string | null,
+): Promise<{ text: string; recorded_at: string | null } | null> {
+  if (!appointmentId) return null;
+  const r = await pool.query<{ transcript: string | null; starts_at: string | null }>(
+    `SELECT transcript, starts_at FROM conversations
+      WHERE appointment_id = $1 AND transcript IS NOT NULL
+      ORDER BY starts_at DESC LIMIT 1`,
+    [appointmentId],
+  );
+  if (r.rowCount === 0 || !r.rows[0].transcript) return null;
+  return { text: r.rows[0].transcript, recorded_at: r.rows[0].starts_at };
+}
+
 function contextOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
@@ -812,6 +827,7 @@ function contextOne(table: Table) {
           client_id: null,
           prior: { sheet: null, protocol: null },
           supplementPlan: { current: [], merged: previewSupplementMerge([], note) },
+          transcript: await fetchTranscript(item.rows[0].appointment_id),
         });
       }
 
@@ -862,6 +878,11 @@ function contextOne(table: Table) {
           current,
           merged: previewSupplementMerge(current, note),
         },
+        // The source the note was extracted FROM. Review previously showed ~50
+        // extracted fields with no way to check any of them against what was
+        // actually said; pairing each finding with its quote is what turns
+        // reviewing into confirming.
+        transcript: await fetchTranscript(apptId),
       });
     } catch (err) {
       logError(`review.${table}_context`, 'context query failed', err, { id: req.params.id });

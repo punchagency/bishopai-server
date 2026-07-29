@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { FoundationSchema, LifestyleSchema } from './extract';
+import { BodyScanSchema, FoundationSchema, LifestyleSchema } from './extract';
 
 // Real values pulled off the History grid, where a model had echoed the prompt
 // name back into the value: the flow sheet then reads "HTA: HTA is negative",
@@ -39,10 +39,37 @@ describe('label echo stripping', () => {
   });
 
   it('does not eat a value that merely starts with a similar word', () => {
-    // "clear" must survive even though "cell"/"cns" share a prefix letter, and a
-    // finding that legitimately begins with the label word keeps its meaning.
+    // Half the prompt names are ordinary English words, and for the ART tests the
+    // label word is also a legitimate RESULT — "open" is what OPEN tests for.
+    // Stripping it turned "open on the right side only" into "on the right side
+    // only", which reads as a location with no finding attached, and turned
+    // "Cell membranes weak" into "membranes weak". A redundant-looking
+    // "OPEN: open on the right side only" on the flow sheet is cosmetic; losing
+    // the result is not, so an ambiguous label survives without a delimiter.
     const f = FoundationSchema.parse({ art_open: 'open on the right side only' });
-    expect(f.art_open).toBe('on the right side only');
+    expect(f.art_open).toBe('open on the right side only');
+    const b = BodyScanSchema.parse({ art_cell: 'cell membranes weak' });
+    expect(b.art_cell).toBe('cell membranes weak');
+  });
+
+  it('still strips an ambiguous label when punctuation or a verb marks it', () => {
+    // The echo is unmistakable here, so it goes — this is the case the stripper
+    // exists for, and it survives the fix above.
+    const f = FoundationSchema.parse({
+      art_open: 'OPEN: clear',
+      art_switch: 'switch is stuck',
+      art_dental: 'DENTAL - amalgam on the lower left',
+    });
+    expect(f.art_open).toBe('clear');
+    expect(f.art_switch).toBe('stuck');
+    expect(f.art_dental).toBe('amalgam on the lower left');
+  });
+
+  it('strips only the first matching alias, never twice', () => {
+    // 'hta post run' and 'post run' both match; applying both would leave "62"
+    // stripped of the reading it belongs to.
+    const f = FoundationSchema.parse({ hta_post_run: 'HTA POST RUN: post run 62' });
+    expect(f.hta_post_run).toBe('post run 62');
   });
 
   it('strips echoes in the lifestyle log too', () => {

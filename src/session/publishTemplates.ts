@@ -7,6 +7,7 @@ import { coerceSessionNote } from './render';
 import { toRofData, toSupplementData, toFlowSheetEntry } from './templateData';
 import { fillRof } from '../integrations/docs/rof';
 import { fillSupplementProtocol } from '../integrations/docs/supplement';
+import { buildFlowSheetXlsx } from '../integrations/docs/flowsheetWorkbook';
 import { fetchCurrentSupplements, type CurrentSupplementRow } from './supplements';
 import { recordDocument } from './documents';
 import type { FlowSheetEntry } from '../integrations/docs/types';
@@ -94,6 +95,68 @@ export interface ClientTemplatesResult {
  * is connected, so enabling it early is safe.)
  */
 const emailToClientEnabled = (): boolean => process.env.EMAIL_PROTOCOL_TO_CLIENT === 'true';
+
+/**
+ * Interim Flow Sheet transport. The native path appends a block to a Google Sheet
+ * via the Sheets API, which needs the `spreadsheets` scope + the Sheets API enabled
+ * on the Google project — neither is set up in this pilot yet (see `npm run
+ * check:google`). Until it is, FLOW_SHEET_AS_XLSX=true keeps the Flow Sheet as an
+ * .xlsx file: we rebuild the whole sheet from the DB on each approve and overwrite
+ * the one file in Drive, using only the drive.file scope we already have. Flip the
+ * flag off once Sheets is live to return to native, append-in-place Google Sheets.
+ */
+const flowSheetAsXlsx = (): boolean => process.env.FLOW_SHEET_AS_XLSX === 'true';
+
+/**
+ * The client's Flow Sheet entries, oldest session first, for the xlsx-rebuild path.
+ * Derives one entry per approved protocol from its stored note, so the rebuilt file
+ * reflects the current state of every session (amendments included).
+ */
+async function flowSheetEntriesForClient(clientId: string): Promise<FlowSheetEntry[]> {
+  const r = await pool.query<{ content_json: unknown; starts_at: string | null }>(
+    `SELECT p.content_json, a.starts_at
+       FROM protocols p
+       JOIN appointments a ON a.id = p.appointment_id
+      WHERE p.client_id = $1 AND p.status = 'approved'
+   ORDER BY a.starts_at ASC NULLS LAST, p.id ASC`,
+    [clientId],
+  );
+  return r.rows.map((row) =>
+    toFlowSheetEntry(coerceSessionNote(row.content_json), { date: displayDate(row.starts_at) }),
+  );
+}
+
+/**
+ * Rebuild the client's Flow Sheet from all their approved sessions and overwrite
+ * the single .xlsx in Drive (`<Client>/AppointmentFlowSheet/`). Idempotent: same
+ * inputs always produce the same file, found and PATCHed by name. Returns partial
+ * ids to fold into the caller's result. `driveFolderId` is the client's stable
+ * folder id when known, so we don't misfile on a renamed client.
+ */
+async function publishFlowSheetXlsx(
+  clientId: string,
+  clientName: string,
+  driveFolderId: string | null,
+): Promise<{ fileId?: string; clientFolderId?: string; dryRun?: boolean }> {
+  const entries = await flowSheetEntriesForClient(clientId);
+  const bytes = await buildFlowSheetXlsx(entries);
+  const res = await publishBinaryDoc({
+    clientName,
+    driveFolderId,
+    docType: 'AppointmentFlowSheet',
+    fileName: `${clientName} Appointment Flow Sheet.xlsx`,
+    bytes,
+    mimeType: XLSX_MIME,
+    update: true,
+  });
+  if (!res.dryRun) await recordDocument(clientId, 'AppointmentFlowSheet', res.fileId);
+  logEvent('info', 'session.flowsheet_xlsx', res.dryRun ? '[dry-run] would overwrite Flow Sheet xlsx' : 'overwrote Flow Sheet xlsx', {
+    client: clientName,
+    sessions: entries.length,
+    fileId: res.fileId,
+  });
+  return res;
+}
 
 /**
  * Mail the client their filled documents as attachments: the Supplement Protocol
@@ -205,44 +268,63 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
   await recordDocument(row.client_id, 'SupplementProtocol', supp.fileId);
   clientFolderId = supp.clientFolderId ?? clientFolderId;
 
-  // Flow Sheet — provision once (xlsx → Google Sheet), then append a block.
-  // publishFlowSheet also mirrors the block into a local demo xlsx whenever
-  // DEMO_OUTPUT_DIR is set, in addition to (not instead of) the real Sheet.
+  // Flow Sheet. Two transports, chosen by FLOW_SHEET_AS_XLSX (see flowSheetAsXlsx):
+  //   xlsx mode  — rebuild the whole sheet from the DB, overwrite one file in Drive
+  //                (drive.file scope only; the interim path until Sheets is enabled).
+  //   native mode— provision a Google Sheet once, then append this session's block.
   let flowSheetId: string | null = row.flow_sheet_id ?? null;
-  try {
-    if (isDriveConfigured() && !flowSheetId) {
-      const { folderId, clientFolderId: cfid } = await resolveDocFolder(clientName, 'AppointmentFlowSheet', {
-        clientFolderId,
-        rootFolderId: driveConfig().rootFolderId,
-      });
-      clientFolderId = cfid;
-      const sheet = await ensureConvertedSheet(folderId, `${clientName} Appointment Flow Sheet`, readFileSync(FLOW_TEMPLATE));
-      flowSheetId = sheet.id;
-      logEvent('info', 'session.flowsheet_provision', 'provisioned client Flow Sheet', {
-        client: clientName,
-        spreadsheetId: flowSheetId,
-        created: sheet.created,
-      });
+  if (flowSheetAsXlsx()) {
+    try {
+      if (row.client_id) {
+        const flow = await publishFlowSheetXlsx(row.client_id, clientName, clientFolderId);
+        result.flowSheetId = flow.fileId ?? null;
+        clientFolderId = flow.clientFolderId ?? clientFolderId;
+      }
+    } catch (err) {
+      // Same contract as the native path: ROF/Supplement already landed, so a
+      // Flow Sheet failure stays local to this doc and is surfaced (not swallowed)
+      // so the caller/dashboard can say the block is missing.
+      result.flowSheetError = err instanceof Error ? err.message : String(err);
+      logError('session.flowsheet_publish', 'Flow Sheet xlsx publish failed', err, { client: clientName });
     }
-    const flow = await publishFlowSheet({
-      clientName,
-      spreadsheetId: flowSheetId ?? 'unprovisioned',
-      entry: rendered.flowEntry,
-    });
-    result.flowSheetId = flowSheetId;
-    result.flowBlock = flow.blockIndex;
-    if (!flow.dryRun) await recordDocument(row.client_id, 'AppointmentFlowSheet', flowSheetId);
-  } catch (err) {
-    // ROF/Supplement already landed above — a Sheets-API failure must not lose
-    // that work or block persistIds/email below, so it stays local to this doc.
-    //
-    // But it must not stay INVISIBLE either. This is how the Flow Sheet went
-    // months without ever being written: the other two documents succeeded, the
-    // publish reported success, and the one failure went to a log nobody reads.
-    // Surfacing it on the result means the caller — and the dashboard — can say
-    // that a session's Flow Sheet block is missing.
-    result.flowSheetError = err instanceof Error ? err.message : String(err);
-    logError('session.flowsheet_publish', 'Flow Sheet publish failed', err, { client: clientName });
+  } else {
+    // publishFlowSheet also mirrors the block into a local demo xlsx whenever
+    // DEMO_OUTPUT_DIR is set, in addition to (not instead of) the real Sheet.
+    try {
+      if (isDriveConfigured() && !flowSheetId) {
+        const { folderId, clientFolderId: cfid } = await resolveDocFolder(clientName, 'AppointmentFlowSheet', {
+          clientFolderId,
+          rootFolderId: driveConfig().rootFolderId,
+        });
+        clientFolderId = cfid;
+        const sheet = await ensureConvertedSheet(folderId, `${clientName} Appointment Flow Sheet`, readFileSync(FLOW_TEMPLATE));
+        flowSheetId = sheet.id;
+        logEvent('info', 'session.flowsheet_provision', 'provisioned client Flow Sheet', {
+          client: clientName,
+          spreadsheetId: flowSheetId,
+          created: sheet.created,
+        });
+      }
+      const flow = await publishFlowSheet({
+        clientName,
+        spreadsheetId: flowSheetId ?? 'unprovisioned',
+        entry: rendered.flowEntry,
+      });
+      result.flowSheetId = flowSheetId;
+      result.flowBlock = flow.blockIndex;
+      if (!flow.dryRun) await recordDocument(row.client_id, 'AppointmentFlowSheet', flowSheetId);
+    } catch (err) {
+      // ROF/Supplement already landed above — a Sheets-API failure must not lose
+      // that work or block persistIds/email below, so it stays local to this doc.
+      //
+      // But it must not stay INVISIBLE either. This is how the Flow Sheet went
+      // months without ever being written: the other two documents succeeded, the
+      // publish reported success, and the one failure went to a log nobody reads.
+      // Surfacing it on the result means the caller — and the dashboard — can say
+      // that a session's Flow Sheet block is missing.
+      result.flowSheetError = err instanceof Error ? err.message : String(err);
+      logError('session.flowsheet_publish', 'Flow Sheet publish failed', err, { client: clientName });
+    }
   }
 
   // Optionally mail the client their filled docs (off unless Nicole enables it).
@@ -326,8 +408,20 @@ export async function republishAmended(protocolId: string): Promise<ClientTempla
   result.supplementFileId = supp.fileId;
   await recordDocument(row.client_id, 'SupplementProtocol', supp.fileId);
 
-  // Flow Sheet — rewrite this session's own block.
-  if (row.flow_sheet_id) {
+  // Flow Sheet. In xlsx mode the rebuild reads the amended note straight from the
+  // DB, so re-publishing the whole file is the correction — no per-block rewrite.
+  // In native mode we rewrite this session's own block in place (appending would
+  // give the client two blocks for one visit).
+  if (flowSheetAsXlsx()) {
+    if (row.client_id) {
+      try {
+        const flow = await publishFlowSheetXlsx(row.client_id, clientName, row.drive_folder_id ?? null);
+        result.flowSheetId = flow.fileId ?? null;
+      } catch (err) {
+        logError('session.flowsheet_amend', 'Flow Sheet xlsx rewrite failed', err, { client: clientName });
+      }
+    }
+  } else if (row.flow_sheet_id) {
     try {
       const flow = await rewriteFlowSheetBlock({
         clientName,

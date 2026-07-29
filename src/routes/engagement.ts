@@ -20,6 +20,7 @@ engagementRouter.get('/leads', async (_req, res) => {
   try {
     const r = await pool.query(
       `SELECT l.id, l.source, l.email, l.status, l.sequence_state, l.last_touch, l.created_at,
+              l.cadence_cancelled_at,
               (SELECT count(*) FROM lead_activity a WHERE a.lead_id = l.id) AS activity_count,
               (SELECT max(a.occurred_at) FROM lead_activity a WHERE a.lead_id = l.id) AS last_activity
          FROM leads l
@@ -32,6 +33,7 @@ engagementRouter.get('/leads', async (_req, res) => {
         created_at: new Date(row.created_at),
         last_touch: row.last_touch ? new Date(row.last_touch) : null,
         sentSteps: row.sequence_state?.sent ?? [],
+        cadenceCancelled: row.cadence_cancelled_at !== null,
       };
       const action = nextCadenceAction(state, now);
       return {

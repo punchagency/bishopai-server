@@ -1,429 +1,378 @@
-import { z } from 'zod';
 import { generateStructured } from '../llm/providers';
 import { llmConfig } from '../llm/config';
+import { RateLimitError, RequestTooLargeError, TruncatedOutputError, isRetryable } from '../llm/errors';
+import { logEvent } from '../observability/logger';
 import { mockExtractSessionNote } from './mockExtract';
+import {
+  NARRATIVE_JSON_SCHEMA,
+  NRT_JSON_SCHEMA,
+  NarrativeStageSchema,
+  NrtStageSchema,
+  PROTOCOL_JSON_SCHEMA,
+  ProtocolStageSchema,
+  STAGE_WIRE,
+  SessionNoteSchema,
+  type Evidence,
+  type SessionNote,
+} from './schema';
+import { mergeChunkNotes, mergeStages, type ChunkResult } from './mergeNotes';
+import { narrativePrompt } from './prompts/narrative';
+import { protocolPrompt } from './prompts/protocol';
+import { nrtPrompt } from './prompts/nrt';
+import { PROMPT_VERSION, type PromptContext } from './prompts/shared';
+import { matchCatalog } from './supplementName';
+import { chunkTurns, formatStamp, prepareTranscript, renderTurns, type Chunk } from './transcript';
+import { verifyEvidence } from './verifyEvidence';
 
-// Structured session note (WF1 step 3): what the transcript parse produces,
-// feeding both the Appointment Sheet and the Protocol.
-// Nutrition Response Testing findings. These are muscle-testing results Nicole
-// calls out during the session; they fill the ROF's NRT block and the Flow Sheet's
-// FOUNDATION / BODY SCAN columns. Every field is nullable and stays null unless the
-// transcript states it — a wrong clinical value is far worse than a blank one.
-
-// Models frequently echo the prompt name back into the value: asked for HTA they
-// answer "HTA is negative", or worse just "LAYING 1 FOUNDATIONS". The value then
-// renders as "HTA: HTA is negative" on the flow sheet, and a bare label echo is
-// indistinguishable from a real finding. Strip the echo deterministically rather
-// than only asking the prompt to stop — the prompt is guidance, this is a
-// guarantee.
-const ECHO_CONNECTOR = String.raw`(?:\s+(?:is|was|are|were|shows?|reads?))?\s*[:\-–]?\s*`;
-
-function stripEcho(value: string | null, aliases: string[]): string | null {
-  if (!value) return null;
-  let out = value.trim();
-  for (const alias of aliases) {
-    const re = new RegExp(`^${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${ECHO_CONNECTOR}`, 'i');
-    const next = out.replace(re, '').trim();
-    // A value that was ONLY the label carries no finding at all — that is a
-    // blank, not a result, and must not read as one.
-    if (next !== out) out = next;
-  }
-  return out.length ? out : null;
-}
-
-function stripEchoes<T extends Record<string, string | null>>(
-  obj: T,
-  labels: Record<keyof T, string[]>,
-): T {
-  const out = { ...obj };
-  for (const key of Object.keys(out) as (keyof T)[]) {
-    (out as Record<string, string | null>)[key as string] = stripEcho(out[key], labels[key] ?? []);
-  }
-  return out;
-}
-
-const FOUNDATION_LABELS = {
-  laying1: ['laying 1 foundations', 'laying 1'],
-  standing: ['standing foundations', 'standing'],
-  hta: ['hta'],
-  hta_post_run: ['hta post run', 'post run'],
-  laying2: ['laying 2 foundations', 'laying 2'],
-  art_open: ['art open', 'open'],
-  art_switch: ['art switch', 'switch'],
-  art_cns: ['art cns', 'cns'],
-  art_dental: ['art dental', 'dental'],
-  art_hormonal: ['art hormonal', 'hormonal'],
-  additional: ['additional'],
-};
-
-const BODY_SCAN_LABELS = {
-  art_ectoderm: ['art ectoderm', 'ectoderm'],
-  art_priority: ['art priority', 'priority'],
-  art_matrix: ['art matrix', 'matrix'],
-  art_cell: ['art cell', 'cell'],
-  additional_art: ['additional art'],
-  scan_priority: ['scan priority', 'body scan priority', 'priority'],
-  scan_matrix: ['scan matrix', 'body scan matrix', 'matrix'],
-  scan_cell: ['scan cell', 'body scan cell', 'cell'],
-  additional_nrt: ['additional nrt'],
-};
-
-const LIFESTYLE_LABELS = {
-  bm: ['bowel movements', 'bowel movement', 'bm'],
-  sleep: ['sleep'],
-  water: ['water intake', 'water'],
-  cycle: ['menstrual cycle', 'cycle'],
-  exercise: ['exercise'],
-  diet: ['diet'],
-};
-
-/** A field that stays null unless the transcript states it. */
-const stated = (): z.ZodType<string | null, unknown> =>
-  z.string().nullish().transform((v) => v?.trim() || null) as z.ZodType<string | null, unknown>;
-
-// The FOUNDATION column (D) of the Flow Sheet is not free text — it is a fixed
-// list of muscle-testing prompts Nicole works down in order. Modelling each prompt
-// as its own field is what lets the review UI show her "HTA: 68" against a blank
-// "HTA POST RUN", instead of one blob she has to read for what's missing.
-// Legacy notes stored a single string here; it lands in `additional`.
-export const FoundationSchema = z.preprocess(
-  (v) => (typeof v === 'string' ? { additional: v } : v),
-  z.object({
-    laying1: stated(),
-    standing: stated(),
-    hta: stated(),
-    hta_post_run: stated(),
-    laying2: stated(),
-    art_open: stated(),
-    art_switch: stated(),
-    art_cns: stated(),
-    art_dental: stated(),
-    art_hormonal: stated(),
-    additional: stated(),
-  }),
-).transform((v) => (v ? stripEchoes(v, FOUNDATION_LABELS) : v));
-
-// The BODY SCAN column (E): two testing passes — ART with polarity, then NRT
-// without — each with its own PRIORITY / MATRIX / CELL readings.
-export const BodyScanSchema = z.preprocess(
-  (v) => (typeof v === 'string' ? { additional_nrt: v } : v),
-  z.object({
-    art_ectoderm: stated(),
-    art_priority: stated(),
-    art_matrix: stated(),
-    art_cell: stated(),
-    additional_art: stated(),
-    scan_priority: stated(),
-    scan_matrix: stated(),
-    scan_cell: stated(),
-    additional_nrt: stated(),
-  }),
-).transform((v) => (v ? stripEchoes(v, BODY_SCAN_LABELS) : v));
-
-export const NrtFindingsSchema = z.object({
-  pulse0: stated(),
-  priority1: stated(),
-  k27: stated(),
-  // Some models return stressors as an array — join it into a string.
-  stressors: z.union([z.string(), z.array(z.string())]).nullish().transform(
-    (v) => (Array.isArray(v) ? v.join(', ') : (v ?? null)),
-  ),
-  foundation: FoundationSchema.nullish().transform((v) => v ?? null),
-  body_scan: BodyScanSchema.nullish().transform((v) => v ?? null),
-});
-
-export type FoundationFindings = z.infer<typeof FoundationSchema>;
-export type BodyScanFindings = z.infer<typeof BodyScanSchema>;
-
-// The Flow Sheet's lifestyle log (column B), as reported by the client in-session.
-export const LifestyleSchema = z
-  .object({
-    bm: stated(),
-    sleep: stated(),
-    water: stated(),
-    cycle: stated(),
-    exercise: stated(),
-    diet: stated(),
-  })
-  .transform((v) => stripEchoes(v, LIFESTYLE_LABELS));
-
-// The Supplement Protocol grid's time-of-day columns (D–J). Keys match
-// ScheduleSlot in integrations/docs/types.ts.
-export const ScheduleSchema = z.object({
-  uponWaking: stated(),
-  breakfast: stated(),
-  midMorning: stated(),
-  lunch: stated(),
-  midAfternoon: stated(),
-  dinner: stated(),
-  beforeBed: stated(),
-});
-
-export const FollowUpSchema = z.object({
-  text: z.string().default(''),
-  // Only when a timeframe was actually said. "Recheck in 4 weeks" → 28. "Keep an
-  // eye on her sleep" → null, and the task simply has no due date. Never guessed.
-  due_in_days: z.number().int().nullish().transform((v) => v ?? null),
-});
-
-export const SessionNoteSchema = z.object({
-  concerns: z.array(z.string()).default([]),
-  goals: z.array(z.string()).nullish().transform((v) => v ?? []),
-  assessments: z.array(z.string()).default([]),
-  protocol_changes: z.array(
-    z.object({
-      description: z.string().nullish().transform((v) => v ?? ''),
-      type: z.enum(['add', 'remove', 'adjust', 'continue']).nullish().transform((v) => v ?? 'continue'),
-    }),
-  ).default([]),
-  supplements: z.array(
-    z.object({
-      name: z.string().default(''),
-      dose: z.string().nullish().transform((v) => v ?? null),
-      quantity: z.number().nullish().transform((v) => v ?? null),
-      change: z.enum(['start', 'stop', 'increase', 'decrease', 'continue']).nullish().transform((v) => v ?? 'continue'),
-      // Dosing slots on the Supplement Protocol's Daily Schedule grid. A slot is
-      // filled only when the timing was actually spoken; an absent slot means
-      // "not taken then", not "unknown".
-      schedule: ScheduleSchema.optional(),
-      // "Here | Fullscript" on the protocol grid — where the client gets it.
-      // Rarely spoken aloud, so usually filled in by Nicole during review.
-      obtained_from: stated().optional(),
-      // The ROF's "Function" column — what this supplement is FOR, in terms the
-      // client reads ("supports adrenal recovery"). It is practitioner knowledge
-      // rather than something said in session, so it stays null unless she
-      // writes it; the ROF simply leaves that cell blank.
-      func: stated().optional(),
-    }),
-  ).default([]),
-  follow_ups: z.array(z.union([z.string(), FollowUpSchema])).default([]),
-  // Optional so notes extracted before these fields existed still parse.
-  nrt: NrtFindingsSchema.optional(),
-  lifestyle: LifestyleSchema.optional(),
-});
-
-
-export type SessionNote = z.infer<typeof SessionNoteSchema>;
-
-// JSON-Schema mirror of SessionNoteSchema for providers that take one (Gemini).
-// Hand-kept in sync — small + stable; zod stays the validation source of truth.
-const SESSION_NOTE_JSON_SCHEMA = {
-  type: 'object',
-  properties: {
-    concerns: { type: 'array', items: { type: 'string' } },
-    assessments: { type: 'array', items: { type: 'string' } },
-    protocol_changes: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          description: { type: 'string' },
-          type: { type: 'string', enum: ['add', 'remove', 'adjust', 'continue'] },
-        },
-        required: ['description', 'type'],
-      },
-    },
-    supplements: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          name: { type: 'string' },
-          dose: { type: 'string', nullable: true },
-          quantity: { type: 'number', nullable: true },
-          change: { type: 'string', enum: ['start', 'stop', 'increase', 'decrease', 'continue'] },
-          func: { type: 'string', nullable: true },
-          schedule: {
-            type: 'object',
-            nullable: true,
-            properties: {
-              uponWaking: { type: 'string', nullable: true },
-              breakfast: { type: 'string', nullable: true },
-              midMorning: { type: 'string', nullable: true },
-              lunch: { type: 'string', nullable: true },
-              midAfternoon: { type: 'string', nullable: true },
-              dinner: { type: 'string', nullable: true },
-              beforeBed: { type: 'string', nullable: true },
-            },
-            required: [
-              'uponWaking', 'breakfast', 'midMorning', 'lunch',
-              'midAfternoon', 'dinner', 'beforeBed',
-            ],
-          },
-        },
-        required: ['name', 'dose', 'quantity', 'change', 'schedule'],
-      },
-    },
-    follow_ups: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          text: { type: 'string' },
-          due_in_days: { type: 'number', nullable: true },
-        },
-        required: ['text', 'due_in_days'],
-      },
-    },
-    goals: { type: 'array', items: { type: 'string' } },
-    nrt: {
-      type: 'object',
-      properties: {
-        pulse0: { type: 'string', nullable: true },
-        priority1: { type: 'string', nullable: true },
-        k27: { type: 'string', nullable: true },
-        stressors: { type: 'string', nullable: true },
-        foundation: {
-          type: 'object',
-          nullable: true,
-          properties: {
-            laying1: { type: 'string', nullable: true },
-            standing: { type: 'string', nullable: true },
-            hta: { type: 'string', nullable: true },
-            hta_post_run: { type: 'string', nullable: true },
-            laying2: { type: 'string', nullable: true },
-            art_open: { type: 'string', nullable: true },
-            art_switch: { type: 'string', nullable: true },
-            art_cns: { type: 'string', nullable: true },
-            art_dental: { type: 'string', nullable: true },
-            art_hormonal: { type: 'string', nullable: true },
-            additional: { type: 'string', nullable: true },
-          },
-          required: [
-            'laying1', 'standing', 'hta', 'hta_post_run', 'laying2',
-            'art_open', 'art_switch', 'art_cns', 'art_dental', 'art_hormonal', 'additional',
-          ],
-        },
-        body_scan: {
-          type: 'object',
-          nullable: true,
-          properties: {
-            art_ectoderm: { type: 'string', nullable: true },
-            art_priority: { type: 'string', nullable: true },
-            art_matrix: { type: 'string', nullable: true },
-            art_cell: { type: 'string', nullable: true },
-            additional_art: { type: 'string', nullable: true },
-            scan_priority: { type: 'string', nullable: true },
-            scan_matrix: { type: 'string', nullable: true },
-            scan_cell: { type: 'string', nullable: true },
-            additional_nrt: { type: 'string', nullable: true },
-          },
-          required: [
-            'art_ectoderm', 'art_priority', 'art_matrix', 'art_cell', 'additional_art',
-            'scan_priority', 'scan_matrix', 'scan_cell', 'additional_nrt',
-          ],
-        },
-      },
-      required: ['pulse0', 'priority1', 'k27', 'stressors', 'foundation', 'body_scan'],
-    },
-    lifestyle: {
-      type: 'object',
-      properties: {
-        bm: { type: 'string', nullable: true },
-        sleep: { type: 'string', nullable: true },
-        water: { type: 'string', nullable: true },
-        cycle: { type: 'string', nullable: true },
-        exercise: { type: 'string', nullable: true },
-        diet: { type: 'string', nullable: true },
-      },
-      required: ['bm', 'sleep', 'water', 'cycle', 'exercise', 'diet'],
-    },
-  },
-  required: [
-    'concerns',
-    'goals',
-    'assessments',
-    'protocol_changes',
-    'supplements',
-    'follow_ups',
-    'nrt',
-    'lifestyle',
-  ],
-} as const;
-
-const SYSTEM = [
-  'You are a clinical documentation assistant for a functional-medicine practice',
-  'that uses Nutrition Response Testing (NRT).',
-  'Extract structured session data from an appointment transcript.',
-  '',
-  'CRITICAL: record only what is explicitly stated. Never infer, guess, or fill in a',
-  'plausible clinical value. A blank field is correct and expected; a fabricated one',
-  'is a clinical error. If the transcript does not state something, return null (for',
-  'string fields) or an empty array.',
-  '',
-  'Field guidance:',
-  '- concerns: symptoms/complaints the CLIENT reports (e.g. pain, panic attacks,',
-  '  fatigue). Capture them verbatim in full — include any context the client gives',
-  '  (e.g. "gallbladder pain — stones confirmed on ultrasound, surgeon wanted removal").',
-  '- goals: what the CLIENT explicitly says they want to achieve.',
-  '- assessments: the PRACTITIONER\'s working conclusions and findings — capture every',
-  '  distinct clinical statement made by the practitioner, verbatim or near-verbatim.',
-  '  Include organ/system findings, stress-pattern conclusions, neuro/hormonal',
-  '  observations, and any body-system the practitioner says needs support.',
-  '  Each finding should be a separate item. Do not merge or summarise.',
-  '  Examples: "pituitary is a little bit offline", "HPA axis under stress",',
-  '  "gallbladder stress affecting digestion, bile production and detoxification",',
-  '  "adrenal cortex needs support to calm cortisol and fight-or-flight response",',
-  '  "body needs to reset its safety signal after chronic stress".',
-  '- protocol_changes: every supplement change the practitioner states — match the',
-  '  type field to the action: "add"/"start" → add, "stop"/"remove"/"take out" → remove,',
-  '  "continue"/"keep" → continue, dose or frequency changes → adjust.',
-  '  If product names are garbled in transcription, preserve the best phonetic match.',
-  '  Include ALL changes mentioned: continues, removals, additions.',
-  '- supplements: only for NEW supplements being added with explicit name + change type.',
-  '- supplements[].func: what the supplement is FOR, only if the practitioner says',
-  '  so ("this one is for the adrenals"). Never invent a purpose from the name.',
-  '- supplements[].schedule: when the practitioner states WHEN a supplement is taken,',
-  '  put the amount in that slot: uponWaking, breakfast, midMorning, lunch,',
-  '  midAfternoon, dinner, beforeBed. "two caps with breakfast and one before bed"',
-  '  → {breakfast: "2 caps", beforeBed: "1 cap"}. Leave every slot null if no timing',
-  '  was spoken — do NOT spread a daily dose across meals to make it add up.',
-  '- nrt.pulse0: the Pulse 0 / pulse-point reading, verbatim as spoken.',
-  '- nrt.priority1: the stated "Priority #1" finding.',
-  '- nrt.k27: the K-27 (kidney-27 reflex point) result.',
-  '- nrt.stressors: the stressors identified (immune, food, metal, chemical, scar, etc.).',
-  '- nrt.foundation: the foundation muscle-testing pass, prompt by prompt. Fill only',
-  '  the prompts the practitioner actually calls a result for; leave the rest null.',
-  '    laying1 = "LAYING 1 FOUNDATIONS", standing = "STANDING FOUNDATIONS",',
-  '    hta = "HTA", hta_post_run = "HTA POST RUN", laying2 = "LAYING 2 FOUNDATIONS",',
-  '    art_open = ART "OPEN", art_switch = ART "SWITCH", art_cns = ART "CNS",',
-  '    art_dental = ART "DENTAL", art_hormonal = ART "HORMONAL",',
-  '    additional = any foundation finding that fits none of the above.',
-  '  Record ONLY the result, never the prompt name: "negative", not "HTA is',
-  '  negative" and never just "HTA". A value that only repeats the prompt is a',
-  '  blank — leave it null.',
-  '- nrt.body_scan: the body-scan pass, prompt by prompt. Two testing rounds:',
-  '    ART W/ POL → art_ectoderm ("ECTODERM"), art_priority ("PRIORITY"),',
-  '      art_matrix ("MATRIX"), art_cell ("CELL"), additional_art ("ADDITIONAL ART"),',
-  '    NRT W/O POL → scan_priority ("PRIORITY"), scan_matrix ("MATRIX"),',
-  '      scan_cell ("CELL"), additional_nrt ("ADDITIONAL NRT").',
-  '  Do not copy an ART reading into the NRT round or vice versa — they are separate',
-  '  tests and Nicole compares them. If you cannot tell which round a reading belongs',
-  '  to, put it in additional_art or additional_nrt rather than guessing a slot.',
-  '- lifestyle: the client\'s self-reported log — bowel movements (bm), sleep, water',
-  '  intake, menstrual cycle, exercise, and diet. Null any the client did not mention.',
-  '- follow_ups: each is an action someone committed to, as {text, due_in_days}.',
-  '  Set due_in_days ONLY from a timeframe actually spoken ("recheck in 4 weeks" → 28,',
-  '  "back in a month" → 30, "next week" → 7). If no timeframe was given, due_in_days',
-  '  is null — an undated task is correct. Do not assign a default interval.',
-].join('\n');
+// Re-exported so the many existing importers of `./extract` keep working; the
+// schemas themselves now live in ./schema.
+export * from './schema';
 
 /**
- * Parse a Bee transcript into a structured session note. Provider + model come
- * from llmConfig (swappable via LLM_PROVIDER, no code change). Uses structured
- * outputs; the result is validated against SessionNoteSchema regardless of
- * provider, so the output contract is identical across models.
+ * Everything the extractor knows about the session beyond the words themselves.
+ * The client name in particular is nearly free accuracy: without it the model
+ * has to infer which participant is which on the very distinction that decides
+ * whether a sentence lands on the internal sheet or the client's Report of
+ * Findings.
  */
-export async function extractSessionNote(transcript: string): Promise<SessionNote> {
+export interface ExtractContext {
+  clientName?: string | null;
+  practitionerName?: string | null;
+  appointmentDate?: string | null;
+  /** Known product names to match garbled supplement names against. */
+  catalog?: readonly string[];
+}
+
+interface Stage {
+  name: 'narrative' | 'protocol' | 'nrt';
+  prompt: (ctx: PromptContext) => string;
+  zodSchema: typeof STAGE_WIRE[keyof typeof STAGE_WIRE];
+  jsonSchema: unknown;
+  parse: (raw: unknown) => Partial<SessionNote>;
+  /** Whether this stage is run per-chunk on a long transcript. The narrative
+   *  stage never is: concerns and goals are stated once, often in passing, and a
+   *  chunk that doesn't contain them cannot know they exist. */
+  chunked: boolean;
+  /**
+   * Output budget for THIS stage, sized to what its schema can actually emit.
+   *
+   * A blanket budget is not free: providers bill requested completion tokens
+   * against rate limits, so asking for 4096 on a stage whose entire output is
+   * ~26 nullable slots wastes most of a small per-minute allowance on tokens
+   * that were never going to be generated. Undersizing is safe here because
+   * truncation is a typed error that retries at double — the cost of guessing
+   * low is one extra call, the cost of guessing high is every call.
+   */
+  maxTokens: number;
+}
+
+const STAGES: Stage[] = [
+  {
+    name: 'narrative',
+    prompt: narrativePrompt,
+    zodSchema: STAGE_WIRE.narrative,
+    jsonSchema: NARRATIVE_JSON_SCHEMA,
+    parse: (raw) => NarrativeStageSchema.parse(raw),
+    chunked: false,
+    // The largest output: verbatim assessments and concerns, each with a quote.
+    maxTokens: Number(process.env.LLM_MAX_TOKENS_NARRATIVE ?? 3000),
+  },
+  {
+    name: 'protocol',
+    prompt: protocolPrompt,
+    zodSchema: STAGE_WIRE.protocol,
+    jsonSchema: PROTOCOL_JSON_SCHEMA,
+    parse: (raw) => ProtocolStageSchema.parse(raw),
+    chunked: true,
+    // Supplements are verbose (7 schedule slots + structured dose each).
+    maxTokens: Number(process.env.LLM_MAX_TOKENS_PROTOCOL ?? 2500),
+  },
+  {
+    name: 'nrt',
+    prompt: nrtPrompt,
+    zodSchema: STAGE_WIRE.nrt,
+    jsonSchema: NRT_JSON_SCHEMA,
+    parse: (raw) => NrtStageSchema.parse(raw),
+    chunked: true,
+    // A fixed 26-slot grid, mostly nulls. Bounded and small.
+    maxTokens: Number(process.env.LLM_MAX_TOKENS_NRT ?? 1500),
+  },
+];
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * One provider call, with the two retries that are actually worth making.
+ *
+ * Truncation → retry BIGGER: the model had the answer and ran out of room, so
+ * an identical retry burns the same tokens to fail the same way.
+ * Rate limited → retry LATER: on a small per-minute budget a long transcript's
+ * chunks queue behind each other, and giving up on the first 429 throws away a
+ * chunk of the session over a delay we could simply have waited out.
+ * Too large → do not retry at all; only sending less can help, which is the
+ * caller's decision, not this function's.
+ */
+async function callStage(
+  stage: Stage,
+  system: string,
+  user: string,
+): Promise<Partial<SessionNote>> {
+  // Per-stage budget, capped by the global setting so LLM_MAX_TOKENS still works
+  // as an override for a provider that needs more.
+  let maxTokens = Math.min(stage.maxTokens, llmConfig.maxTokens);
+  let rateLimitRetries = 0;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { parsed } = await generateStructured({
+        system,
+        user,
+        zodSchema: stage.zodSchema,
+        jsonSchema: stage.jsonSchema,
+        maxTokens,
+      });
+      return stage.parse(parsed);
+    } catch (err) {
+      if (err instanceof RateLimitError && rateLimitRetries < llmConfig.rateLimitRetries) {
+        rateLimitRetries++;
+        const waitMs = err.retryAfterMs ?? 1000 * 2 ** rateLimitRetries;
+        logEvent('info', 'session.extract', 'rate limited — waiting before retry', {
+          stage: stage.name,
+          attempt: rateLimitRetries,
+          wait_ms: waitMs,
+        });
+        await sleep(Math.min(waitMs, 60_000));
+        continue;
+      }
+      const canGrow = err instanceof TruncatedOutputError && maxTokens < llmConfig.maxTokensCeiling;
+      if (!canGrow || attempt >= 1) throw err;
+      maxTokens = Math.min(maxTokens * 2, llmConfig.maxTokensCeiling);
+      logEvent('warn', 'session.extract', 'output truncated — retrying with a larger budget', {
+        stage: stage.name,
+        max_tokens: maxTokens,
+      });
+    }
+  }
+}
+
+/** Run tasks with bounded concurrency so a long session stays inside provider
+ *  rate limits instead of bursting every chunk at once. */
+async function pooled<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      try {
+        results[i] = { status: 'fulfilled', value: await fn(items[i]) };
+      } catch (reason) {
+        results[i] = { status: 'rejected', reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function chunkLabel(chunk: Chunk): PromptContext['chunk'] {
+  return {
+    index: chunk.index,
+    total: chunk.total,
+    startLabel: chunk.startSeconds != null ? formatStamp(chunk.startSeconds) : null,
+    endLabel: chunk.endSeconds != null ? formatStamp(chunk.endSeconds) : null,
+  };
+}
+
+/**
+ * Parse a Bee transcript into a structured session note.
+ *
+ * Three focused stages rather than one call doing everything: narrative
+ * summarisation and dictated-checklist transcription are different tasks with
+ * different failure modes, and under one prompt a single bad field discarded the
+ * entire session. Now a stage that fails leaves the other two intact and the note
+ * is marked partial — Nicole sees the session minus its NRT grid, which is worth
+ * far more than nothing.
+ *
+ * Long transcripts additionally chunk the protocol and NRT stages. Below
+ * `chunkThresholdTokens` a single call sees the whole session and reads better;
+ * above it, long-context recall on "find every scattered callout" decays
+ * silently, which is the worse failure.
+ */
+export async function extractSessionNote(
+  transcript: string,
+  ctx: ExtractContext = {},
+): Promise<SessionNote> {
   // Offline path: deterministic heuristic extractor, no API key (demos/seed).
   if (llmConfig.provider === 'mock') {
     return SessionNoteSchema.parse(mockExtractSessionNote(transcript));
   }
-  const raw = await generateStructured({
-    system: SYSTEM,
-    user: `Transcript:\n\n${transcript}`,
-    zodSchema: SessionNoteSchema,
-    jsonSchema: SESSION_NOTE_JSON_SCHEMA,
+
+  const prepared = prepareTranscript(transcript);
+  const promptCtx: PromptContext = {
+    clientName: ctx.clientName,
+    practitionerName: ctx.practitionerName,
+    appointmentDate: ctx.appointmentDate,
+    catalog: ctx.catalog,
+  };
+
+  const shouldChunk = prepared.tokens > llmConfig.chunkThresholdTokens;
+  // Always compute the plan, even below the threshold: it is also the fallback
+  // for a whole-transcript call the provider refuses as too large.
+  const chunkPlan = chunkTurns(prepared.turns, {
+    targetTokens: llmConfig.chunkTargetTokens,
+    overlapTurns: llmConfig.chunkOverlapTurns,
   });
-  return SessionNoteSchema.parse(raw);
+  const chunks = shouldChunk ? chunkPlan : [];
+
+  const partial: string[] = [];
+  const conflicts: { path: string; chosen: string | null; candidates: string[] }[] = [];
+  const gaps: { from: number | null; to: number | null }[] = [];
+
+  const stageResults = await Promise.all(
+    STAGES.map(async (stage): Promise<Partial<SessionNote> | null> => {
+      const fail = (err: unknown, note: string): null => {
+        partial.push(stage.name);
+        logEvent('warn', 'session.extract', note, {
+          stage: stage.name,
+          error: err instanceof Error ? err.message : String(err),
+          retryable: isRetryable(err),
+        });
+        return null;
+      };
+
+      const runWhole = async (): Promise<Partial<SessionNote> | null> => {
+        const body = stage.name === 'narrative' ? prepared.narrative : prepared.full;
+        try {
+          return await callStage(stage, stage.prompt(promptCtx), `Transcript:\n\n${body}`);
+        } catch (err) {
+          // A stage that never chunks can still be too big for the model or the
+          // account's per-minute budget. Losing the entire narrative pass over
+          // that is far worse than the accuracy cost of chunking it, so degrade
+          // rather than drop — and say so, since the note is now weaker.
+          if ((err instanceof RequestTooLargeError || err instanceof RateLimitError) && chunkPlan.length) {
+            logEvent('warn', 'session.extract', 'whole-transcript call too large — falling back to chunks', {
+              stage: stage.name,
+              chunks: chunkPlan.length,
+            });
+            partial.push(`${stage.name}:chunked-fallback`);
+            return runChunked();
+          }
+          return fail(err, 'stage failed — note will be partial');
+        }
+      };
+
+      const runChunked = async (): Promise<Partial<SessionNote> | null> => {
+      const settled = await pooled(chunkPlan, llmConfig.chunkConcurrency, (chunk) =>
+        callStage(
+          stage,
+          stage.prompt({ ...promptCtx, chunk: chunkLabel(chunk) }),
+          `Transcript:\n\n${renderTurns(chunk.turns)}`,
+        ),
+      );
+
+      const ok: ChunkResult[] = [];
+      settled.forEach((r, i) => {
+        if (r.status === 'fulfilled') ok.push({ index: chunkPlan[i].index, note: r.value });
+        else gaps.push({ from: chunkPlan[i].startSeconds, to: chunkPlan[i].endSeconds });
+      });
+
+      // A minority of failed chunks still yields a usable note covering the rest
+      // of the session — labelled, so Nicole knows which minutes are missing. A
+      // majority failing means we learned nothing, and pretending otherwise
+      // would hide a broken extraction behind a plausible-looking draft.
+      if (ok.length === 0 || ok.length * 2 < chunkPlan.length) {
+        partial.push(stage.name);
+        logEvent('warn', 'session.extract', 'too many chunks failed — stage dropped', {
+          stage: stage.name,
+          ok: ok.length,
+          total: chunkPlan.length,
+        });
+        return null;
+      }
+      if (ok.length < chunkPlan.length) partial.push(`${stage.name}:partial`);
+
+      const merged = mergeChunkNotes(ok);
+      conflicts.push(...merged.conflicts);
+      return merged.note;
+      };
+
+      return shouldChunk && stage.chunked ? runChunked() : runWhole();
+    }),
+  );
+
+  const note = mergeStages(stageResults.filter((s): s is Partial<SessionNote> => s !== null));
+
+  // Provenance is only worth anything if it's checked: a quote that isn't in the
+  // transcript is a fabricated finding, and that is mechanically detectable
+  // without a human. Flag, never drop — a real finding with a paraphrased quote
+  // must not vanish.
+  const evidence = verifyEvidence(note.evidence ?? [], transcript);
+  const unverified = evidence.filter((e) => e.unverified).length;
+
+  const parsed = SessionNoteSchema.parse({
+    ...note,
+    evidence,
+    extraction: {
+      prompt_version: PROMPT_VERSION,
+      provider: llmConfig.provider,
+      model: modelName(),
+      partial: partial.length ? partial : undefined,
+      conflicts: conflicts.length ? conflicts : undefined,
+      gaps: gaps.length ? gaps : undefined,
+      attribution_coverage: prepared.attributionCoverage,
+      chunks: chunks.length || null,
+    },
+  });
+
+  logEvent('info', 'session.extract', 'extraction complete', {
+    tokens: prepared.tokens,
+    chunks: chunks.length,
+    partial,
+    conflicts: conflicts.length,
+    evidence: evidence.length,
+    unverified,
+    attribution_coverage: Number(prepared.attributionCoverage.toFixed(3)),
+  });
+
+  return applyCatalog(parsed, ctx.catalog);
 }
+
+function modelName(): string {
+  switch (llmConfig.provider) {
+    case 'anthropic':
+      return llmConfig.anthropic.model;
+    case 'google':
+      return llmConfig.google.model;
+    case 'groq':
+      return llmConfig.groq.model;
+    default:
+      return llmConfig.provider;
+  }
+}
+
+/**
+ * Suggest a catalog product for each supplement whose spoken name nearly matches
+ * one. An exact normalized hit is applied (it IS the same product under
+ * different punctuation); anything less is only recorded as a suggestion for
+ * Nicole to confirm, because forcing a near-match would rewrite a client's plan
+ * to a product nobody prescribed.
+ */
+function applyCatalog(note: SessionNote, catalog: readonly string[] | undefined): SessionNote {
+  if (!catalog?.length || !note.supplements.length) return note;
+  return {
+    ...note,
+    supplements: note.supplements.map((s) => {
+      if (!s.name) return s;
+      const hit = matchCatalog(s.name, catalog);
+      if (!hit) return s;
+      if (hit.score === 1) return { ...s, name: hit.name };
+      return { ...s, name_matched_to: hit.name };
+    }),
+  };
+}
+
+export type { Evidence };
