@@ -7,6 +7,18 @@ import type { TaskItem } from '../db/interfaces/types.js';
 
 export type TaskStatus = 'open' | 'done' | 'dismissed';
 
+/**
+ * Sort sentinel for tasks with no due date. Firestore excludes documents that are
+ * MISSING an orderBy field from the result entirely, and `0015_tasks.sql` calls a
+ * null due_date a legitimate, common value ("keep an eye on her sleep"). Writing
+ * a far-future sentinel keeps those tasks in the result and sorts them last,
+ * reproducing `ORDER BY due_date ASC NULLS LAST`.
+ */
+const DUE_SORT_NEVER = '9999-12-31';
+
+const randomTaskId = (kind: 'session' | 'manual'): string =>
+  `task_${kind}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
 export interface TaskRow {
   id: string;
   client_id: string;
@@ -33,27 +45,26 @@ export async function createTasksFromNote(
 
   for (const f of followUps) {
     const title = f.text;
-    const apptId = args.appointmentId || 'unbound';
-    const id = taskDocId(apptId, title);
     const dueDate = dueDateFrom(args.sessionDate, f.dueInDays);
+    // Appointment-bound tasks get a deterministic id so a replayed approval
+    // collides instead of duplicating. Tasks with no appointment carry no
+    // uniqueness — same as the partial Postgres index — so they get a fresh id.
+    const id = taskDocId(args.appointmentId, title) ?? randomTaskId('session');
 
-    const existing = await db.tasks.findById(id);
-    if (!existing) {
-      await db.tasks.save({
-        id,
-        client_id: args.clientId,
-        client_name: client?.name || null,
-        appointment_id: args.appointmentId ?? null,
-        title,
-        due_date: dueDate ?? null,
-        due_sort: dueDate ?? '9999-12-31',
-        status: 'open',
-        source: 'session',
-        created_at: new Date().toISOString(),
-        completed_at: null,
-      });
-      created++;
-    }
+    const landed = await db.tasks.create({
+      id,
+      client_id: args.clientId,
+      client_name: client?.name || null,
+      appointment_id: args.appointmentId ?? null,
+      title,
+      due_date: dueDate ?? null,
+      due_sort: dueDate ?? DUE_SORT_NEVER,
+      status: 'open',
+      source: 'session',
+      created_at: new Date().toISOString(),
+      completed_at: null,
+    });
+    if (landed) created++;
   }
   return { created };
 }
@@ -90,15 +101,15 @@ export async function reconcileTasksAfterAmend(
 export async function listOpenTasks(clientId?: string): Promise<TaskRow[]> {
   const db = getDatabase();
   const tasks = clientId ? await db.tasks.listByClient(clientId) : await db.tasks.listOpen();
-  const clients = await db.clients.listAll();
-  const clientMap = new Map(clients.map((c) => [c.id, c.name]));
 
+  // client_name is denormalized onto the task at write time, so this no longer
+  // reads the whole clients collection to build a lookup map.
   const openTasks = tasks
     .filter((t) => t.status === 'open')
     .map((t) => ({
       id: t.id,
       client_id: t.client_id,
-      client_name: t.client_name || clientMap.get(t.client_id) || null,
+      client_name: t.client_name ?? null,
       appointment_id: t.appointment_id || null,
       title: t.title,
       due_date: t.due_date || null,
@@ -130,11 +141,10 @@ export async function setTaskStatus(id: string, status: TaskStatus): Promise<Tas
   };
   await db.tasks.save(updated);
 
-  const client = task.client_id ? await db.clients.findById(task.client_id) : null;
   const row: TaskRow = {
     id: updated.id,
     client_id: updated.client_id,
-    client_name: updated.client_name || client?.name || null,
+    client_name: updated.client_name ?? null,
     appointment_id: updated.appointment_id || null,
     title: updated.title,
     due_date: updated.due_date || null,
@@ -162,7 +172,7 @@ export async function createManualTask(args: {
   dueDate: string | null;
 }): Promise<TaskRow> {
   const db = getDatabase();
-  const id = `task_manual_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const id = randomTaskId('manual');
   const client = await db.clients.findById(args.clientId);
 
   const taskItem: TaskItem = {
@@ -172,7 +182,7 @@ export async function createManualTask(args: {
     appointment_id: null,
     title: args.title,
     due_date: args.dueDate || null,
-    due_sort: args.dueDate || '9999-12-31',
+    due_sort: args.dueDate || DUE_SORT_NEVER,
     status: 'open',
     source: 'manual',
     created_at: new Date().toISOString(),

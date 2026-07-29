@@ -37,6 +37,44 @@ import type {
   IDatabase,
 } from '../../interfaces/repositories.js';
 
+/**
+ * Lower bound for the overlap scan in findOverlapping. No session runs longer
+ * than this, so an appointment starting earlier cannot still be running when the
+ * candidate window opens. Generous on purpose: too large only costs a few extra
+ * document reads, too small would miss a genuine conflict and double-book Nicole.
+ */
+const MAX_APPOINTMENT_HOURS = 24;
+
+/**
+ * Delete every document in the given collections.
+ *
+ * Chunked at 500 writes because that is Firestore's hard per-batch limit (§3.7) —
+ * an unchunked batch silently works in tests and throws on a real dataset.
+ *
+ * Every repository that owns more than one collection must pass ALL of them. An
+ * incomplete clearAll() is worse than none: fixtures survive into the next test
+ * and produce failures that look like logic bugs.
+ */
+const BATCH_LIMIT = 500;
+
+async function deleteAllDocs(
+  collections: admin.firestore.CollectionReference[],
+): Promise<void> {
+  const firestore = getFirestoreInstance();
+  for (const collection of collections) {
+    // Re-query each pass: deleting shrinks the collection, so a single snapshot
+    // taken up front would go stale on anything larger than one chunk.
+    for (;;) {
+      const snap = await collection.limit(BATCH_LIMIT).get();
+      if (snap.empty) break;
+      const batch = firestore.batch();
+      snap.docs.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+      if (snap.size < BATCH_LIMIT) break;
+    }
+  }
+}
+
 function getFirestoreInstance(): admin.firestore.Firestore {
   if (admin.apps.length === 0) {
     admin.initializeApp();
@@ -70,10 +108,7 @@ export class FirestoreClientsRepository implements IClientsRepository {
     await this.db.doc(id).delete();
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db]);
   }
 }
 
@@ -87,7 +122,12 @@ export class FirestoreAppointmentsRepository implements IAppointmentsRepository 
     return doc.exists ? (doc.data() as Appointment) : null;
   }
   async listByClient(clientId: string): Promise<Appointment[]> {
-    const snap = await this.db.where('client_id', '==', clientId).get();
+    // Chronological — every caller wants a client's visits in order. Uses the
+    // declared (client_id, starts_at) composite index.
+    const snap = await this.db
+      .where('client_id', '==', clientId)
+      .orderBy('starts_at', 'asc')
+      .get();
     return snap.docs.map((doc) => doc.data() as Appointment);
   }
   async listAll(): Promise<Appointment[]> {
@@ -95,8 +135,21 @@ export class FirestoreAppointmentsRepository implements IAppointmentsRepository 
     return snap.docs.map((doc) => doc.data() as Appointment);
   }
   async findOverlapping(startsAt: string, endsAt: string): Promise<Appointment[]> {
-    // Range query on starts_at indexed field
-    const snap = await this.db.where('starts_at', '<', endsAt).get();
+    // Overlap is `starts_at < endsAt AND ends_at > startsAt`, but Firestore
+    // cannot range-filter two different fields in one query. So we range on
+    // starts_at only and bound it BELOW as well — an appointment that ends after
+    // `startsAt` cannot have begun more than MAX_APPOINTMENT_HOURS before it.
+    // Without that lower bound this reads every appointment ever recorded and
+    // filters in JS, which grows without limit and bills per document.
+    const lowerBound = new Date(
+      new Date(startsAt).getTime() - MAX_APPOINTMENT_HOURS * 3_600_000,
+    ).toISOString();
+
+    const snap = await this.db
+      .where('starts_at', '>=', lowerBound)
+      .where('starts_at', '<', endsAt)
+      .get();
+
     const end = new Date(endsAt).getTime();
     const start = new Date(startsAt).getTime();
 
@@ -116,10 +169,7 @@ export class FirestoreAppointmentsRepository implements IAppointmentsRepository 
     await this.db.doc(id).delete();
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db]);
   }
 }
 
@@ -164,10 +214,7 @@ export class FirestoreConversationsRepository implements IConversationsRepositor
     await this.db.doc(id).delete();
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db, this.claimsDb]);
   }
 }
 
@@ -277,10 +324,7 @@ export class FirestoreSessionNotesRepository implements ISessionNotesRepository 
     return snap.docs.map((doc) => doc.data() as NoteRevision);
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db, this.sheetsDb, this.protocolsDb, this.approvalsDb, this.revisionsDb]);
   }
 }
 
@@ -345,10 +389,7 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
     await this.qboDb.doc(clientId).delete();
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db, this.reconciliationsDb, this.qboDb]);
   }
 }
 
@@ -400,10 +441,7 @@ export class FirestoreRefillsRepository implements IRefillsRepository {
     return snap.docs.map((doc) => doc.data() as RefillOrder);
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db, this.supplementsDb, this.ordersDb]);
   }
 }
 
@@ -441,10 +479,7 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
     return snap.docs.map((doc) => doc.data() as LeadActivity);
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db, this.activitiesDb]);
   }
 }
 
@@ -462,7 +497,13 @@ export class FirestoreTasksRepository implements ITasksRepository {
     return snap.docs.map((doc) => doc.data() as TaskItem);
   }
   async listOpen(): Promise<TaskItem[]> {
-    const snap = await this.db.where('status', '==', 'open').get();
+    // Ordered by the due_sort sentinel so "no due date" sorts last instead of
+    // being dropped from the result — see DUE_SORT_NEVER in tasks/service.ts.
+    // Uses the declared (status, due_sort) composite index.
+    const snap = await this.db
+      .where('status', '==', 'open')
+      .orderBy('due_sort', 'asc')
+      .get();
     return snap.docs.map((doc) => doc.data() as TaskItem);
   }
   async listAll(): Promise<TaskItem[]> {
@@ -473,14 +514,22 @@ export class FirestoreTasksRepository implements ITasksRepository {
     await this.db.doc(task.id).set(task, { merge: true });
     return task;
   }
+  async create(task: TaskItem): Promise<boolean> {
+    try {
+      await this.db.doc(task.id).create(task);
+      return true;
+    } catch (err) {
+      // ALREADY_EXISTS (code 6) is the expected outcome of a replayed approval,
+      // not an error. Anything else is real and must not be swallowed.
+      if ((err as { code?: number }).code === 6) return false;
+      throw err;
+    }
+  }
   async delete(id: string): Promise<void> {
     await this.db.doc(id).delete();
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db]);
   }
 }
 
@@ -498,10 +547,7 @@ export class FirestoreDocumentsRepository implements IDocumentsRepository {
     return snap.docs.map((d) => d.data() as DocumentRecord);
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db]);
   }
 }
 
@@ -519,10 +565,7 @@ export class FirestoreConsentsRepository implements IConsentsRepository {
     return doc.exists ? (doc.data() as Consent) : null;
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db]);
   }
 }
 
@@ -532,7 +575,10 @@ export class FirestoreAuditRepository implements IAuditRepository {
   }
 
   async log(event: AuditLog): Promise<AuditLog> {
-    await this.db.doc(event.id).set(event, { merge: true });
+    // APPEND-ONLY by contract (migrations/0024_audit_log.sql): "an audit you can
+    // rewrite isn't one." create() enforces that at the datastore — a merge would
+    // let a later write silently rewrite history under a colliding id.
+    await this.db.doc(event.id).create(event);
     return event;
   }
   async listForEntity(entityType: string, entityId: string, limit = 100): Promise<AuditLog[]> {
@@ -553,10 +599,7 @@ export class FirestoreAuditRepository implements IAuditRepository {
     return snap.docs.map((doc) => doc.data() as AuditLog);
   }
   async clearAll(): Promise<void> {
-    const snap = await this.db.get();
-    const batch = getFirestoreInstance().batch();
-    snap.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
+    await deleteAllDocs([this.db]);
   }
 }
 

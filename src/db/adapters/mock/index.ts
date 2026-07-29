@@ -70,7 +70,10 @@ export class MockAppointmentsRepository implements IAppointmentsRepository {
     return this.appointments.get(id) ?? null;
   }
   async listByClient(clientId: string): Promise<Appointment[]> {
-    return Array.from(this.appointments.values()).filter((a) => a.client_id === clientId);
+    // Mirrors the Firestore query's orderBy('starts_at').
+    return Array.from(this.appointments.values())
+      .filter((a) => a.client_id === clientId)
+      .sort((a, b) => a.starts_at.localeCompare(b.starts_at));
   }
   async listAll(): Promise<Appointment[]> {
     return Array.from(this.appointments.values());
@@ -357,7 +360,12 @@ export class MockTasksRepository implements ITasksRepository {
     return Array.from(this.tasks.values()).filter((t) => t.client_id === clientId);
   }
   async listOpen(): Promise<TaskItem[]> {
-    return Array.from(this.tasks.values()).filter((t) => t.status === 'open');
+    // Mirrors the Firestore query: ordered by due_sort, and documents MISSING
+    // due_sort are excluded exactly as Firestore's orderBy would exclude them —
+    // otherwise the mock would hide that class of bug from the suite.
+    return Array.from(this.tasks.values())
+      .filter((t) => t.status === 'open' && t.due_sort !== undefined)
+      .sort((a, b) => (a.due_sort ?? '').localeCompare(b.due_sort ?? ''));
   }
   async listAll(): Promise<TaskItem[]> {
     return Array.from(this.tasks.values());
@@ -365,6 +373,13 @@ export class MockTasksRepository implements ITasksRepository {
   async save(task: TaskItem): Promise<TaskItem> {
     this.tasks.set(task.id, task);
     return task;
+  }
+  async create(task: TaskItem): Promise<boolean> {
+    // Must mirror Firestore's create(): insert-if-absent, report whether it
+    // landed. A mock that merged instead would hide replay bugs from the suite.
+    if (this.tasks.has(task.id)) return false;
+    this.tasks.set(task.id, task);
+    return true;
   }
   async delete(id: string): Promise<void> {
     this.tasks.delete(id);
@@ -411,6 +426,11 @@ export class MockAuditRepository implements IAuditRepository {
   private logs: AuditLog[] = [];
 
   async log(event: AuditLog): Promise<AuditLog> {
+    // Mirrors Firestore's create(): append-only, so a colliding id is an error
+    // rather than a silent overwrite of existing history.
+    if (this.logs.some((l) => l.id === event.id)) {
+      throw Object.assign(new Error('ALREADY_EXISTS'), { code: 6 });
+    }
     this.logs.push(event);
     return event;
   }

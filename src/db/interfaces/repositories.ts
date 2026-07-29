@@ -125,6 +125,13 @@ export interface ITasksRepository {
   listOpen(): Promise<TaskItem[]>;
   listAll(): Promise<TaskItem[]>;
   save(task: TaskItem): Promise<TaskItem>;
+  /**
+   * Insert-if-absent. Returns false when the document already exists, which is
+   * how a replayed approval reports "created 0" without a read-then-write race.
+   * This is the `ON CONFLICT … DO NOTHING` equivalent — never a merge, because a
+   * merge would silently reset an already-completed task back to open.
+   */
+  create(task: TaskItem): Promise<boolean>;
   delete(id: string): Promise<void>;
   clearAll(): Promise<void>;
 }
