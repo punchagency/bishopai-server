@@ -2,12 +2,15 @@ import type {
   Client,
   Appointment,
   Conversation,
+  ExtractionStatus,
   AppointmentClaim,
   SessionNoteRecord,
   AppointmentSheet,
   SupplementProtocol,
+  DocStatus,
   Approval,
   NoteRevision,
+  NoteTable,
   Checkout,
   CheckoutStatus,
   PaymentReconciliation,
@@ -36,7 +39,12 @@ import type {
   IStateRepository,
   IAuditRepository,
   IDatabase,
+  SessionDocs,
+  GuardedSessionWrite,
+  GuardedSessionResult,
 } from '../../interfaces/repositories.js';
+import { noteRevisionDocId, supplementDocId } from '../../ids.js';
+import { combineStatus } from '../../sessionStatus.js';
 
 export class MockClientsRepository implements IClientsRepository {
   private clients = new Map<string, Client>();
@@ -80,6 +88,22 @@ export class MockAppointmentsRepository implements IAppointmentsRepository {
   async listAll(): Promise<Appointment[]> {
     return Array.from(this.appointments.values());
   }
+  async listRecent(limit: number): Promise<Appointment[]> {
+    return Array.from(this.appointments.values())
+      .sort((a, b) => b.starts_at.localeCompare(a.starts_at))
+      .slice(0, limit);
+  }
+  async listBetween(fromIso: string, toIso: string): Promise<Appointment[]> {
+    return Array.from(this.appointments.values())
+      .filter((a) => a.starts_at >= fromIso && a.starts_at < toIso)
+      .sort((a, b) => a.starts_at.localeCompare(b.starts_at));
+  }
+  async findByPbId(pbId: string): Promise<Appointment | null> {
+    for (const a of this.appointments.values()) {
+      if (a.pb_id === pbId) return a;
+    }
+    return null;
+  }
   async findOverlapping(startsAt: string, endsAt: string): Promise<Appointment[]> {
     const start = new Date(startsAt).getTime();
     const end = new Date(endsAt).getTime();
@@ -115,7 +139,9 @@ export class MockConversationsRepository implements IConversationsRepository {
     return null;
   }
   async listUnmatched(): Promise<Conversation[]> {
-    return Array.from(this.conversations.values()).filter((c) => c.status === 'unmatched');
+    return Array.from(this.conversations.values())
+      .filter((c) => c.correlation_status === 'unmatched')
+      .sort((a, b) => b.starts_at.localeCompare(a.starts_at));
   }
   async listAll(): Promise<Conversation[]> {
     return Array.from(this.conversations.values());
@@ -124,10 +150,88 @@ export class MockConversationsRepository implements IConversationsRepository {
     this.conversations.set(conversation.id, conversation);
     return conversation;
   }
+
+  async upsertByBeeId(
+    conversation: Conversation,
+  ): Promise<{ conversation: Conversation; created: boolean }> {
+    const stored = this.conversations.get(conversation.id);
+    if (!stored) {
+      this.conversations.set(conversation.id, conversation);
+      return { conversation, created: true };
+    }
+    if (stored.transcript || !conversation.transcript) {
+      return { conversation: stored, created: false };
+    }
+    const merged: Conversation = {
+      ...stored,
+      transcript: conversation.transcript,
+      updated_at: new Date().toISOString(),
+    };
+    this.conversations.set(merged.id, merged);
+    return { conversation: merged, created: false };
+  }
+
+  async transitionExtraction(
+    id: string,
+    from: ExtractionStatus[],
+    patch: Partial<Conversation>,
+    guard?: (row: Conversation) => boolean,
+  ): Promise<Conversation | null> {
+    const row = this.conversations.get(id);
+    if (!row) return null;
+    if (!from.includes(row.extraction_status)) return null;
+    if (guard && !guard(row)) return null;
+    const next: Conversation = { ...row, ...patch, updated_at: new Date().toISOString() };
+    this.conversations.set(id, next);
+    return next;
+  }
+
+  async listStuckExtractions(leaseCutoff: string): Promise<Conversation[]> {
+    return Array.from(this.conversations.values()).filter(
+      (c) =>
+        c.extraction_status === 'processing' &&
+        // Matches the Firestore range filter, which EXCLUDES documents missing
+        // the field (§3.5) — a mock that treated a missing lease as stuck would
+        // hide exactly the bug the emulator catches.
+        !!c.extraction_leased_at &&
+        c.extraction_leased_at < leaseCutoff,
+    );
+  }
+
+  async listExhaustedExtractions(maxAttempts: number): Promise<Conversation[]> {
+    return Array.from(this.conversations.values()).filter(
+      (c) => c.extraction_status === 'failed' && (c.extraction_attempts ?? 0) >= maxAttempts,
+    );
+  }
+
+  async listDueExtractions(
+    now: string,
+    maxAttempts: number,
+    limit: number,
+  ): Promise<Conversation[]> {
+    return Array.from(this.conversations.values())
+      .filter(
+        (c) =>
+          c.extraction_status === 'failed' &&
+          !!c.extraction_next_attempt_at &&
+          c.extraction_next_attempt_at <= now &&
+          (c.extraction_attempts ?? 0) < maxAttempts &&
+          !!c.appointment_id &&
+          !!c.transcript,
+      )
+      .sort((a, b) =>
+        (a.extraction_next_attempt_at ?? '').localeCompare(b.extraction_next_attempt_at ?? ''),
+      )
+      .slice(0, limit);
+  }
+
   async claimAppointment(claim: AppointmentClaim): Promise<boolean> {
     if (this.claims.has(claim.id)) return false;
     this.claims.set(claim.id, claim);
     return true;
+  }
+  async releaseAppointment(appointmentId: string): Promise<void> {
+    this.claims.delete(appointmentId);
   }
   async delete(id: string): Promise<void> {
     this.conversations.delete(id);
@@ -201,15 +305,200 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
     return approval;
   }
   async listApprovals(appointmentId: string): Promise<Approval[]> {
-    return this.approvals.filter((a) => a.appointment_id === appointmentId);
+    return this.approvals
+      .filter((a) => a.appointment_id === appointmentId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
   }
-  async saveRevision(revision: NoteRevision): Promise<NoteRevision> {
-    this.revisions.push(revision);
-    return revision;
+  async listRevisions(sourceTable: NoteTable, sourceId: string): Promise<NoteRevision[]> {
+    return this.revisions
+      .filter((r) => r.source_table === sourceTable && r.source_id === sourceId)
+      .sort((a, b) => b.revision - a.revision);
   }
-  async listRevisions(appointmentId: string): Promise<NoteRevision[]> {
-    return this.revisions.filter((r) => r.appointment_id === appointmentId);
+
+  async findSessionDocs(appointmentId: string): Promise<SessionDocs> {
+    return {
+      sheet: this.sheets.get(appointmentId) ?? null,
+      protocol: this.protocols.get(appointmentId) ?? null,
+    };
   }
+
+  async findManySessionDocs(appointmentIds: string[]): Promise<Map<string, SessionDocs>> {
+    const out = new Map<string, SessionDocs>();
+    for (const id of appointmentIds) {
+      out.set(id, {
+        sheet: this.sheets.get(id) ?? null,
+        protocol: this.protocols.get(id) ?? null,
+      });
+    }
+    return out;
+  }
+
+  async guardedWrite(args: GuardedSessionWrite): Promise<GuardedSessionResult> {
+    const before: SessionDocs = {
+      sheet: this.sheets.get(args.appointmentId) ?? null,
+      protocol: this.protocols.get(args.appointmentId) ?? null,
+    };
+    if (!before.sheet && !before.protocol) {
+      return { ok: false, reason: 'not_found', before };
+    }
+    const current = combineStatus(before.sheet?.status ?? null, before.protocol?.status ?? null);
+    if (!args.expect.includes(current)) {
+      return { ok: false, reason: 'wrong_status', before };
+    }
+
+    const now = new Date().toISOString();
+    const revision = before.sheet?.revision ?? before.protocol?.revision ?? 1;
+
+    if (args.snapshotRevision) {
+      for (const [table, doc] of [
+        ['appointment_sheets', before.sheet],
+        ['protocols', before.protocol],
+      ] as const) {
+        if (!doc) continue;
+        const id = noteRevisionDocId(table, doc.id, revision);
+        // create() semantics: a replayed amendment must not re-file the version
+        // it already filed.
+        if (this.revisions.some((r) => r.id === id)) continue;
+        this.revisions.push({
+          id,
+          source_table: table,
+          source_id: doc.id,
+          appointment_id: args.appointmentId,
+          revision,
+          content_json: doc.content_json,
+          reason: args.snapshotRevision.reason,
+          created_at: now,
+        });
+      }
+    }
+
+    for (const [map, doc] of [
+      [this.sheets, before.sheet],
+      [this.protocols, before.protocol],
+    ] as const) {
+      if (!doc) continue;
+      (map as Map<string, typeof doc>).set(doc.id, {
+        ...doc,
+        ...(args.content !== undefined ? { content_json: args.content } : {}),
+        ...(args.status !== undefined ? { status: args.status } : {}),
+        ...(args.snapshotRevision ? { revision: revision + 1 } : {}),
+        updated_at: now,
+      });
+    }
+    if (args.approval) this.approvals.push(args.approval);
+
+    return { ok: true, before, revision };
+  }
+
+  async listProtocolsByClient(
+    clientId: string,
+    opts: { status?: DocStatus; limit?: number } = {},
+  ): Promise<SupplementProtocol[]> {
+    const rows = Array.from(this.protocols.values())
+      .filter((p) => p.client_id === clientId)
+      .filter((p) => (opts.status ? p.status === opts.status : true))
+      // Mirrors the Firestore orderBy, which EXCLUDES documents missing the
+      // field rather than sorting them first.
+      .filter((p) => p.starts_at != null)
+      .sort((a, b) => (a.starts_at ?? '').localeCompare(b.starts_at ?? ''));
+    return opts.limit ? rows.slice(0, opts.limit) : rows;
+  }
+
+  async findPriorApproved(
+    kind: 'sheet' | 'protocol',
+    clientId: string,
+    opts: { excludeAppointmentId: string | null; before: string | null },
+  ): Promise<AppointmentSheet | SupplementProtocol | null> {
+    const source: Array<AppointmentSheet | SupplementProtocol> =
+      kind === 'sheet' ? [...this.sheets.values()] : [...this.protocols.values()];
+    return (
+      source
+        .filter((r) => r.client_id === clientId && r.status === 'approved')
+        .filter((r) => r.starts_at != null)
+        .filter((r) => (opts.before ? (r.starts_at ?? '') < opts.before : true))
+        .filter((r) => r.appointment_id !== opts.excludeAppointmentId)
+        .sort((a, b) => (b.starts_at ?? '').localeCompare(a.starts_at ?? ''))[0] ?? null
+    );
+  }
+
+  async listApprovedHistory(
+    clientId: string,
+    opts: { excludeAppointmentId: string | null; before: string | null; limit: number },
+  ): Promise<{ total: number; sessions: Array<{ starts_at: string | null; content_json: unknown }> }> {
+    const eligible = (rows: Array<AppointmentSheet | SupplementProtocol>) =>
+      rows
+        .filter((r) => r.client_id === clientId && r.status === 'approved')
+        .filter((r) => r.starts_at != null)
+        .filter((r) => (opts.before ? (r.starts_at ?? '') < opts.before : true));
+
+    const sheets = eligible([...this.sheets.values()]);
+    const protocols = eligible([...this.protocols.values()]);
+
+    const byAppointment = new Map<string, { starts_at: string | null; content_json: unknown }>();
+    for (const r of sheets) {
+      byAppointment.set(r.appointment_id, { starts_at: r.starts_at ?? null, content_json: r.content_json });
+    }
+    for (const r of protocols) {
+      if (byAppointment.has(r.appointment_id)) continue; // the sheet wins
+      byAppointment.set(r.appointment_id, { starts_at: r.starts_at ?? null, content_json: r.content_json });
+    }
+    if (opts.excludeAppointmentId) byAppointment.delete(opts.excludeAppointmentId);
+
+    const counted = Math.max(sheets.length, protocols.length);
+    const total = opts.excludeAppointmentId ? Math.max(0, counted - 1) : counted;
+    const sessions = [...byAppointment.values()]
+      .sort((a, b) => (b.starts_at ?? '').localeCompare(a.starts_at ?? ''))
+      .slice(0, opts.limit);
+    return { total, sessions };
+  }
+
+  async saveExtractedNote(args: {
+    appointmentId: string;
+    clientId: string | null;
+    startsAt: string | null;
+    clientName: string | null;
+    content: Record<string, unknown>;
+  }): Promise<{ written: boolean }> {
+    const sheet = this.sheets.get(args.appointmentId) ?? null;
+    const protocol = this.protocols.get(args.appointmentId) ?? null;
+    if (sheet?.status === 'approved' || protocol?.status === 'approved') {
+      return { written: false };
+    }
+    const now = new Date().toISOString();
+    this.sheets.set(args.appointmentId, {
+      id: args.appointmentId,
+      appointment_id: args.appointmentId,
+      client_id: args.clientId,
+      starts_at: args.startsAt,
+      client_name: args.clientName,
+      content_json: args.content,
+      status: 'draft',
+      revision: sheet?.revision ?? 1,
+      created_at: sheet?.created_at ?? now,
+      updated_at: now,
+    });
+    if (args.clientId) {
+      this.protocols.set(args.appointmentId, {
+        id: args.appointmentId,
+        appointment_id: args.appointmentId,
+        client_id: args.clientId,
+        starts_at: args.startsAt,
+        client_name: args.clientName,
+        content_json: args.content,
+        status: 'draft',
+        revision: protocol?.revision ?? 1,
+        created_at: protocol?.created_at ?? now,
+        updated_at: now,
+      });
+    }
+    return { written: true };
+  }
+
+  async deleteSessionDocs(appointmentId: string): Promise<void> {
+    this.sheets.delete(appointmentId);
+    this.protocols.delete(appointmentId);
+  }
+
   async clearAll(): Promise<void> {
     this.notes.clear();
     this.sheets.clear();
@@ -416,6 +705,12 @@ export class MockRefillsRepository implements IRefillsRepository {
     this.supplements.set(supp.id, supp);
     return supp;
   }
+  async findSupplement(clientId: string, nameKey: string): Promise<Supplement | null> {
+    return this.supplements.get(supplementDocId(clientId, nameKey)) ?? null;
+  }
+  async deleteSupplement(clientId: string, nameKey: string): Promise<boolean> {
+    return this.supplements.delete(supplementDocId(clientId, nameKey));
+  }
   async listSupplementsByClient(clientId: string): Promise<Supplement[]> {
     return Array.from(this.supplements.values()).filter((s) => s.client_id === clientId);
   }
@@ -512,6 +807,12 @@ export class MockTasksRepository implements ITasksRepository {
 export class MockDocumentsRepository implements IDocumentsRepository {
   private docs = new Map<string, DocumentRecord>();
 
+  async listByClient(clientId: string, limit = 100): Promise<DocumentRecord[]> {
+    return Array.from(this.docs.values())
+      .filter((d) => d.client_id === clientId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, limit);
+  }
   async save(doc: DocumentRecord): Promise<DocumentRecord> {
     this.docs.set(doc.id, doc);
     return doc;

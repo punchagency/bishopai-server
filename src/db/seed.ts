@@ -210,7 +210,7 @@ async function main(): Promise<void> {
   if (david.rowCount) {
     const d = david.rows[0];
     await pool.query(`UPDATE appointment_sheets SET status = 'approved' WHERE id = $1`, [d.sheet_id]);
-    await createTasksFromNote(pool, {
+    await createTasksFromNote({
       clientId: d.client_id,
       appointmentId: d.appointment_id,
       sessionDate: new Date(d.starts_at),

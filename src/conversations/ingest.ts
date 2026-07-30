@@ -1,4 +1,6 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
+import { conversationDocId } from '../db/ids.js';
+import type { Conversation } from '../db/interfaces/types.js';
 import { correlateConversation, type CorrelationResult } from '../correlation/correlate';
 
 export interface ConversationInput {
@@ -20,71 +22,76 @@ export interface IngestResult {
  * or reconnect can't duplicate a conversation.
  */
 export async function ingestConversation(input: ConversationInput): Promise<IngestResult> {
-  return ingestOnce(input, true);
-}
+  const db = getDatabase();
+  const id = conversationDocId(input.bee_id);
+  const now = new Date().toISOString();
 
-async function ingestOnce(input: ConversationInput, retryOnTaken: boolean): Promise<IngestResult> {
-  const db = await pool.connect();
-  try {
-    await db.query('BEGIN');
+  const correlation = await correlateConversation(input.starts_at, input.ends_at);
 
-    const correlation = await correlateConversation(db, input.starts_at, input.ends_at);
-    const matched = correlation.status === 'matched';
-
-    const ins = await db.query<{
-      id: string;
-      appointment_id: string | null;
-      client_id: string | null;
-    }>(
-      `INSERT INTO conversations
-              (bee_id, starts_at, ends_at, transcript, appointment_id, client_id, correlation_status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (bee_id) DO UPDATE
-            SET transcript = COALESCE(EXCLUDED.transcript, conversations.transcript)
-         RETURNING id, appointment_id, client_id`,
-      [
-        input.bee_id,
-        input.starts_at,
-        input.ends_at,
-        input.transcript ?? null,
-        matched ? correlation.appointmentId : null,
-        matched ? correlation.clientId : null,
-        matched ? 'matched' : 'unmatched',
-      ],
-    );
-
-    await db.query('COMMIT');
-
-    // Report the STORED row's state, not the fresh computation. On a replay the
-    // conflict update keeps the existing assignment (possibly manual), so the
-    // fresh correlation can disagree with reality in both directions — and the
-    // caller uses this result to decide whether to fire extraction. A replayed
-    // transcript for a matched conversation must trigger it; a recomputed
-    // "match" for a row a human left unmatched must not.
-    const row = ins.rows[0];
-    const effective: CorrelationResult = row.appointment_id
-      ? { status: 'matched', appointmentId: row.appointment_id, clientId: row.client_id }
-      : correlation.status === 'unmatched'
-        ? correlation
-        : { status: 'unmatched', reason: 'ambiguous', candidateCount: 1 };
-    return { conversationId: row.id, correlation: effective };
-  } catch (err) {
-    await db.query('ROLLBACK');
-    // Two overlapping recordings ingested concurrently can both correlate to the
-    // same appointment; the unique index rejects the loser. Re-run once — the
-    // second pass sees the appointment as taken and lands unmatched, which is
-    // where a competing chunk belongs anyway.
-    if (retryOnTaken && isUniqueViolation(err, 'conversations_appointment_unique')) {
-      // finally releases this client; the retry checks out its own.
-      return ingestOnce(input, false);
-    }
-    throw err;
-  } finally {
-    db.release();
+  // Claim the appointment BEFORE writing the conversation that points at it.
+  //
+  // This replaces `conversations_appointment_unique` (0022). Two overlapping
+  // recordings ingested concurrently can both correlate to the same appointment;
+  // in Postgres the unique index rejected the loser and ingest retried, landing
+  // it unmatched. Here the claim document does the rejecting, and doing it first
+  // means a conversation is never written matched to an appointment it lost —
+  // there is no window in which the pointer exists and the claim doesn't.
+  let matched = correlation.status === 'matched';
+  if (matched && correlation.status === 'matched') {
+    const won = await db.conversations.claimAppointment({
+      id: correlation.appointmentId,
+      conversation_id: id,
+      claimed_at: now,
+    });
+    // Losing is not an error: a competing chunk belongs in the unmatched queue,
+    // which is where a human decides which recording is the real session.
+    if (!won) matched = false;
   }
-}
 
-function isUniqueViolation(err: unknown, constraint: string): boolean {
-  const e = err as { code?: string; constraint?: string };
-  return e?.code === '23505' && e?.constraint === constraint;
+  const candidate: Conversation = {
+    id,
+    bee_id: input.bee_id,
+    starts_at: input.starts_at,
+    ends_at: input.ends_at,
+    transcript: input.transcript ?? null,
+    appointment_id: matched && correlation.status === 'matched' ? correlation.appointmentId : null,
+    client_id: matched && correlation.status === 'matched' ? correlation.clientId : null,
+    correlation_status: matched ? 'matched' : 'unmatched',
+    extraction_status: 'pending',
+    extraction_attempts: 0,
+    extraction_next_attempt_at: now,
+    extraction_leased_at: null,
+    created_at: now,
+    updated_at: now,
+  };
+
+  const { conversation: stored, created } = await db.conversations.upsertByBeeId(candidate);
+
+  // On a replay the upsert kept the EXISTING assignment (possibly a manual one)
+  // and this call's claim was against an appointment the stored row may not be
+  // on. Hand it back so the claim collection stays a true mirror of what the
+  // conversations actually hold.
+  if (!created && matched && correlation.status === 'matched') {
+    if (stored.appointment_id !== correlation.appointmentId) {
+      await db.conversations.releaseAppointment(correlation.appointmentId);
+    }
+  }
+
+  // Report the STORED row's state, not the fresh computation. On a replay the
+  // upsert keeps the existing assignment (possibly manual), so the fresh
+  // correlation can disagree with reality in both directions — and the caller
+  // uses this result to decide whether to fire extraction. A replayed transcript
+  // for a matched conversation must trigger it; a recomputed "match" for a row a
+  // human left unmatched must not.
+  const effective: CorrelationResult = stored.appointment_id
+    ? {
+        status: 'matched',
+        appointmentId: stored.appointment_id,
+        clientId: stored.client_id ?? null,
+      }
+    : correlation.status === 'unmatched'
+      ? correlation
+      : { status: 'unmatched', reason: 'ambiguous', candidateCount: 1 };
+
+  return { conversationId: stored.id, correlation: effective };
 }

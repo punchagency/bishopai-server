@@ -1,0 +1,24 @@
+// Typecheck config covering src plus the emulator-backed suites.
+//
+// tsconfig.json sets rootDir: "src" so the build emits a clean dist tree, which
+// means `tsc --noEmit` there never looked at test/ at all. That matters most for
+// the *.firestore.test.ts suites: they construct documents directly against the
+// repository interfaces, and since Firestore has no schema, a test that builds
+// the WRONG shape writes it happily and then asserts against its own mistake.
+// Typechecking them is what makes them a specification rather than an echo.
+//
+// The `*.int.test.ts` suites are deliberately excluded: they assert over
+// `unknown` HTTP bodies and would need their own cleanup, which has nothing to
+// do with document shape.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    // The suites use top-level await, which vitest handles natively; the build's
+    // commonjs target does not. Only the typecheck needs the ESM module setting.
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  },
+  "include": ["src/**/*", "test/firestore.ts", "test/*.firestore.test.ts"]
+}

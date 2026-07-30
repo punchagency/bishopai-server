@@ -51,7 +51,7 @@ suite('tasks/service against Firestore', () => {
   });
 
   it('creates a task per follow-up, denormalizing the client name', async () => {
-    const r = await createTasksFromNote(null, {
+    const r = await createTasksFromNote({
       clientId: 'client-a',
       appointmentId: 'appt-1',
       sessionDate: SESSION_DATE,
@@ -74,9 +74,9 @@ suite('tasks/service against Firestore', () => {
       sessionDate: SESSION_DATE,
       note: note(['Recheck B12 in 4 weeks']),
     };
-    expect((await createTasksFromNote(null, args)).created).toBe(1);
-    expect((await createTasksFromNote(null, args)).created).toBe(0);
-    expect((await createTasksFromNote(null, args)).created).toBe(0);
+    expect((await createTasksFromNote(args)).created).toBe(1);
+    expect((await createTasksFromNote(args)).created).toBe(0);
+    expect((await createTasksFromNote(args)).created).toBe(0);
     expect(await listOpenTasks('client-a')).toHaveLength(1);
   });
 
@@ -90,8 +90,8 @@ suite('tasks/service against Firestore', () => {
       note: note(['Recheck B12 in 4 weeks']),
     };
     const results = await Promise.all([
-      createTasksFromNote(null, args),
-      createTasksFromNote(null, args),
+      createTasksFromNote(args),
+      createTasksFromNote(args),
     ]);
     expect(results.map((r) => r.created).sort()).toEqual([0, 1]);
     expect(await listOpenTasks('client-a')).toHaveLength(1);
@@ -106,11 +106,11 @@ suite('tasks/service against Firestore', () => {
       sessionDate: SESSION_DATE,
       note: note(['Recheck B12 in 4 weeks']),
     };
-    await createTasksFromNote(null, args);
+    await createTasksFromNote(args);
     const [task] = await listOpenTasks('client-a');
     await setTaskStatus(task.id, 'done');
 
-    expect((await createTasksFromNote(null, args)).created).toBe(0);
+    expect((await createTasksFromNote(args)).created).toBe(0);
     expect(await listOpenTasks('client-a')).toHaveLength(0);
     const stored = await db.tasks.findById(task.id);
     expect(stored?.status).toBe('done');
@@ -129,13 +129,13 @@ suite('tasks/service against Firestore', () => {
     });
 
     const followUp = note(['Recheck B12 in 4 weeks']);
-    await createTasksFromNote(null, {
+    await createTasksFromNote({
       clientId: 'client-a',
       appointmentId: null,
       sessionDate: SESSION_DATE,
       note: followUp,
     });
-    await createTasksFromNote(null, {
+    await createTasksFromNote({
       clientId: 'client-b',
       appointmentId: null,
       sessionDate: SESSION_DATE,
@@ -152,7 +152,7 @@ suite('tasks/service against Firestore', () => {
   it('returns tasks with no due date, ordered last', async () => {
     // A dated follow-up carries due_in_days explicitly — the extractor never
     // infers a timeframe from prose, so a bare string is genuinely undated.
-    await createTasksFromNote(null, {
+    await createTasksFromNote({
       clientId: 'client-a',
       appointmentId: 'appt-1',
       sessionDate: SESSION_DATE,
@@ -178,12 +178,12 @@ suite('tasks/service against Firestore', () => {
       appointmentId: 'appt-1',
       sessionDate: SESSION_DATE,
     };
-    await createTasksFromNote(null, {
+    await createTasksFromNote({
       ...base,
       note: note(['Recheck B12 in 4 weeks', 'Trial magnesium at night']),
     });
 
-    const r = await reconcileTasksAfterAmend(null, {
+    const r = await reconcileTasksAfterAmend({
       ...base,
       note: note(['Recheck B12 in 4 weeks', 'Add vitamin D']),
     });

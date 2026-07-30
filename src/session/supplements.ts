@@ -1,5 +1,6 @@
-import type { PoolClient } from 'pg';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
+import { supplementDocId } from '../db/ids.js';
+import type { Supplement } from '../db/interfaces/types.js';
 import { coerceSessionNote } from './render';
 import type { SessionNote } from './extract';
 import { normalizeSupplementName } from './supplementName';
@@ -23,19 +24,29 @@ export interface SupplementSyncResult {
   removed: number;
 }
 
+/** The normalized identity a supplement row is keyed on. */
+export function supplementKey(name: string): string {
+  return normalizeSupplementName(name) || name.toLowerCase();
+}
+
 /**
  * Reconcile a client's supplement rows against an approved Protocol's session
- * note. Runs inside the approval transaction (atomic with the approve), so a
- * failure rolls the approval back rather than leaving a half-synced plan.
- * Idempotent: re-approving the same protocol yields the same rows.
+ * note. Idempotent: re-approving the same protocol yields the same rows.
+ *
+ * Runs AFTER the approval transaction rather than inside it. In Postgres this
+ * shared the approve transaction, so a failure rolled both back; a Firestore
+ * transaction is retried on contention and would re-run this whole loop, and it
+ * spans an unbounded number of documents besides. What replaces the atomicity is
+ * idempotency — every write here is keyed on (client, name_key), so a caller
+ * that fails partway and retries converges on the same plan.
  */
 export async function syncClientSupplements(
-  db: PoolClient,
   clientId: string,
   startDate: string | null,
   contentJson: unknown,
 ): Promise<SupplementSyncResult> {
   const note = coerceSessionNote(contentJson);
+  const db = getDatabase();
   let upserted = 0;
   let removed = 0;
 
@@ -46,79 +57,54 @@ export async function syncClientSupplements(
     // to preserve garbled product names verbatim, so keying on the raw string
     // made "Bio-C Plus" and "Bio C Plus" two rows on one plan — and two refill
     // projections for one product. `name` stays as spoken for the document.
-    const key = normalizeSupplementName(name) || name.toLowerCase();
+    const key = supplementKey(name);
+    const existing = await db.refills.findSupplement(clientId, key);
 
     if (s.change === 'stop') {
       // Chronology guard: a `stop` from an older session (approved late, out of
       // order) must not remove a plan a NEWER session already established. Only
       // stop rows dated at or before this session. A row with no date, or an
       // undated session, falls through to the old unconditional behaviour.
-      const r = await db.query(
-        `DELETE FROM supplements
-          WHERE client_id = $1 AND name_key = $2
-            AND ($3::date IS NULL OR start_date IS NULL OR start_date <= $3::date)`,
-        [clientId, key, startDate],
-      );
-      removed += r.rowCount ?? 0;
+      if (!existing) continue;
+      if (startDate && existing.start_date && existing.start_date > startDate) continue;
+      if (await db.refills.deleteSupplement(clientId, key)) removed++;
       continue;
     }
 
     // start | increase | decrease | continue → keep one current row per name.
-    const existing = await db.query<{ id: string; start_date: string | null }>(
-      `SELECT id, start_date::text AS start_date FROM supplements
-        WHERE client_id = $1 AND name_key = $2 LIMIT 1`,
-      [clientId, key],
-    );
+    //
     // Don't let an out-of-order approval walk the plan backwards: if the stored
     // row is dated NEWER than this session, a later session already owns it —
     // leave it. (Both dates must be known to compare; otherwise proceed.)
-    if (
-      existing.rowCount &&
-      startDate &&
-      existing.rows[0].start_date &&
-      existing.rows[0].start_date > startDate
-    ) {
+    if (existing && startDate && existing.start_date && existing.start_date > startDate) {
       continue;
     }
-    // Only overwrite the stored schedule when this session actually stated timing;
-    // otherwise the row keeps whatever slot pattern an earlier session established.
-    const schedule = s.schedule && Object.values(s.schedule).some(Boolean)
-      ? JSON.stringify(s.schedule)
-      : null;
 
-    const params = [
-      clientId, name, s.dose, s.quantity, startDate, schedule, s.obtained_from ?? null, key,
-      s.units_per_dose ?? null, s.doses_per_day ?? null,
-    ];
-    if (existing.rowCount) {
-      await db.query(
-        `UPDATE supplements
-            SET name = $2, name_key = $8, dose = $3, qty = $4, start_date = $5, source = 'notes',
-                schedule = COALESCE($6::jsonb, schedule),
-                obtained_from = COALESCE($7, obtained_from),
-                -- COALESCE, not overwrite: a session that restated the product
-                -- without restating a countable dose must not erase the numbers
-                -- an earlier session captured.
-                units_per_dose = COALESCE($9::numeric, units_per_dose),
-                doses_per_day = COALESCE($10::numeric, doses_per_day)
-          WHERE id = $1`,
-        [existing.rows[0].id, ...params.slice(1)],
-      );
-    } else {
-      await db.query(
-        `INSERT INTO supplements (client_id, name, name_key, dose, qty, start_date, source,
-                                  schedule, obtained_from, units_per_dose, doses_per_day)
-              VALUES ($1, $2, $8, $3, $4, $5, 'notes', $6::jsonb, $7, $9::numeric, $10::numeric)
-         ON CONFLICT (client_id, name_key) DO UPDATE
-              SET name = EXCLUDED.name, dose = EXCLUDED.dose, qty = EXCLUDED.qty,
-                  start_date = EXCLUDED.start_date, source = 'notes',
-                  schedule = COALESCE(EXCLUDED.schedule, supplements.schedule),
-                  obtained_from = COALESCE(EXCLUDED.obtained_from, supplements.obtained_from),
-                  units_per_dose = COALESCE(EXCLUDED.units_per_dose, supplements.units_per_dose),
-                  doses_per_day = COALESCE(EXCLUDED.doses_per_day, supplements.doses_per_day)`,
-        params,
-      );
-    }
+    // Only overwrite the stored schedule when this session actually stated
+    // timing; otherwise the row keeps whatever slot pattern an earlier session
+    // established. Same rule for the rest: these are COALESCE, not overwrite —
+    // a session that restated the product without restating a countable dose
+    // must not erase the numbers an earlier session captured.
+    const stated = s.schedule && Object.values(s.schedule).some(Boolean) ? s.schedule : null;
+    const now = new Date().toISOString();
+
+    const row: Supplement = {
+      id: supplementDocId(clientId, key),
+      client_id: clientId,
+      name,
+      name_key: key,
+      dose: s.dose,
+      qty: s.quantity,
+      start_date: startDate,
+      source: 'notes',
+      schedule: stated ?? existing?.schedule ?? null,
+      obtained_from: s.obtained_from ?? existing?.obtained_from ?? null,
+      units_per_dose: s.units_per_dose ?? existing?.units_per_dose ?? null,
+      doses_per_day: s.doses_per_day ?? existing?.doses_per_day ?? null,
+      created_at: existing?.created_at ?? now,
+      updated_at: now,
+    };
+    await db.refills.saveSupplement(row);
     upserted++;
   }
 
@@ -142,12 +128,15 @@ export interface CurrentSupplementRow {
  *  protocol, not just the one being reviewed. This is what the Supplement
  *  Protocol document's grid should actually be built from. */
 export async function fetchCurrentSupplements(clientId: string): Promise<CurrentSupplementRow[]> {
-  const r = await pool.query<CurrentSupplementRow>(
-    `SELECT name, dose, qty, schedule, source, obtained_from
-       FROM supplements WHERE client_id = $1 ORDER BY name`,
-    [clientId],
-  );
-  return r.rows;
+  const rows = await getDatabase().refills.listSupplementsByClient(clientId);
+  return rows.map((r) => ({
+    name: r.name,
+    dose: r.dose,
+    qty: r.qty,
+    schedule: r.schedule,
+    source: r.source,
+    obtained_from: r.obtained_from ?? null,
+  }));
 }
 
 // How long a fetched vocabulary stays good. Products change rarely; a few
@@ -167,24 +156,33 @@ let practiceVocab: { at: number; names: string[] } | null = null;
  * what the budget can carry.
  */
 export async function fetchSupplementVocabulary(clientId: string | null): Promise<string[]> {
+  const db = getDatabase();
   const names: string[] = [];
   if (clientId) {
-    const own = await pool.query<{ name: string }>(
-      `SELECT name FROM supplements WHERE client_id = $1 ORDER BY name`,
-      [clientId],
-    );
-    names.push(...own.rows.map((r) => r.name));
+    names.push(...(await db.refills.listSupplementsByClient(clientId)).map((r) => r.name));
   }
 
   if (!practiceVocab || Date.now() - practiceVocab.at > VOCAB_TTL_MS) {
-    const all = await pool.query<{ name: string }>(
-      `SELECT name FROM supplements
-        GROUP BY name_key, name
-        ORDER BY count(*) DESC, name
-        LIMIT $1`,
-      [VOCAB_LIMIT],
-    );
-    practiceVocab = { at: Date.now(), names: all.rows.map((r) => r.name) };
+    // `GROUP BY name_key ORDER BY count(*) DESC` has no Firestore equivalent, so
+    // the frequency ranking is computed here over the whole collection. That is
+    // the one deliberate full scan in the port (§3.6): a solo practice's plan
+    // rows number in the hundreds, the result is cached for VOCAB_TTL_MS, and
+    // the alternative — a denormalized counter per product — would drift out of
+    // step with the plan it is supposed to describe.
+    const counts = new Map<string, { name: string; n: number }>();
+    for (const row of await db.refills.listAllSupplements()) {
+      const key = row.name_key || supplementKey(row.name);
+      const seen = counts.get(key);
+      if (seen) seen.n++;
+      else counts.set(key, { name: row.name, n: 1 });
+    }
+    practiceVocab = {
+      at: Date.now(),
+      names: [...counts.values()]
+        .sort((a, b) => b.n - a.n || a.name.localeCompare(b.name))
+        .slice(0, VOCAB_LIMIT)
+        .map((c) => c.name),
+    };
   }
   names.push(...practiceVocab.names);
 
@@ -259,7 +257,6 @@ export function previewSupplementMerge(
  * the supplement.
  */
 export async function removeSupplementsDroppedByAmendment(
-  db: PoolClient,
   clientId: string,
   supersededNote: unknown,
   amendedNote: unknown,
@@ -270,17 +267,14 @@ export async function removeSupplementsDroppedByAmendment(
     after.supplements.map((s) => normalizeSupplementName(s.name)).filter(Boolean),
   );
 
+  const db = getDatabase();
   let removed = 0;
   for (const s of before.supplements) {
     const name = s.name?.trim();
     if (!name || s.change !== 'start') continue;
-    const key = normalizeSupplementName(name) || name.toLowerCase();
+    const key = supplementKey(name);
     if (stillNamed.has(key)) continue;
-    const r = await db.query(
-      `DELETE FROM supplements WHERE client_id = $1 AND name_key = $2`,
-      [clientId, key],
-    );
-    removed += r.rowCount ?? 0;
+    if (await db.refills.deleteSupplement(clientId, key)) removed++;
   }
   return removed;
 }

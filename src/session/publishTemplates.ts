@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
+import type { Client, SupplementProtocol } from '../db/interfaces/types.js';
 import { logEvent, logError } from '../observability/logger';
 import { sendEmail } from '../integrations/outlook';
 import { coerceSessionNote } from './render';
@@ -113,17 +114,42 @@ const flowSheetAsXlsx = (): boolean => process.env.FLOW_SHEET_AS_XLSX === 'true'
  * reflects the current state of every session (amendments included).
  */
 async function flowSheetEntriesForClient(clientId: string): Promise<FlowSheetEntry[]> {
-  const r = await pool.query<{ content_json: unknown; starts_at: string | null }>(
-    `SELECT p.content_json, a.starts_at
-       FROM protocols p
-       JOIN appointments a ON a.id = p.appointment_id
-      WHERE p.client_id = $1 AND p.status = 'approved'
-   ORDER BY a.starts_at ASC NULLS LAST, p.id ASC`,
-    [clientId],
-  );
-  return r.rows.map((row) =>
+  // Ordered by the denormalized starts_at — when the session happened — so the
+  // rebuilt sheet stacks visits in the same order Nicole's paper one does.
+  const rows = await getDatabase().sessionNotes.listProtocolsByClient(clientId, {
+    status: 'approved',
+  });
+  return rows.map((row) =>
     toFlowSheetEntry(coerceSessionNote(row.content_json), { date: displayDate(row.starts_at) }),
   );
+}
+
+/**
+ * A protocol plus the client and appointment context both publish paths need.
+ *
+ * Three gets by known ref, replacing the two LEFT JOINs. The protocol's document
+ * id is the appointment id, so the appointment lookup is free of a second query.
+ */
+async function loadProtocolContext(protocolId: string): Promise<{
+  protocol: SupplementProtocol;
+  client: Client | null;
+  clientName: string;
+  startsAt: string | null;
+}> {
+  const db = getDatabase();
+  const { protocol } = await db.sessionNotes.findSessionDocs(protocolId);
+  if (!protocol) throw new Error(`protocol ${protocolId} not found`);
+
+  const [client, appointment] = await Promise.all([
+    protocol.client_id ? db.clients.findById(protocol.client_id) : Promise.resolve(null),
+    db.appointments.findById(protocol.appointment_id),
+  ]);
+  return {
+    protocol,
+    client,
+    clientName: client?.name ?? protocol.client_name ?? 'Unknown client',
+    startsAt: protocol.starts_at ?? appointment?.starts_at ?? null,
+  };
 }
 
 /**
@@ -217,31 +243,22 @@ async function emailTemplatesToClient(
  * of any one doc rather than throwing (it runs off the request path).
  */
 export async function publishClientTemplates(protocolId: string): Promise<ClientTemplatesResult> {
-  const r = await pool.query(
-    `SELECT p.content_json, p.client_id, c.name AS client_name, c.email AS client_email,
-            c.drive_folder_id, c.flow_sheet_id, a.starts_at
-       FROM protocols p
-  LEFT JOIN clients c ON c.id = p.client_id
-  LEFT JOIN appointments a ON a.id = p.appointment_id
-      WHERE p.id = $1`,
-    [protocolId],
-  );
-  if (r.rowCount === 0) throw new Error(`protocol ${protocolId} not found`);
-  const row = r.rows[0];
-  const clientName: string = row.client_name ?? 'Unknown client';
-  const note = coerceSessionNote(row.content_json);
-  // syncClientSupplements already ran (in the approval transaction, before this
-  // fires), so the table already reflects this session's changes merged in —
-  // this is the full current plan, not just what this session mentioned.
-  const currentSupplements = row.client_id ? await fetchCurrentSupplements(row.client_id) : [];
-  const rendered = await renderClientTemplates(note, { clientName, date: row.starts_at }, currentSupplements);
+  const { protocol, client, clientName, startsAt } = await loadProtocolContext(protocolId);
+  const clientId = protocol.client_id ?? null;
+  const note = coerceSessionNote(protocol.content_json);
+  // syncClientSupplements already ran (right after the approval transaction,
+  // before this fires), so the plan already reflects this session's changes
+  // merged in — this is the full current plan, not just what this session
+  // mentioned.
+  const currentSupplements = clientId ? await fetchCurrentSupplements(clientId) : [];
+  const rendered = await renderClientTemplates(note, { clientName, date: startsAt }, currentSupplements);
 
   const result: ClientTemplatesResult = {};
 
   // ROF — fill-once at intake.
   const rof = await publishBinaryDoc({
     clientName,
-    driveFolderId: row.drive_folder_id,
+    driveFolderId: client?.drive_folder_id ?? null,
     docType: 'ROF',
     fileName: 'ROF.docx',
     bytes: rendered.rof,
@@ -252,8 +269,8 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
   result.rofFileId = rof.fileId;
   result.rofSkipped = rof.skipped;
   // Only when it was actually created — a skipped fill-once ROF was already recorded.
-  if (!rof.skipped) await recordDocument(row.client_id, 'ROF', rof.fileId);
-  let clientFolderId = rof.clientFolderId ?? row.drive_folder_id ?? null;
+  if (!rof.skipped) await recordDocument(clientId, 'ROF', rof.fileId, protocol.appointment_id);
+  let clientFolderId = rof.clientFolderId ?? client?.drive_folder_id ?? null;
 
   // Supplement Protocol — new dated version each time.
   const supp = await publishBinaryDoc({
@@ -265,18 +282,18 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
     mimeType: XLSX_MIME,
   });
   result.supplementFileId = supp.fileId;
-  await recordDocument(row.client_id, 'SupplementProtocol', supp.fileId);
+  await recordDocument(clientId, 'SupplementProtocol', supp.fileId, protocol.appointment_id);
   clientFolderId = supp.clientFolderId ?? clientFolderId;
 
   // Flow Sheet. Two transports, chosen by FLOW_SHEET_AS_XLSX (see flowSheetAsXlsx):
   //   xlsx mode  — rebuild the whole sheet from the DB, overwrite one file in Drive
   //                (drive.file scope only; the interim path until Sheets is enabled).
   //   native mode— provision a Google Sheet once, then append this session's block.
-  let flowSheetId: string | null = row.flow_sheet_id ?? null;
+  let flowSheetId: string | null = client?.flow_sheet_id ?? null;
   if (flowSheetAsXlsx()) {
     try {
-      if (row.client_id) {
-        const flow = await publishFlowSheetXlsx(row.client_id, clientName, clientFolderId);
+      if (clientId) {
+        const flow = await publishFlowSheetXlsx(clientId, clientName, clientFolderId);
         result.flowSheetId = flow.fileId ?? null;
         clientFolderId = flow.clientFolderId ?? clientFolderId;
       }
@@ -312,7 +329,9 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
       });
       result.flowSheetId = flowSheetId;
       result.flowBlock = flow.blockIndex;
-      if (!flow.dryRun) await recordDocument(row.client_id, 'AppointmentFlowSheet', flowSheetId);
+      if (!flow.dryRun) {
+        await recordDocument(clientId, 'AppointmentFlowSheet', flowSheetId, protocol.appointment_id);
+      }
     } catch (err) {
       // ROF/Supplement already landed above — a Sheets-API failure must not lose
       // that work or block persistIds/email below, so it stays local to this doc.
@@ -329,14 +348,14 @@ export async function publishClientTemplates(protocolId: string): Promise<Client
 
   // Optionally mail the client their filled docs (off unless Nicole enables it).
   // The ROF rides along only on the session that actually created it.
-  if (emailToClientEnabled() && row.client_email) {
-    result.emailed = await emailTemplatesToClient(row.client_email, clientName, rendered, {
+  if (emailToClientEnabled() && client?.email) {
+    result.emailed = await emailTemplatesToClient(client.email, clientName, rendered, {
       includeRof: !rof.skipped,
     });
   }
 
   // Persist the folder + sheet ids we learned, so we don't re-provision next time.
-  await persistIds(row.client_id, { driveFolderId: clientFolderId, flowSheetId });
+  await persistIds(clientId, { driveFolderId: clientFolderId, flowSheetId });
   return result;
 }
 
@@ -345,15 +364,28 @@ async function persistIds(
   ids: { driveFolderId: string | null; flowSheetId: string | null },
 ): Promise<void> {
   if (!clientId) return;
-  await pool.query(
-    `UPDATE clients
-        SET drive_folder_id = COALESCE($2, drive_folder_id),
-            flow_sheet_id   = COALESCE($3, flow_sheet_id)
-      WHERE id = $1
-        AND (drive_folder_id IS DISTINCT FROM COALESCE($2, drive_folder_id)
-          OR flow_sheet_id   IS DISTINCT FROM COALESCE($3, flow_sheet_id))`,
-    [clientId, ids.driveFolderId, ids.flowSheetId],
-  );
+  const db = getDatabase();
+  // Re-read rather than reuse the row loaded at the top: provisioning happened
+  // in between, and a concurrent publish may already have filed the same ids.
+  const client = await db.clients.findById(clientId);
+  if (!client) return;
+
+  // COALESCE, not overwrite — a publish that didn't touch the Flow Sheet must
+  // not clear an id an earlier one established.
+  const driveFolderId = ids.driveFolderId ?? client.drive_folder_id ?? null;
+  const flowSheetId = ids.flowSheetId ?? client.flow_sheet_id ?? null;
+  if (
+    driveFolderId === (client.drive_folder_id ?? null) &&
+    flowSheetId === (client.flow_sheet_id ?? null)
+  ) {
+    return; // the `IS DISTINCT FROM` guard: nothing learned, nothing to write
+  }
+  await db.clients.save({
+    ...client,
+    drive_folder_id: driveFolderId,
+    flow_sheet_id: flowSheetId,
+    updated_at: new Date().toISOString(),
+  });
 }
 
 /**
@@ -373,23 +405,13 @@ async function persistIds(
  * Best-effort and off the request path, matching the approve publish.
  */
 export async function republishAmended(protocolId: string): Promise<ClientTemplatesResult> {
-  const r = await pool.query(
-    `SELECT p.content_json, p.client_id, c.name AS client_name,
-            c.drive_folder_id, c.flow_sheet_id, a.starts_at
-       FROM protocols p
-  LEFT JOIN clients c ON c.id = p.client_id
-  LEFT JOIN appointments a ON a.id = p.appointment_id
-      WHERE p.id = $1`,
-    [protocolId],
-  );
-  if (r.rowCount === 0) throw new Error(`protocol ${protocolId} not found`);
-  const row = r.rows[0];
-  const clientName: string = row.client_name ?? 'Unknown client';
-  const note = coerceSessionNote(row.content_json);
-  const currentSupplements = row.client_id ? await fetchCurrentSupplements(row.client_id) : [];
+  const { protocol, client, clientName, startsAt } = await loadProtocolContext(protocolId);
+  const clientId = protocol.client_id ?? null;
+  const note = coerceSessionNote(protocol.content_json);
+  const currentSupplements = clientId ? await fetchCurrentSupplements(clientId) : [];
   const rendered = await renderClientTemplates(
     note,
-    { clientName, date: row.starts_at },
+    { clientName, date: startsAt },
     currentSupplements,
   );
 
@@ -398,7 +420,7 @@ export async function republishAmended(protocolId: string): Promise<ClientTempla
   // Supplement Protocol — a new dated version. The superseded one stays in Drive.
   const supp = await publishBinaryDoc({
     clientName,
-    driveFolderId: row.drive_folder_id,
+    driveFolderId: client?.drive_folder_id ?? null,
     docType: 'SupplementProtocol',
     fileName: rendered.supplementFileName,
     bytes: rendered.supplement,
@@ -406,29 +428,33 @@ export async function republishAmended(protocolId: string): Promise<ClientTempla
   });
   result.dryRun = supp.dryRun;
   result.supplementFileId = supp.fileId;
-  await recordDocument(row.client_id, 'SupplementProtocol', supp.fileId);
+  await recordDocument(clientId, 'SupplementProtocol', supp.fileId, protocol.appointment_id);
 
   // Flow Sheet. In xlsx mode the rebuild reads the amended note straight from the
   // DB, so re-publishing the whole file is the correction — no per-block rewrite.
   // In native mode we rewrite this session's own block in place (appending would
   // give the client two blocks for one visit).
   if (flowSheetAsXlsx()) {
-    if (row.client_id) {
+    if (clientId) {
       try {
-        const flow = await publishFlowSheetXlsx(row.client_id, clientName, row.drive_folder_id ?? null);
+        const flow = await publishFlowSheetXlsx(
+          clientId,
+          clientName,
+          client?.drive_folder_id ?? null,
+        );
         result.flowSheetId = flow.fileId ?? null;
       } catch (err) {
         logError('session.flowsheet_amend', 'Flow Sheet xlsx rewrite failed', err, { client: clientName });
       }
     }
-  } else if (row.flow_sheet_id) {
+  } else if (client?.flow_sheet_id) {
     try {
       const flow = await rewriteFlowSheetBlock({
         clientName,
-        spreadsheetId: row.flow_sheet_id,
+        spreadsheetId: client.flow_sheet_id,
         entry: rendered.flowEntry,
       });
-      result.flowSheetId = row.flow_sheet_id;
+      result.flowSheetId = client.flow_sheet_id;
       result.flowBlock = flow.blockIndex;
     } catch (err) {
       logError('session.flowsheet_amend', 'Flow Sheet rewrite failed', err, { client: clientName });

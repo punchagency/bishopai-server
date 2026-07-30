@@ -6,9 +6,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // path (docType AppointmentFlowSheet, update:true) and never touches the native
 // Sheets calls — so flipping the flag is a clean, side-effect-free swap.
 
-const query = vi.fn();
-vi.mock('../db/pool', () => ({ pool: { query: (...a: unknown[]) => query(...a) } }));
-
 vi.mock('../integrations/outlook', () => ({ sendEmail: vi.fn().mockResolvedValue({ ok: true }) }));
 
 const publishBinaryDoc = vi.fn();
@@ -30,6 +27,7 @@ vi.mock('../integrations/drive', () => ({
 }));
 
 import { publishClientTemplates, republishAmended } from './publishTemplates';
+import { setDatabaseAdapter, resetDatabaseAdapter, InMemoryMockDatabase } from '../db/index.js';
 
 const NOTE = {
   concerns: ['Fatigue'],
@@ -39,30 +37,50 @@ const NOTE = {
   follow_ups: [],
 };
 
-function protocolRow() {
-  return {
-    rowCount: 1,
-    rows: [
-      {
-        content_json: NOTE,
-        client_id: 'c1',
-        client_name: 'Leeza Woodbury',
-        client_email: null,
-        drive_folder_id: 'folder1',
-        flow_sheet_id: null,
-        starts_at: '2026-07-09T15:00:00Z',
-      },
-    ],
-  };
-}
-
+const STARTS_AT = '2026-07-09T15:00:00Z';
 const prev = process.env.FLOW_SHEET_AS_XLSX;
+let db: InMemoryMockDatabase;
 
-beforeEach(() => {
+beforeEach(async () => {
   process.env.FLOW_SHEET_AS_XLSX = 'true';
-  query.mockReset().mockImplementation((sql: string) =>
-    String(sql).includes('SELECT') ? Promise.resolve(protocolRow()) : Promise.resolve({ rowCount: 0, rows: [] }),
-  );
+  db = new InMemoryMockDatabase();
+  setDatabaseAdapter(db);
+
+  await db.clients.save({
+    id: 'c1',
+    name: 'Leeza Woodbury',
+    email: '',
+    drive_folder_id: 'folder1',
+    flow_sheet_id: null,
+    created_at: STARTS_AT,
+    updated_at: STARTS_AT,
+  });
+  await db.appointments.save({
+    id: 'p1',
+    client_id: 'c1',
+    client_name: 'Leeza Woodbury',
+    starts_at: STARTS_AT,
+    ends_at: STARTS_AT,
+    status: 'completed',
+    created_at: STARTS_AT,
+    updated_at: STARTS_AT,
+  });
+  // The protocol's document id IS the appointment id, and the rebuild orders on
+  // the denormalized starts_at — a protocol without it is invisible to the
+  // chronological query, which is the behaviour the emulator enforces too.
+  await db.sessionNotes.saveProtocol({
+    id: 'p1',
+    appointment_id: 'p1',
+    client_id: 'c1',
+    client_name: 'Leeza Woodbury',
+    starts_at: STARTS_AT,
+    content_json: NOTE,
+    status: 'approved',
+    revision: 1,
+    created_at: STARTS_AT,
+    updated_at: STARTS_AT,
+  });
+
   publishBinaryDoc.mockReset().mockResolvedValue({ fileId: 'file-x', dryRun: false, skipped: false });
   publishFlowSheet.mockReset();
   rewriteFlowSheetBlock.mockReset();
@@ -71,6 +89,7 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env.FLOW_SHEET_AS_XLSX = prev ?? '';
+  resetDatabaseAdapter();
   vi.clearAllMocks();
 });
 
@@ -96,13 +115,36 @@ describe('publishClientTemplates — FLOW_SHEET_AS_XLSX', () => {
     expect(ensureConvertedSheet).not.toHaveBeenCalled();
   });
 
-  it('rebuilds from the client’s approved sessions (queries protocols by client)', async () => {
+  it('rebuilds from every approved session of the client, in visit order', async () => {
+    // A second, EARLIER approved session, plus a draft that must not appear.
+    const earlier = '2026-05-02T15:00:00Z';
+    await db.sessionNotes.saveProtocol({
+      id: 'p0',
+      appointment_id: 'p0',
+      client_id: 'c1',
+      starts_at: earlier,
+      content_json: { ...NOTE, concerns: ['Earlier visit'] },
+      status: 'approved',
+      revision: 1,
+      created_at: earlier,
+      updated_at: earlier,
+    });
+    await db.sessionNotes.saveProtocol({
+      id: 'p2',
+      appointment_id: 'p2',
+      client_id: 'c1',
+      starts_at: '2026-08-01T15:00:00Z',
+      content_json: { ...NOTE, concerns: ['Still a draft'] },
+      status: 'draft',
+      revision: 1,
+      created_at: earlier,
+      updated_at: earlier,
+    });
+
+    const rebuilt = await db.sessionNotes.listProtocolsByClient('c1', { status: 'approved' });
+    expect(rebuilt.map((p) => p.id)).toEqual(['p0', 'p1']); // oldest visit first
     await publishClientTemplates('p1');
-    const rebuildQuery = query.mock.calls.find(
-      (c) => String(c[0]).includes('FROM protocols') && String(c[0]).includes("status = 'approved'"),
-    );
-    expect(rebuildQuery).toBeDefined();
-    expect(rebuildQuery![1]).toEqual(['c1']);
+    expect(flowSheetCall()).toBeDefined();
   });
 
   it('reverts to the native Sheets path when the flag is off', async () => {

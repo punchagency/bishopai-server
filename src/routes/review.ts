@@ -1,19 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
+import type { Appointment } from '../db/interfaces/types.js';
 import { logError, logEvent } from '../observability/logger';
 import { coerceSessionNote, renderAppointmentSheet, renderProtocol } from '../session/render';
 import { processConversation } from '../session/process';
 import { publishApproved } from '../session/publish';
 import { publishClientTemplates, republishAmended } from '../session/publishTemplates';
-import {
-  syncClientSupplements,
-  fetchCurrentSupplements,
-  previewSupplementMerge,
-  removeSupplementsDroppedByAmendment,
-} from '../session/supplements';
-import { createTasksFromNote } from '../tasks/service';
-import { fetchRevisions, snapshotRevision } from '../session/revisions';
+import { fetchCurrentSupplements, previewSupplementMerge } from '../session/supplements';
+import { fetchRevisions } from '../session/revisions';
 import { scoreNameMatch, nameSignalRank, overlapSeconds } from '../correlation/nameMatch';
 import { recordAudit } from '../audit/log';
 import {
@@ -51,6 +46,14 @@ const amendSchema = z.object({
   amended_by: z.string().optional(),
 });
 
+/**
+ * Appointment / document ids are still uuids, so the cheap 404 for a malformed
+ * path segment is kept for those.
+ *
+ * It is deliberately NOT applied to conversation ids any more: a conversation's
+ * document id is its bee_id (§3.1), which is an external identifier and not a
+ * uuid. Leaving the guard on would have 404'd every real recording.
+ */
 const isUuid = (id: string) => z.uuid().safeParse(id).success;
 
 function fmtDate(v: unknown): string {
@@ -88,16 +91,25 @@ reviewRouter.get('/queue', async (req, res) => {
 // appointment (no overlap, or ambiguous). These need Nicole to tag manually;
 // we never auto-guess the client. (§8 dashboard, §9 risk 3.)
 // ---------------------------------------------------------------------------
+const PREVIEW_CHARS = 240;
+
 reviewRouter.get('/unmatched', async (_req, res) => {
   try {
-    const r = await pool.query(
-      `SELECT id, bee_id, starts_at, ends_at, correlation_status,
-              left(coalesce(transcript, ''), 240) AS transcript_preview
-         FROM conversations
-        WHERE appointment_id IS NULL
-     ORDER BY starts_at DESC`,
-    );
-    res.json({ conversations: r.rows });
+    // `correlation_status = 'unmatched'` rather than `appointment_id IS NULL`.
+    // Firestore cannot query for a missing/null field the way SQL can, and the
+    // two are the same set by construction: nothing sets one without the other,
+    // and unmatch resets both together.
+    const rows = await getDatabase().conversations.listUnmatched();
+    res.json({
+      conversations: rows.map((c) => ({
+        id: c.id,
+        bee_id: c.bee_id,
+        starts_at: c.starts_at,
+        ends_at: c.ends_at,
+        correlation_status: c.correlation_status,
+        transcript_preview: (c.transcript ?? '').slice(0, PREVIEW_CHARS),
+      })),
+    });
   } catch (err) {
     logError('review.unmatched', 'unmatched query failed', err);
     res.status(500).json({ error: 'internal error' });
@@ -111,31 +123,24 @@ reviewRouter.get('/unmatched', async (_req, res) => {
 // plus the timing the candidate ranking is built on. Still unmatched-only — a
 // recording that already has an appointment is read through the session, not here.
 reviewRouter.get('/unmatched/:id', async (req, res) => {
-  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   try {
-    const r = await pool.query<{
-      id: string;
-      bee_id: string;
-      starts_at: string;
-      ends_at: string;
-      correlation_status: string;
-      extraction_status: string;
-      appointment_id: string | null;
-      transcript: string | null;
-    }>(
-      `SELECT id, bee_id, starts_at, ends_at, correlation_status,
-              extraction_status, appointment_id, transcript
-         FROM conversations
-        WHERE id = $1`,
-      [req.params.id],
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
-    if (r.rows[0].appointment_id) {
+    const conv = await getDatabase().conversations.findById(req.params.id);
+    if (!conv) return res.status(404).json({ error: 'not found' });
+    if (conv.appointment_id) {
       // It's been matched (perhaps in another tab) — send her to the session.
       return res.status(409).json({ error: 'already matched', detail: 'This recording is now tied to an appointment.' });
     }
-    const { appointment_id: _drop, ...conv } = r.rows[0];
-    return res.json({ conversation: conv });
+    return res.json({
+      conversation: {
+        id: conv.id,
+        bee_id: conv.bee_id,
+        starts_at: conv.starts_at,
+        ends_at: conv.ends_at,
+        correlation_status: conv.correlation_status,
+        extraction_status: conv.extraction_status,
+        transcript: conv.transcript ?? null,
+      },
+    });
   } catch (err) {
     logError('review.unmatched.detail', 'detail query failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
@@ -155,42 +160,54 @@ reviewRouter.get('/unmatched/:id', async (req, res) => {
 // Still never auto-assigns: a name in a transcript is evidence, not proof (a
 // client can be discussed in someone else's session). The signals are returned
 // so the UI can show WHY a candidate is ranked where it is.
+/** How wide a window around the recording to consider for manual tagging. */
+const CANDIDATE_WINDOW_HOURS = 36;
+const CANDIDATE_SCAN = 12;
+
 reviewRouter.get('/unmatched/:id/candidates', async (req, res) => {
-  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   try {
-    const conv = await pool.query<{ starts_at: string; ends_at: string; transcript: string | null }>(
-      `SELECT starts_at, ends_at, transcript FROM conversations WHERE id = $1`,
-      [req.params.id],
-    );
-    if (conv.rowCount === 0) return res.status(404).json({ error: 'not found' });
-    const { starts_at: cs, ends_at: ce, transcript } = conv.rows[0];
+    const db = getDatabase();
+    const conv = await db.conversations.findById(req.params.id);
+    if (!conv) return res.status(404).json({ error: 'not found' });
+    const { starts_at: cs, ends_at: ce, transcript } = conv;
 
     // Offer only appointments a match could actually land on: not cancelled
     // (the slot's client may never have shown up — matching their chart is the
     // wrong-person error), and not already carrying a recording (one
-    // conversation per appointment is a schema invariant; offering a taken one
-    // just walks Nicole into a refusal).
-    const r = await pool.query<{
-      id: string;
-      starts_at: string;
-      ends_at: string;
-      client_id: string | null;
-      client_name: string | null;
-    }>(
-      `SELECT a.id, a.starts_at, a.ends_at, a.client_id, c.name AS client_name
-         FROM appointments a
-    LEFT JOIN clients c ON c.id = a.client_id
-        WHERE a.status <> 'cancelled'
-          AND NOT EXISTS (SELECT 1 FROM conversations cv WHERE cv.appointment_id = a.id)
-     ORDER BY abs(extract(epoch FROM (a.starts_at - $1::timestamptz)))
-        LIMIT 12`,
-      [cs],
+    // conversation per appointment is an invariant; offering a taken one just
+    // walks Nicole into a refusal).
+    //
+    // `ORDER BY abs(starts_at - $1)` has no Firestore equivalent — an ordering
+    // by distance from a point isn't an index — so the nearest-first scan
+    // becomes a bounded window around the recording, sorted in memory. The
+    // window is generous because a mis-timed recording is exactly the case this
+    // screen exists for; the LIMIT then applies to the ranked result.
+    const windowMs = CANDIDATE_WINDOW_HOURS * 3_600_000;
+    const inWindow = await db.appointments.listBetween(
+      new Date(new Date(cs).getTime() - windowMs).toISOString(),
+      new Date(new Date(cs).getTime() + windowMs).toISOString(),
     );
+    const live = inWindow.filter((a) => a.status !== 'cancelled');
+    const taken = await Promise.all(live.map((a) => db.conversations.findByAppointment(a.id)));
+    const nearest = live
+      .filter((_, i) => !taken[i])
+      .sort(
+        (x, y) =>
+          Math.abs(new Date(x.starts_at).getTime() - new Date(cs).getTime()) -
+          Math.abs(new Date(y.starts_at).getTime() - new Date(cs).getTime()),
+      )
+      .slice(0, CANDIDATE_SCAN);
 
-    const scored = r.rows.map((a) => {
-      const name = scoreNameMatch(transcript, a.client_name);
+    const scored = nearest.map((a) => {
+      // client_name is denormalized onto the appointment (§3.4), so ranking by
+      // name evidence no longer needs a clients join per candidate.
+      const name = scoreNameMatch(transcript ?? null, a.client_name ?? null);
       return {
-        ...a,
+        id: a.id,
+        starts_at: a.starts_at,
+        ends_at: a.ends_at,
+        client_id: a.client_id,
+        client_name: a.client_name ?? null,
         name_mentions: name.mentions,
         name_matched_on: name.matchedOn,
         overlap_seconds: overlapSeconds(cs, ce, a.starts_at, a.ends_at),
@@ -219,85 +236,90 @@ reviewRouter.get('/unmatched/:id/candidates', async (req, res) => {
 // appointment. Sets the correlation and, if there's a transcript, kicks off
 // extraction off the request path (same as the automatic matched path).
 const matchSchema = z.object({ appointment_id: z.string() });
+
+const APPOINTMENT_TAKEN = {
+  error: 'appointment has a recording',
+  detail: 'This appointment already has a recording attached. Detach that one first if it is wrong.',
+} as const;
+
 reviewRouter.post('/unmatched/:id/match', async (req, res) => {
-  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   const parsed = matchSchema.safeParse(req.body);
   if (!parsed.success || !isUuid(parsed.data.appointment_id)) {
     return res.status(400).json({ error: 'invalid payload' });
   }
+  const appointmentId = parsed.data.appointment_id;
+  const db = getDatabase();
+  let claimed = false;
+
   try {
-    const appt = await pool.query<{ client_id: string | null; status: string }>(
-      `SELECT client_id, status FROM appointments WHERE id = $1`,
-      [parsed.data.appointment_id],
-    );
-    if (appt.rowCount === 0) return res.status(404).json({ error: 'appointment not found' });
-    if (appt.rows[0].status === 'cancelled') {
+    const appointment = await db.appointments.findById(appointmentId);
+    if (!appointment) return res.status(404).json({ error: 'appointment not found' });
+    if (appointment.status === 'cancelled') {
       return res.status(409).json({
         error: 'appointment cancelled',
         detail: 'This booking was cancelled — its client may never have been in the room. Assign the recording to the right client instead.',
       });
     }
 
-    // One recording per appointment (schema-enforced), and never onto a session
-    // that's already signed off: extraction would overwrite the approved note
-    // and demote it to draft with no revision trail. An approved session is
-    // corrected through Amend, not by re-matching a recording onto it.
-    const taken = await pool.query(
-      `SELECT 1 FROM conversations WHERE appointment_id = $1 LIMIT 1`,
-      [parsed.data.appointment_id],
-    );
-    if (taken.rowCount) {
-      return res.status(409).json({
-        error: 'appointment has a recording',
-        detail: 'This appointment already has a recording attached. Detach that one first if it is wrong.',
-      });
-    }
-    const approvedNote = await pool.query(
-      `SELECT 1 FROM appointment_sheets WHERE appointment_id = $1 AND status = 'approved'
-        UNION ALL
-       SELECT 1 FROM protocols WHERE appointment_id = $1 AND status = 'approved'
-        LIMIT 1`,
-      [parsed.data.appointment_id],
-    );
-    if (approvedNote.rowCount) {
+    // Never onto a session that's already signed off: extraction would overwrite
+    // the approved note and demote it to draft with no revision trail. An
+    // approved session is corrected through Amend, not by re-matching a
+    // recording onto it.
+    const docs = await db.sessionNotes.findSessionDocs(appointmentId);
+    if (docs.sheet?.status === 'approved' || docs.protocol?.status === 'approved') {
       return res.status(409).json({
         error: 'session already approved',
         detail: 'This appointment already has an approved session note. Amend that note instead of attaching a new recording.',
       });
     }
 
-    const r = await pool.query<{ id: string; transcript: string | null }>(
-      `UPDATE conversations
-          SET appointment_id = $2, client_id = $3, correlation_status = 'matched'
-        WHERE id = $1 AND appointment_id IS NULL
-    RETURNING id, transcript`,
-      [req.params.id, parsed.data.appointment_id, appt.rows[0].client_id],
-    );
-    if (r.rowCount === 0) return res.status(409).json({ error: 'already matched or not found' });
+    // One recording per appointment. The claim document is the enforcement —
+    // the replacement for `conversations_appointment_unique` — so it is taken
+    // BEFORE the conversation is pointed at the appointment, not checked with a
+    // read that a concurrent match could slip past.
+    claimed = await db.conversations.claimAppointment({
+      id: appointmentId,
+      conversation_id: req.params.id,
+      claimed_at: new Date().toISOString(),
+    });
+    if (!claimed) return res.status(409).json(APPOINTMENT_TAKEN);
 
-    if (r.rows[0].transcript) {
-      void processConversation(r.rows[0].id).catch((e) =>
-        logError('session.process', 'post-match processing failed', e, { conversation_id: r.rows[0].id }),
+    // Guarded on the conversation still being unassigned, so two tabs matching
+    // the same recording to different appointments can't both win.
+    const moved = await db.conversations.transitionExtraction(
+      req.params.id,
+      ['pending', 'failed', 'done', 'needs_review'],
+      {
+        appointment_id: appointmentId,
+        client_id: appointment.client_id ?? null,
+        correlation_status: 'matched',
+      },
+      (row) => !row.appointment_id,
+    );
+    if (!moved) {
+      await db.conversations.releaseAppointment(appointmentId);
+      claimed = false;
+      return res.status(409).json({ error: 'already matched or not found' });
+    }
+
+    if (moved.transcript) {
+      void processConversation(moved.id).catch((e) =>
+        logError('session.process', 'post-match processing failed', e, { conversation_id: moved.id }),
       );
     }
     await recordAudit({
       entityType: 'session',
-      entityId: parsed.data.appointment_id,
+      entityId: appointmentId,
       action: 'session.matched',
       actor: 'nicole',
       summary: 'Recording manually matched to this appointment',
-      metadata: { conversation_id: r.rows[0].id },
+      metadata: { conversation_id: moved.id },
     });
-    return res.json({ conversation_id: r.rows[0].id, status: 'matched' });
+    return res.json({ conversation_id: moved.id, status: 'matched' });
   } catch (err) {
-    // The pre-checks race a concurrent match; the unique index is the real
-    // enforcement, so translate its rejection into the same friendly refusal.
-    if ((err as { code?: string }).code === '23505') {
-      return res.status(409).json({
-        error: 'appointment has a recording',
-        detail: 'This appointment already has a recording attached. Detach that one first if it is wrong.',
-      });
-    }
+    // A claim taken but never used would block the appointment forever, so it
+    // is handed back on any failure after it was granted.
+    if (claimed) await db.conversations.releaseAppointment(appointmentId).catch(() => {});
     logError('review.match', 'manual match failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
   }
@@ -315,78 +337,99 @@ reviewRouter.post('/unmatched/:id/match', async (req, res) => {
 // `walk-in` so it's distinguishable from anything PB booked.
 const assignClientSchema = z.object({ client_id: z.string() });
 
+/**
+ * A walk-in appointment exists only to carry one recording, so its id is derived
+ * from that recording. Deterministic on purpose: a replayed assign lands on the
+ * same appointment document instead of creating a second one for the same
+ * session, which is the uniqueness the pg `pb_id` UNIQUE gave for free.
+ */
+const walkInAppointmentId = (conversationId: string) => `walkin-${conversationId}`;
+
 reviewRouter.post('/unmatched/:id/assign-client', async (req, res) => {
-  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   const parsed = assignClientSchema.safeParse(req.body);
   if (!parsed.success || !isUuid(parsed.data.client_id)) {
     return res.status(400).json({ error: 'invalid payload' });
   }
+  const conversationId = req.params.id;
+  const clientId = parsed.data.client_id;
+  const appointmentId = walkInAppointmentId(conversationId);
+  const db = getDatabase();
+  let claimed = false;
 
-  const db = await pool.connect();
   try {
-    await db.query('BEGIN');
-    const conv = await db.query<{ starts_at: string; ends_at: string; transcript: string | null }>(
-      `SELECT starts_at, ends_at, transcript FROM conversations
-        WHERE id = $1 AND appointment_id IS NULL FOR UPDATE`,
-      [req.params.id],
-    );
-    if (conv.rowCount === 0) {
-      await db.query('ROLLBACK');
+    const conv = await db.conversations.findById(conversationId);
+    if (!conv || conv.appointment_id) {
       return res.status(409).json({ error: 'already matched or not found' });
     }
-    const client = await db.query(`SELECT 1 FROM clients WHERE id = $1`, [parsed.data.client_id]);
-    if (client.rowCount === 0) {
-      await db.query('ROLLBACK');
-      return res.status(404).json({ error: 'client not found' });
+    const client = await db.clients.findById(clientId);
+    if (!client) return res.status(404).json({ error: 'client not found' });
+
+    // The claim is taken first, same as /match: it is what makes one recording
+    // per appointment true, and taking it before the appointment exists means a
+    // concurrent retry cannot produce two walk-ins for one recording.
+    claimed = await db.conversations.claimAppointment({
+      id: appointmentId,
+      conversation_id: conversationId,
+      claimed_at: new Date().toISOString(),
+    });
+    if (!claimed) return res.status(409).json(APPOINTMENT_TAKEN);
+
+    const now = new Date().toISOString();
+    const appointment: Appointment = {
+      id: appointmentId,
+      client_id: clientId,
+      client_name: client.name,
+      // No PB booking exists, so the id is derived from the recording — stable,
+      // and obviously not a Practice Better id to anyone reading the collection.
+      pb_id: appointmentId,
+      // The recording's window is the truth of when the session happened.
+      starts_at: conv.starts_at,
+      ends_at: conv.ends_at,
+      status: 'completed',
+      created_at: now,
+      updated_at: now,
+    };
+    await db.appointments.save(appointment);
+
+    const moved = await db.conversations.transitionExtraction(
+      conversationId,
+      ['pending', 'failed', 'done', 'needs_review'],
+      { appointment_id: appointmentId, client_id: clientId, correlation_status: 'walk_in' },
+      (row) => !row.appointment_id,
+    );
+    if (!moved) {
+      // The appointment was created for a recording that has since been placed
+      // elsewhere. Remove it rather than leaving an empty walk-in on the books.
+      await db.appointments.delete(appointmentId);
+      await db.conversations.releaseAppointment(appointmentId);
+      claimed = false;
+      return res.status(409).json({ error: 'already matched or not found' });
     }
 
-    const appt = await db.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-            VALUES ($1, $2, $3, $4, 'completed') RETURNING id`,
-      [
-        parsed.data.client_id,
-        // No PB booking exists, so the id is derived from the recording — stable,
-        // and obviously not a Practice Better id to anyone reading the table.
-        `walkin-${req.params.id}`,
-        conv.rows[0].starts_at,
-        conv.rows[0].ends_at,
-      ],
-    );
-
-    await db.query(
-      `UPDATE conversations
-          SET appointment_id = $2, client_id = $3, correlation_status = 'walk_in'
-        WHERE id = $1`,
-      [req.params.id, appt.rows[0].id, parsed.data.client_id],
-    );
-    await db.query('COMMIT');
-
     logEvent('info', 'review.assign_client', 'assigned a walk-in recording to a client', {
-      conversation_id: req.params.id,
-      client_id: parsed.data.client_id,
-      appointment_id: appt.rows[0].id,
+      conversation_id: conversationId,
+      client_id: clientId,
+      appointment_id: appointmentId,
     });
     await recordAudit({
       entityType: 'session',
-      entityId: appt.rows[0].id,
+      entityId: appointmentId,
       action: 'session.assigned_walkin',
       actor: 'nicole',
       summary: 'Walk-in recording assigned to a client (appointment created from the recording)',
-      metadata: { conversation_id: req.params.id, client_id: parsed.data.client_id },
+      metadata: { conversation_id: conversationId, client_id: clientId },
     });
 
-    if (conv.rows[0].transcript) {
-      void processConversation(req.params.id).catch((e) =>
-        logError('session.process', 'walk-in processing failed', e, { conversation_id: req.params.id }),
+    if (moved.transcript) {
+      void processConversation(conversationId).catch((e) =>
+        logError('session.process', 'walk-in processing failed', e, { conversation_id: conversationId }),
       );
     }
-    return res.json({ appointment_id: appt.rows[0].id, client_id: parsed.data.client_id, status: 'walk_in' });
+    return res.json({ appointment_id: appointmentId, client_id: clientId, status: 'walk_in' });
   } catch (err) {
-    await db.query('ROLLBACK').catch(() => {});
-    logError('review.assign_client', 'walk-in assignment failed', err, { id: req.params.id });
+    if (claimed) await db.conversations.releaseAppointment(appointmentId).catch(() => {});
+    logError('review.assign_client', 'walk-in assignment failed', err, { id: conversationId });
     return res.status(500).json({ error: 'internal error' });
-  } finally {
-    db.release();
   }
 });
 
@@ -403,32 +446,17 @@ reviewRouter.post('/unmatched/:id/assign-client', async (req, res) => {
 type UnmatchOutcome = { code: number; body: Record<string, unknown> };
 
 async function unmatchByConversation(conversationId: string): Promise<UnmatchOutcome> {
-  const db = await pool.connect();
+  const db = getDatabase();
   try {
-    await db.query('BEGIN');
-    const conv = await db.query<{ appointment_id: string | null }>(
-      `SELECT appointment_id FROM conversations WHERE id = $1 FOR UPDATE`,
-      [conversationId],
-    );
-    if (conv.rowCount === 0) {
-      await db.query('ROLLBACK');
-      return { code: 404, body: { error: 'not found' } };
-    }
-    const apptId = conv.rows[0].appointment_id;
+    const conv = await db.conversations.findById(conversationId);
+    if (!conv) return { code: 404, body: { error: 'not found' } };
+    const apptId = conv.appointment_id;
     if (!apptId) {
-      await db.query('ROLLBACK');
       return { code: 409, body: { error: 'not matched', detail: 'This recording is already unassigned.' } };
     }
 
-    const approved = await db.query(
-      `SELECT 1 FROM appointment_sheets WHERE appointment_id = $1 AND status = 'approved'
-        UNION ALL
-       SELECT 1 FROM protocols WHERE appointment_id = $1 AND status = 'approved'
-        LIMIT 1`,
-      [apptId],
-    );
-    if (approved.rowCount) {
-      await db.query('ROLLBACK');
+    const docs = await db.sessionNotes.findSessionDocs(apptId);
+    if (docs.sheet?.status === 'approved' || docs.protocol?.status === 'approved') {
       return {
         code: 409,
         body: {
@@ -439,25 +467,40 @@ async function unmatchByConversation(conversationId: string): Promise<UnmatchOut
       };
     }
 
+    // Detach the conversation FIRST, guarded on it still pointing where we
+    // think. In Postgres one transaction covered the whole teardown; here the
+    // order carries the safety instead. Releasing the pointer before deleting
+    // the drafts means a crash mid-way leaves an unmatched recording beside an
+    // orphaned draft — recoverable, and visible in the queue — rather than a
+    // matched recording whose note has already been destroyed.
+    const detached = await db.conversations.transitionExtraction(
+      conversationId,
+      ['pending', 'processing', 'failed', 'done', 'needs_review'],
+      {
+        appointment_id: null,
+        client_id: null,
+        correlation_status: 'unmatched',
+        extraction_status: 'pending',
+        extraction_leased_at: null,
+        extraction_next_attempt_at: new Date().toISOString(),
+      },
+      (row) => row.appointment_id === apptId,
+    );
+    if (!detached) {
+      return { code: 409, body: { error: 'not matched', detail: 'This recording moved before it could be detached.' } };
+    }
+
     // The draft note belongs to the wrong client — remove it rather than leaving
     // it in her queue attributed to someone who was never in the room.
-    await db.query(`DELETE FROM appointment_sheets WHERE appointment_id = $1`, [apptId]);
-    await db.query(`DELETE FROM protocols WHERE appointment_id = $1`, [apptId]);
+    await db.sessionNotes.deleteSessionDocs(apptId);
 
     // A walk-in appointment exists only to carry this recording, so it goes too.
-    await db.query(
-      `DELETE FROM appointments WHERE id = $1 AND pb_id = $2`,
-      [apptId, `walkin-${conversationId}`],
-    );
+    if (apptId === walkInAppointmentId(conversationId)) {
+      await db.appointments.delete(apptId);
+    }
 
-    await db.query(
-      `UPDATE conversations
-          SET appointment_id = NULL, client_id = NULL,
-              correlation_status = 'unmatched', extraction_status = 'pending'
-        WHERE id = $1`,
-      [conversationId],
-    );
-    await db.query('COMMIT');
+    // Hand the appointment back so it can be offered as a candidate again.
+    await db.conversations.releaseAppointment(apptId);
 
     logEvent('info', 'review.unmatch', 'detached a recording from its appointment', {
       conversation_id: conversationId,
@@ -473,16 +516,12 @@ async function unmatchByConversation(conversationId: string): Promise<UnmatchOut
     });
     return { code: 200, body: { status: 'unmatched' } };
   } catch (err) {
-    await db.query('ROLLBACK').catch(() => {});
     logError('review.unmatch', 'unmatch failed', err, { id: conversationId });
     return { code: 500, body: { error: 'internal error' } };
-  } finally {
-    db.release();
   }
 }
 
 reviewRouter.post('/conversations/:id/unmatch', async (req, res) => {
-  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   const out = await unmatchByConversation(req.params.id);
   return res.status(out.code).json(out.body);
 });
@@ -498,21 +537,16 @@ function unmatchOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
     try {
-      const conv = await pool.query<{ id: string }>(
-        `SELECT c.id
-           FROM conversations c
-           JOIN ${table} t ON t.appointment_id = c.appointment_id
-          WHERE t.id = $1
-          LIMIT 1`,
-        [req.params.id],
-      );
-      if (conv.rowCount === 0) {
+      // Both document collections key on the appointment id, so the JOIN that
+      // resolved a document to its recording is now a direct lookup.
+      const conv = await getDatabase().conversations.findByAppointment(req.params.id);
+      if (!conv) {
         return res.status(404).json({
           error: 'no recording',
           detail: 'This session has no Bee recording attached, so there is nothing to reassign.',
         });
       }
-      const out = await unmatchByConversation(conv.rows[0].id);
+      const out = await unmatchByConversation(conv.id);
       return res.status(out.code).json(out.body);
     } catch (err) {
       logError(`review.${table}_unmatch`, 'unmatch lookup failed', err, { id: req.params.id });
@@ -526,42 +560,38 @@ function unmatchOne(table: Table) {
 // ---------------------------------------------------------------------------
 type Table = 'appointment_sheets' | 'protocols';
 
+/** Both collections key the document on the appointment id, so `id` IS that id. */
+async function loadDoc(table: Table, id: string) {
+  const docs = await getDatabase().sessionNotes.findSessionDocs(id);
+  return { docs, doc: table === 'appointment_sheets' ? docs.sheet : docs.protocol };
+}
+
 function getOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
     try {
-      const r = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
-      if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+      const { docs, doc } = await loadDoc(table, req.params.id);
+      if (!doc) return res.status(404).json({ error: 'not found' });
 
       // Whether this session can still be detached from its client, so the UI can
       // avoid offering an action that would only fail. A sheet and a protocol
       // share an appointment: approving EITHER publishes documents, which pins
       // the pairing even while the other is still a draft.
-      const apptId = r.rows[0].appointment_id;
+      const approved = docs.sheet?.status === 'approved' || docs.protocol?.status === 'approved';
+      const conv = await getDatabase().conversations.findByAppointment(doc.appointment_id);
+
       let canUnmatch = false;
-      let blocked: string | null = 'This session has no Bee recording attached.';
-      if (apptId) {
-        const [conv, approved] = await Promise.all([
-          pool.query(`SELECT 1 FROM conversations WHERE appointment_id = $1 LIMIT 1`, [apptId]),
-          pool.query(
-            `SELECT 1 FROM appointment_sheets WHERE appointment_id = $1 AND status = 'approved'
-              UNION ALL
-             SELECT 1 FROM protocols WHERE appointment_id = $1 AND status = 'approved'
-              LIMIT 1`,
-            [apptId],
-          ),
-        ]);
-        if (approved.rowCount) {
-          blocked = 'This session has been approved and its documents published. Amend it instead.';
-        } else if (conv.rowCount === 0) {
-          blocked = 'This session has no Bee recording attached.';
-        } else {
-          canUnmatch = true;
-          blocked = null;
-        }
+      let blocked: string | null;
+      if (approved) {
+        blocked = 'This session has been approved and its documents published. Amend it instead.';
+      } else if (!conv) {
+        blocked = 'This session has no Bee recording attached.';
+      } else {
+        canUnmatch = true;
+        blocked = null;
       }
 
-      return res.json({ ...r.rows[0], can_unmatch: canUnmatch, unmatch_blocked_reason: blocked });
+      return res.json({ ...doc, can_unmatch: canUnmatch, unmatch_blocked_reason: blocked });
     } catch (err) {
       logError(`review.${table}_get`, 'fetch failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
@@ -589,14 +619,40 @@ function patchOne(table: Table) {
       }
 
       // A bare status change (draft → in_review) is per-document bookkeeping and
-      // carries no clinical content, so it stays where it is.
+      // carries no clinical content, so it stays a direct write — but it goes
+      // through the guarded write so it cannot touch an approved session.
+      //
+      // `approved` is refused here. The pg version accepted it as a plain UPDATE,
+      // which silently skipped everything approval actually means: the supplement
+      // sync, the follow-up tasks, the approval record, and the Drive publish. A
+      // session marked approved that way looked signed-off in the queue while the
+      // client's documents were never written. Approving goes through
+      // POST /approve, which is the only path that does those.
+      if (status === 'approved') {
+        return res.status(409).json({
+          error: 'use approve',
+          detail: 'Approving publishes documents and syncs the plan. Use the approve action instead.',
+        });
+      }
       if (status) {
-        await pool.query(`UPDATE ${table} SET status = $2 WHERE id = $1`, [req.params.id, status]);
+        const out = await getDatabase().sessionNotes.guardedWrite({
+          appointmentId: req.params.id,
+          expect: ['draft', 'in_review'],
+          status,
+        });
+        if (!out.ok) {
+          return out.reason === 'not_found'
+            ? res.status(404).json({ error: 'not found' })
+            : res.status(409).json({
+                error: 'already approved',
+                detail: 'This session has been approved. Use amend to correct it.',
+              });
+        }
       }
 
-      const r = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
-      if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
-      return res.json(r.rows[0]);
+      const { doc } = await loadDoc(table, req.params.id);
+      if (!doc) return res.status(404).json({ error: 'not found' });
+      return res.json(doc);
     } catch (err) {
       logError(`review.${table}_patch`, 'update failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
@@ -641,8 +697,8 @@ function amendOne(table: Table) {
         );
       }
 
-      const row = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
-      return res.json({ ...row.rows[0], revision: out.revision });
+      const { doc } = await loadDoc(table, req.params.id);
+      return res.json({ ...doc, revision: out.revision });
     } catch (err) {
       logError(`review.${table}_amend`, 'amend failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
@@ -669,52 +725,23 @@ function historyOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
     try {
-      const item = await pool.query<{
-        client_id: string | null;
-        appointment_id: string | null;
-        starts_at: string | null;
-      }>(
-        `SELECT t.client_id, t.appointment_id, a.starts_at
-           FROM ${table} t
-      LEFT JOIN appointments a ON a.id = t.appointment_id
-          WHERE t.id = $1`,
-        [req.params.id],
-      );
-      if (item.rowCount === 0) return res.status(404).json({ error: 'not found' });
-      const { client_id: clientId, appointment_id: apptId, starts_at: startsAt } = item.rows[0];
+      const { doc } = await loadDoc(table, req.params.id);
+      if (!doc) return res.status(404).json({ error: 'not found' });
+      const clientId = doc.client_id ?? null;
       if (!clientId) return res.json({ total: 0, sessions: [] });
 
-      // Count first: the list is capped, and silently dropping older visits
-      // would misrepresent the client's history as shorter than it is.
-      const totalRow = await pool.query<{ n: string }>(
-        `SELECT count(*) AS n
-           FROM appointments a
-      LEFT JOIN appointment_sheets s ON s.appointment_id = a.id AND s.status = 'approved'
-      LEFT JOIN protocols p ON p.appointment_id = a.id AND p.status = 'approved'
-          WHERE a.client_id = $1
-            AND ($2::uuid IS NULL OR a.id IS DISTINCT FROM $2::uuid)
-            AND ($3::timestamptz IS NULL OR a.starts_at < $3::timestamptz)
-            AND (s.id IS NOT NULL OR p.id IS NOT NULL)`,
-        [clientId, apptId, startsAt],
-      );
-
-      const r = await pool.query<{ starts_at: string; content_json: unknown }>(
-        `SELECT a.starts_at, COALESCE(s.content_json, p.content_json) AS content_json
-           FROM appointments a
-      LEFT JOIN appointment_sheets s ON s.appointment_id = a.id AND s.status = 'approved'
-      LEFT JOIN protocols p ON p.appointment_id = a.id AND p.status = 'approved'
-          WHERE a.client_id = $1
-            AND ($2::uuid IS NULL OR a.id IS DISTINCT FROM $2::uuid)
-            AND ($3::timestamptz IS NULL OR a.starts_at < $3::timestamptz)
-            AND (s.id IS NOT NULL OR p.id IS NOT NULL)
-       ORDER BY a.starts_at DESC
-          LIMIT $4`,
-        [clientId, apptId, startsAt, HISTORY_LIMIT],
-      );
+      // The count comes back with the list, from a real count() aggregation —
+      // the list is capped, and silently dropping older visits would
+      // misrepresent the client's history as shorter than it is.
+      const { total, sessions } = await getDatabase().sessionNotes.listApprovedHistory(clientId, {
+        excludeAppointmentId: doc.appointment_id,
+        before: doc.starts_at ?? null,
+        limit: HISTORY_LIMIT,
+      });
 
       return res.json({
-        total: Number(totalRow.rows[0]?.n ?? 0),
-        sessions: r.rows.map((x) => ({
+        total,
+        sessions: sessions.map((x) => ({
           date: x.starts_at,
           note: coerceSessionNote(x.content_json),
         })),
@@ -778,8 +805,8 @@ function approveOne(table: Table) {
         }
       }
 
-      const row = await pool.query(`SELECT * FROM ${table} WHERE id = $1`, [req.params.id]);
-      return res.json(row.rows[0]);
+      const { doc } = await loadDoc(table, req.params.id);
+      return res.json(doc);
     } catch (err) {
       logError(`review.${table}_approve`, 'approve failed', err, { id: req.params.id });
       return res.status(500).json({ error: 'internal error' });
@@ -792,86 +819,57 @@ async function fetchTranscript(
   appointmentId: string | null,
 ): Promise<{ text: string; recorded_at: string | null } | null> {
   if (!appointmentId) return null;
-  const r = await pool.query<{ transcript: string | null; starts_at: string | null }>(
-    `SELECT transcript, starts_at FROM conversations
-      WHERE appointment_id = $1 AND transcript IS NOT NULL
-      ORDER BY starts_at DESC LIMIT 1`,
-    [appointmentId],
-  );
-  if (r.rowCount === 0 || !r.rows[0].transcript) return null;
-  return { text: r.rows[0].transcript, recorded_at: r.rows[0].starts_at };
+  // One conversation per appointment is an invariant (the claim document), so
+  // the ORDER BY … LIMIT 1 over a possible set is now a single lookup.
+  const conv = await getDatabase().conversations.findByAppointment(appointmentId);
+  if (!conv?.transcript) return null;
+  return { text: conv.transcript, recorded_at: conv.starts_at ?? null };
 }
 
 function contextOne(table: Table) {
   return async (req: import('express').Request, res: import('express').Response) => {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
     try {
-      const item = await pool.query<{
-        client_id: string | null;
-        content_json: unknown;
-        appointment_id: string | null;
-        starts_at: string | null;
-      }>(
-        `SELECT t.client_id, t.content_json, t.appointment_id, a.starts_at
-           FROM ${table} t
-      LEFT JOIN appointments a ON a.id = t.appointment_id
-          WHERE t.id = $1`,
-        [req.params.id],
-      );
-      if (item.rowCount === 0) return res.status(404).json({ error: 'not found' });
-      const clientId = item.rows[0].client_id;
-      const note = coerceSessionNote(item.rows[0].content_json);
+      const { doc } = await loadDoc(table, req.params.id);
+      if (!doc) return res.status(404).json({ error: 'not found' });
+      const clientId = doc.client_id ?? null;
+      const note = coerceSessionNote(doc.content_json);
 
       if (!clientId) {
         return res.json({
           client_id: null,
           prior: { sheet: null, protocol: null },
           supplementPlan: { current: [], merged: previewSupplementMerge([], note) },
-          transcript: await fetchTranscript(item.rows[0].appointment_id),
+          transcript: await fetchTranscript(doc.appointment_id),
         });
       }
 
       // "Prior" means the previous SESSION, so it is ordered by when the
-      // appointment happened — not by updated_at, which is a row-modification
-      // timestamp and reorders itself every time a note is re-approved or a
-      // seed re-runs. Rows from THIS appointment are excluded by appointment_id
-      // rather than row id: a protocol and its sheet share an appointment but
-      // live in different tables with different ids, so excluding on id alone
-      // would offer this very session back as its own history.
-      const apptId = item.rows[0].appointment_id;
-      const startsAt = item.rows[0].starts_at;
-      const priorSql = (t: Table) => `
-        SELECT x.content_json, a.starts_at
-          FROM ${t} x
-          JOIN appointments a ON a.id = x.appointment_id
-         WHERE x.client_id = $1
-           AND x.status = 'approved'
-           AND ($2::uuid IS NULL OR x.appointment_id IS DISTINCT FROM $2::uuid)
-           AND ($3::timestamptz IS NULL OR a.starts_at < $3::timestamptz)
-      ORDER BY a.starts_at DESC LIMIT 1`;
-
+      // appointment happened — the denormalized starts_at — not by updated_at,
+      // which is a row-modification timestamp and reorders itself every time a
+      // note is re-approved or a seed re-runs. Rows from THIS appointment are
+      // excluded by appointment_id rather than document id: a protocol and its
+      // sheet share an appointment, so excluding on id alone would offer this
+      // very session back as its own history.
+      const scope = {
+        excludeAppointmentId: doc.appointment_id,
+        before: doc.starts_at ?? null,
+      };
+      const db = getDatabase();
       const [priorSheet, priorProtocol, current] = await Promise.all([
-        pool.query<{ content_json: unknown; starts_at: string }>(priorSql('appointment_sheets'), [
-          clientId,
-          apptId,
-          startsAt,
-        ]),
-        pool.query<{ content_json: unknown; starts_at: string }>(priorSql('protocols'), [
-          clientId,
-          apptId,
-          startsAt,
-        ]),
+        db.sessionNotes.findPriorApproved('sheet', clientId, scope),
+        db.sessionNotes.findPriorApproved('protocol', clientId, scope),
         fetchCurrentSupplements(clientId),
       ]);
 
       return res.json({
         client_id: clientId,
         prior: {
-          sheet: priorSheet.rowCount
-            ? { date: priorSheet.rows[0].starts_at, note: coerceSessionNote(priorSheet.rows[0].content_json) }
+          sheet: priorSheet
+            ? { date: priorSheet.starts_at ?? null, note: coerceSessionNote(priorSheet.content_json) }
             : null,
-          protocol: priorProtocol.rowCount
-            ? { date: priorProtocol.rows[0].starts_at, note: coerceSessionNote(priorProtocol.rows[0].content_json) }
+          protocol: priorProtocol
+            ? { date: priorProtocol.starts_at ?? null, note: coerceSessionNote(priorProtocol.content_json) }
             : null,
         },
         supplementPlan: {
@@ -882,7 +880,7 @@ function contextOne(table: Table) {
         // extracted fields with no way to check any of them against what was
         // actually said; pairing each finding with its quote is what turns
         // reviewing into confirming.
-        transcript: await fetchTranscript(apptId),
+        transcript: await fetchTranscript(doc.appointment_id),
       });
     } catch (err) {
       logError(`review.${table}_context`, 'context query failed', err, { id: req.params.id });
@@ -916,50 +914,32 @@ reviewRouter.post('/protocols/:id/unmatch', unmatchOne('protocols'));
 // Rendered on-demand (always fresh after edits); Zapier/dashboard fetch these
 // and write the Appointment Sheet / Protocol to Drive.
 // ---------------------------------------------------------------------------
-reviewRouter.get('/sheets/:id/render', async (req, res) => {
-  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
-  try {
-    const r = await pool.query(
-      `SELECT s.content_json, c.name AS client_name, a.starts_at
-         FROM appointment_sheets s
-         JOIN appointments a ON a.id = s.appointment_id
-    LEFT JOIN clients c ON c.id = s.client_id
-        WHERE s.id = $1`,
-      [req.params.id],
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
-    const row = r.rows[0];
-    const md = renderAppointmentSheet(coerceSessionNote(row.content_json), {
-      clientName: row.client_name ?? 'Unknown client',
-      appointmentDate: fmtDate(row.starts_at),
-    });
-    return res.json({ markdown: md });
-  } catch (err) {
-    logError('review.sheets_render', 'render failed', err, { id: req.params.id });
-    return res.status(500).json({ error: 'internal error' });
-  }
-});
+function renderOne(table: Table) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+    try {
+      const { doc } = await loadDoc(table, req.params.id);
+      if (!doc) return res.status(404).json({ error: 'not found' });
 
-reviewRouter.get('/protocols/:id/render', async (req, res) => {
-  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
-  try {
-    const r = await pool.query(
-      `SELECT p.content_json, c.name AS client_name, a.starts_at
-         FROM protocols p
-    LEFT JOIN clients c ON c.id = p.client_id
-    LEFT JOIN appointments a ON a.id = p.appointment_id
-        WHERE p.id = $1`,
-      [req.params.id],
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
-    const row = r.rows[0];
-    const md = renderProtocol(coerceSessionNote(row.content_json), {
-      clientName: row.client_name ?? 'Unknown client',
-      appointmentDate: fmtDate(row.starts_at),
-    });
-    return res.json({ markdown: md });
-  } catch (err) {
-    logError('review.protocols_render', 'render failed', err, { id: req.params.id });
-    return res.status(500).json({ error: 'internal error' });
-  }
-});
+      // client_name is denormalized onto the document at extraction time, so a
+      // render needs no clients lookup. It falls back to a live read only when
+      // the document predates the denormalization.
+      const clientName =
+        doc.client_name ??
+        (doc.client_id ? (await getDatabase().clients.findById(doc.client_id))?.name : null) ??
+        'Unknown client';
+
+      const note = coerceSessionNote(doc.content_json);
+      const ctx = { clientName, appointmentDate: fmtDate(doc.starts_at) };
+      const md =
+        table === 'appointment_sheets' ? renderAppointmentSheet(note, ctx) : renderProtocol(note, ctx);
+      return res.json({ markdown: md });
+    } catch (err) {
+      logError(`review.${table}_render`, 'render failed', err, { id: req.params.id });
+      return res.status(500).json({ error: 'internal error' });
+    }
+  };
+}
+
+reviewRouter.get('/sheets/:id/render', renderOne('appointment_sheets'));
+reviewRouter.get('/protocols/:id/render', renderOne('protocols'));

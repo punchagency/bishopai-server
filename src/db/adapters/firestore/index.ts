@@ -3,12 +3,15 @@ import type {
   Client,
   Appointment,
   Conversation,
+  ExtractionStatus,
   AppointmentClaim,
   SessionNoteRecord,
   AppointmentSheet,
   SupplementProtocol,
+  DocStatus,
   Approval,
   NoteRevision,
+  NoteTable,
   Checkout,
   CheckoutStatus,
   PaymentReconciliation,
@@ -38,7 +41,12 @@ import type {
   IStateRepository,
   IAuditRepository,
   IDatabase,
+  SessionDocs,
+  GuardedSessionWrite,
+  GuardedSessionResult,
 } from '../../interfaces/repositories.js';
+import { noteRevisionDocId, supplementDocId } from '../../ids.js';
+import { combineStatus } from '../../sessionStatus.js';
 
 /**
  * Lower bound for the overlap scan in findOverlapping. No session runs longer
@@ -137,6 +145,23 @@ export class FirestoreAppointmentsRepository implements IAppointmentsRepository 
     const snap = await this.db.get();
     return snap.docs.map((doc) => doc.data() as Appointment);
   }
+  async listRecent(limit: number): Promise<Appointment[]> {
+    const snap = await this.db.orderBy('starts_at', 'desc').limit(limit).get();
+    return snap.docs.map((doc) => doc.data() as Appointment);
+  }
+  async listBetween(fromIso: string, toIso: string): Promise<Appointment[]> {
+    const snap = await this.db
+      .where('starts_at', '>=', fromIso)
+      .where('starts_at', '<', toIso)
+      .orderBy('starts_at', 'asc')
+      .get();
+    return snap.docs.map((doc) => doc.data() as Appointment);
+  }
+  async findByPbId(pbId: string): Promise<Appointment | null> {
+    const snap = await this.db.where('pb_id', '==', pbId).limit(1).get();
+    if (snap.empty) return null;
+    return snap.docs[0].data() as Appointment;
+  }
   async findOverlapping(startsAt: string, endsAt: string): Promise<Appointment[]> {
     // Overlap is `starts_at < endsAt AND ends_at > startsAt`, but Firestore
     // cannot range-filter two different fields in one query. So we range on
@@ -194,7 +219,13 @@ export class FirestoreConversationsRepository implements IConversationsRepositor
     return snap.docs[0].data() as Conversation;
   }
   async listUnmatched(): Promise<Conversation[]> {
-    const snap = await this.db.where('status', '==', 'unmatched').get();
+    // `correlation_status`, not `status` — the earlier draft queried a field
+    // this collection does not have, so the review queue's unmatched list was
+    // always empty and every recording looked placed.
+    const snap = await this.db
+      .where('correlation_status', '==', 'unmatched')
+      .orderBy('starts_at', 'desc')
+      .get();
     return snap.docs.map((doc) => doc.data() as Conversation);
   }
   async listAll(): Promise<Conversation[]> {
@@ -205,13 +236,113 @@ export class FirestoreConversationsRepository implements IConversationsRepositor
     await this.db.doc(conversation.id).set(conversation, { merge: true });
     return conversation;
   }
+
+  async upsertByBeeId(
+    conversation: Conversation,
+  ): Promise<{ conversation: Conversation; created: boolean }> {
+    const ref = this.db.doc(conversation.id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) {
+        tx.create(ref, conversation);
+        return { conversation, created: true };
+      }
+      // Replay: keep the STORED assignment — it may be a manual one Nicole made
+      // — and only fill a transcript that was missing. `COALESCE(EXCLUDED.
+      // transcript, conversations.transcript)`, nothing else.
+      const stored = doc.data() as Conversation;
+      if (stored.transcript || !conversation.transcript) {
+        return { conversation: stored, created: false };
+      }
+      const merged: Conversation = {
+        ...stored,
+        transcript: conversation.transcript,
+        updated_at: new Date().toISOString(),
+      };
+      tx.update(ref, { transcript: merged.transcript, updated_at: merged.updated_at });
+      return { conversation: merged, created: false };
+    });
+  }
+
+  async transitionExtraction(
+    id: string,
+    from: ExtractionStatus[],
+    patch: Partial<Conversation>,
+    guard?: (row: Conversation) => boolean,
+  ): Promise<Conversation | null> {
+    const ref = this.db.doc(id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return null;
+      const row = doc.data() as Conversation;
+      if (!from.includes(row.extraction_status)) return null;
+      if (guard && !guard(row)) return null;
+      const next: Conversation = { ...row, ...patch, updated_at: new Date().toISOString() };
+      tx.update(ref, { ...patch, updated_at: next.updated_at });
+      return next;
+    });
+  }
+
+  async listStuckExtractions(leaseCutoff: string): Promise<Conversation[]> {
+    // COALESCE(extraction_leased_at, updated_at) has no Firestore equivalent, so
+    // the lease is always written at claim time (see process.ts) and this is a
+    // plain range on it. Uses the (extraction_status, extraction_leased_at) index.
+    const snap = await this.db
+      .where('extraction_status', '==', 'processing')
+      .where('extraction_leased_at', '<', leaseCutoff)
+      .get();
+    return snap.docs.map((doc) => doc.data() as Conversation);
+  }
+
+  async listExhaustedExtractions(maxAttempts: number): Promise<Conversation[]> {
+    const snap = await this.db
+      .where('extraction_status', '==', 'failed')
+      .where('extraction_attempts', '>=', maxAttempts)
+      .get();
+    return snap.docs.map((doc) => doc.data() as Conversation);
+  }
+
+  async listDueExtractions(
+    now: string,
+    maxAttempts: number,
+    limit: number,
+  ): Promise<Conversation[]> {
+    // Firestore allows range filters on only one field per query, and this
+    // predicate ranges on two (attempts < max, next_attempt_at <= now). Range on
+    // the selective one — the due time — and apply the attempt cap in memory
+    // over an already-small result. `matched && transcribed` are equality-free
+    // NULL checks with no equivalent either, so they filter here too.
+    const snap = await this.db
+      .where('extraction_status', '==', 'failed')
+      .where('extraction_next_attempt_at', '<=', now)
+      .orderBy('extraction_next_attempt_at', 'asc')
+      .limit(limit * 4)
+      .get();
+    return snap.docs
+      .map((doc) => doc.data() as Conversation)
+      .filter(
+        (c) =>
+          (c.extraction_attempts ?? 0) < maxAttempts &&
+          !!c.appointment_id &&
+          !!c.transcript,
+      )
+      .slice(0, limit);
+  }
+
   async claimAppointment(claim: AppointmentClaim): Promise<boolean> {
     try {
       await this.claimsDb.doc(claim.id).create(claim);
       return true;
-    } catch {
-      return false; // Doc already exists (collision)
+    } catch (err) {
+      // ALREADY_EXISTS (6) means another conversation holds this appointment —
+      // the `conversations_appointment_unique` rejection. Anything else is real.
+      if ((err as { code?: number }).code === 6) return false;
+      throw err;
     }
+  }
+
+  async releaseAppointment(appointmentId: string): Promise<void> {
+    await this.claimsDb.doc(appointmentId).delete();
   }
   async delete(id: string): Promise<void> {
     await this.db.doc(id).delete();
@@ -315,17 +446,301 @@ export class FirestoreSessionNotesRepository implements ISessionNotesRepository 
     return approval;
   }
   async listApprovals(appointmentId: string): Promise<Approval[]> {
-    const snap = await this.approvalsDb.where('appointment_id', '==', appointmentId).get();
+    const snap = await this.approvalsDb
+      .where('appointment_id', '==', appointmentId)
+      .orderBy('created_at', 'desc')
+      .get();
     return snap.docs.map((doc) => doc.data() as Approval);
   }
-  async saveRevision(revision: NoteRevision): Promise<NoteRevision> {
-    await this.revisionsDb.doc(revision.id).set(revision, { merge: true });
-    return revision;
-  }
-  async listRevisions(appointmentId: string): Promise<NoteRevision[]> {
-    const snap = await this.revisionsDb.where('appointment_id', '==', appointmentId).get();
+
+  async listRevisions(sourceTable: NoteTable, sourceId: string): Promise<NoteRevision[]> {
+    const snap = await this.revisionsDb
+      .where('source_table', '==', sourceTable)
+      .where('source_id', '==', sourceId)
+      .orderBy('revision', 'desc')
+      .get();
     return snap.docs.map((doc) => doc.data() as NoteRevision);
   }
+
+  async findSessionDocs(appointmentId: string): Promise<SessionDocs> {
+    // Document id == appointment_id for both, so this is two gets by ref rather
+    // than the LEFT JOIN it replaces.
+    const [sheet, protocol] = await getFirestoreInstance().getAll(
+      this.sheetsDb.doc(appointmentId),
+      this.protocolsDb.doc(appointmentId),
+    );
+    return {
+      sheet: sheet.exists ? (sheet.data() as AppointmentSheet) : null,
+      protocol: protocol.exists ? (protocol.data() as SupplementProtocol) : null,
+    };
+  }
+
+  async findManySessionDocs(appointmentIds: string[]): Promise<Map<string, SessionDocs>> {
+    const out = new Map<string, SessionDocs>();
+    if (appointmentIds.length === 0) return out;
+
+    // getAll is a single round trip but the request itself has a size ceiling,
+    // so chunk it. Interleaved sheet/protocol refs keep the two halves of one
+    // session in the same chunk, which is what lets the reassembly below be a
+    // simple positional walk.
+    const CHUNK = 100;
+    for (let i = 0; i < appointmentIds.length; i += CHUNK) {
+      const slice = appointmentIds.slice(i, i + CHUNK);
+      const refs = slice.flatMap((id) => [this.sheetsDb.doc(id), this.protocolsDb.doc(id)]);
+      const docs = await getFirestoreInstance().getAll(...refs);
+      slice.forEach((id, n) => {
+        const sheet = docs[n * 2];
+        const protocol = docs[n * 2 + 1];
+        out.set(id, {
+          sheet: sheet.exists ? (sheet.data() as AppointmentSheet) : null,
+          protocol: protocol.exists ? (protocol.data() as SupplementProtocol) : null,
+        });
+      });
+    }
+    return out;
+  }
+
+  /**
+   * The session-path compare-and-set. Everything that must land with the status
+   * change lands here, in one transaction: both documents, the approval record,
+   * and the revision snapshots.
+   *
+   * Deliberately contains no I/O beyond Firestore. A transaction is RETRIED on
+   * contention, so a Drive write or an email sent from inside would go out twice
+   * (§3.3) — publishing is sequenced after this returns.
+   */
+  async guardedWrite(args: GuardedSessionWrite): Promise<GuardedSessionResult> {
+    const firestore = getFirestoreInstance();
+    const sheetRef = this.sheetsDb.doc(args.appointmentId);
+    const protocolRef = this.protocolsDb.doc(args.appointmentId);
+
+    return firestore.runTransaction(async (tx) => {
+      // ALL reads first — Firestore rejects a transaction that reads after it
+      // has written.
+      const [sheetDoc, protocolDoc] = await tx.getAll(sheetRef, protocolRef);
+      const before: SessionDocs = {
+        sheet: sheetDoc.exists ? (sheetDoc.data() as AppointmentSheet) : null,
+        protocol: protocolDoc.exists ? (protocolDoc.data() as SupplementProtocol) : null,
+      };
+
+      if (!before.sheet && !before.protocol) {
+        return { ok: false, reason: 'not_found', before } as const;
+      }
+      const current = combineStatus(before.sheet?.status ?? null, before.protocol?.status ?? null);
+      if (!args.expect.includes(current)) {
+        return { ok: false, reason: 'wrong_status', before } as const;
+      }
+
+      const now = new Date().toISOString();
+      // The two documents always carry the same revision, because every write
+      // touches both. Reading it off whichever exists keeps a session with no
+      // protocol numbering correctly.
+      const revision = before.sheet?.revision ?? before.protocol?.revision ?? 1;
+
+      if (args.snapshotRevision) {
+        const reason = args.snapshotRevision.reason;
+        for (const [table, doc] of [
+          ['appointment_sheets', before.sheet],
+          ['protocols', before.protocol],
+        ] as const) {
+          if (!doc) continue;
+          // create(), not set(): the deterministic id IS note_revisions_unique,
+          // so a double-submitted amendment collides instead of overwriting the
+          // history it already filed.
+          tx.create(this.revisionsDb.doc(noteRevisionDocId(table, doc.id, revision)), {
+            id: noteRevisionDocId(table, doc.id, revision),
+            source_table: table,
+            source_id: doc.id,
+            appointment_id: args.appointmentId,
+            revision,
+            content_json: doc.content_json,
+            reason,
+            created_at: now,
+          } satisfies NoteRevision);
+        }
+      }
+
+      const patch: Record<string, unknown> = { updated_at: now };
+      if (args.content !== undefined) patch.content_json = args.content;
+      if (args.status !== undefined) patch.status = args.status;
+      if (args.snapshotRevision) patch.revision = revision + 1;
+
+      if (before.sheet) tx.update(sheetRef, patch);
+      if (before.protocol) tx.update(protocolRef, patch);
+      if (args.approval) tx.create(this.approvalsDb.doc(args.approval.id), args.approval);
+
+      return { ok: true, before, revision } as const;
+    });
+  }
+
+  async listProtocolsByClient(
+    clientId: string,
+    opts: { status?: DocStatus; limit?: number } = {},
+  ): Promise<SupplementProtocol[]> {
+    let query: admin.firestore.Query = this.protocolsDb.where('client_id', '==', clientId);
+    if (opts.status) query = query.where('status', '==', opts.status);
+    // Ordered by when the session happened. Documents MISSING starts_at are
+    // dropped from an orderBy result (§3.5), which is correct here — a protocol
+    // with no appointment date has no place in a chronological flow sheet — but
+    // it is why saveExtractedNote always writes the field, even as null.
+    query = query.orderBy('starts_at', 'asc');
+    if (opts.limit) query = query.limit(opts.limit);
+    const snap = await query.get();
+    return snap.docs.map((doc) => doc.data() as SupplementProtocol);
+  }
+
+  async findPriorApproved(
+    kind: 'sheet' | 'protocol',
+    clientId: string,
+    opts: { excludeAppointmentId: string | null; before: string | null },
+  ): Promise<AppointmentSheet | SupplementProtocol | null> {
+    const collection = kind === 'sheet' ? this.sheetsDb : this.protocolsDb;
+    let query: admin.firestore.Query = collection
+      .where('client_id', '==', clientId)
+      .where('status', '==', 'approved');
+    if (opts.before) query = query.where('starts_at', '<', opts.before);
+    // Fetch two so the excluded appointment can be skipped without a second
+    // round trip — Firestore has no `!=` that composes with a range filter.
+    const snap = await query.orderBy('starts_at', 'desc').limit(2).get();
+    for (const doc of snap.docs) {
+      const row = doc.data() as AppointmentSheet | SupplementProtocol;
+      if (opts.excludeAppointmentId && row.appointment_id === opts.excludeAppointmentId) continue;
+      return row;
+    }
+    return null;
+  }
+
+  async listApprovedHistory(
+    clientId: string,
+    opts: { excludeAppointmentId: string | null; before: string | null; limit: number },
+  ): Promise<{ total: number; sessions: Array<{ starts_at: string | null; content_json: unknown }> }> {
+    // One entry per APPOINTMENT, preferring the sheet and falling back to the
+    // protocol — the two carry the same clinical fields and either may be the
+    // one she approved, so keying on the appointment avoids listing a visit twice.
+    const build = (collection: admin.firestore.CollectionReference) => {
+      let q: admin.firestore.Query = collection
+        .where('client_id', '==', clientId)
+        .where('status', '==', 'approved');
+      if (opts.before) q = q.where('starts_at', '<', opts.before);
+      return q.orderBy('starts_at', 'desc');
+    };
+
+    // The count is a real aggregation query, not a read of every document (§3.4),
+    // so capping the list never misreports the client's history as shorter than
+    // it is. Sheets and protocols are counted from the merged appointment set
+    // below rather than summed, since a visit usually has both.
+    const [sheetSnap, protocolSnap] = await Promise.all([
+      build(this.sheetsDb).limit(opts.limit * 2).get(),
+      build(this.protocolsDb).limit(opts.limit * 2).get(),
+    ]);
+
+    const byAppointment = new Map<string, { starts_at: string | null; content_json: unknown }>();
+    for (const doc of sheetSnap.docs) {
+      const row = doc.data() as AppointmentSheet;
+      byAppointment.set(row.appointment_id, {
+        starts_at: row.starts_at ?? null,
+        content_json: row.content_json,
+      });
+    }
+    for (const doc of protocolSnap.docs) {
+      const row = doc.data() as SupplementProtocol;
+      if (byAppointment.has(row.appointment_id)) continue; // the sheet wins
+      byAppointment.set(row.appointment_id, {
+        starts_at: row.starts_at ?? null,
+        content_json: row.content_json,
+      });
+    }
+    if (opts.excludeAppointmentId) byAppointment.delete(opts.excludeAppointmentId);
+
+    const [sheetCount, protocolCount] = await Promise.all([
+      build(this.sheetsDb).count().get(),
+      build(this.protocolsDb).count().get(),
+    ]);
+    // An appointment with both documents is one visit. Sheets exist for every
+    // session and protocols only for those with a client, so the sheet count is
+    // the visit count whenever it is the larger of the two.
+    const counted = Math.max(sheetCount.data().count, protocolCount.data().count);
+    const total = opts.excludeAppointmentId ? Math.max(0, counted - 1) : counted;
+
+    const sessions = [...byAppointment.values()]
+      .sort((a, b) => (b.starts_at ?? '').localeCompare(a.starts_at ?? ''))
+      .slice(0, opts.limit);
+    return { total, sessions };
+  }
+
+  async saveExtractedNote(args: {
+    appointmentId: string;
+    clientId: string | null;
+    startsAt: string | null;
+    clientName: string | null;
+    content: Record<string, unknown>;
+  }): Promise<{ written: boolean }> {
+    const firestore = getFirestoreInstance();
+    const sheetRef = this.sheetsDb.doc(args.appointmentId);
+    const protocolRef = this.protocolsDb.doc(args.appointmentId);
+
+    return firestore.runTransaction(async (tx) => {
+      const [sheetDoc, protocolDoc] = await tx.getAll(sheetRef, protocolRef);
+      const sheet = sheetDoc.exists ? (sheetDoc.data() as AppointmentSheet) : null;
+      const protocol = protocolDoc.exists ? (protocolDoc.data() as SupplementProtocol) : null;
+
+      // Approved content only ever changes through amend, which snapshots what
+      // it supersedes. An extraction landing on an approved appointment means a
+      // recording was matched where a signed-off session already lives — refused
+      // upstream, and refused again here so no path can silently demote approved
+      // clinical content back to draft.
+      if (sheet?.status === 'approved' || protocol?.status === 'approved') {
+        return { written: false };
+      }
+
+      const now = new Date().toISOString();
+      tx.set(
+        sheetRef,
+        {
+          id: args.appointmentId,
+          appointment_id: args.appointmentId,
+          client_id: args.clientId,
+          starts_at: args.startsAt,
+          client_name: args.clientName,
+          content_json: args.content,
+          status: 'draft' as DocStatus,
+          revision: sheet?.revision ?? 1,
+          created_at: sheet?.created_at ?? now,
+          updated_at: now,
+        } satisfies AppointmentSheet,
+        { merge: true },
+      );
+
+      // Client-facing; an appointment with no client attached has no protocol.
+      if (args.clientId) {
+        tx.set(
+          protocolRef,
+          {
+            id: args.appointmentId,
+            appointment_id: args.appointmentId,
+            client_id: args.clientId,
+            starts_at: args.startsAt,
+            client_name: args.clientName,
+            content_json: args.content,
+            status: 'draft' as DocStatus,
+            revision: protocol?.revision ?? 1,
+            created_at: protocol?.created_at ?? now,
+            updated_at: now,
+          } satisfies SupplementProtocol,
+          { merge: true },
+        );
+      }
+      return { written: true };
+    });
+  }
+
+  async deleteSessionDocs(appointmentId: string): Promise<void> {
+    const batch = getFirestoreInstance().batch();
+    batch.delete(this.sheetsDb.doc(appointmentId));
+    batch.delete(this.protocolsDb.doc(appointmentId));
+    await batch.commit();
+  }
+
   async clearAll(): Promise<void> {
     await deleteAllDocs([this.db, this.sheetsDb, this.protocolsDb, this.approvalsDb, this.revisionsDb]);
   }
@@ -619,8 +1034,26 @@ export class FirestoreRefillsRepository implements IRefillsRepository {
     await this.supplementsDb.doc(supp.id).set(supp, { merge: true });
     return supp;
   }
+  async findSupplement(clientId: string, nameKey: string): Promise<Supplement | null> {
+    const doc = await this.supplementsDb.doc(supplementDocId(clientId, nameKey)).get();
+    return doc.exists ? (doc.data() as Supplement) : null;
+  }
+  async deleteSupplement(clientId: string, nameKey: string): Promise<boolean> {
+    const ref = this.supplementsDb.doc(supplementDocId(clientId, nameKey));
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      // Read first so the caller gets the pg rowCount semantics — "removed 0"
+      // and "removed 1" are different answers in the sync result Nicole sees.
+      const doc = await tx.get(ref);
+      if (!doc.exists) return false;
+      tx.delete(ref);
+      return true;
+    });
+  }
   async listSupplementsByClient(clientId: string): Promise<Supplement[]> {
-    const snap = await this.supplementsDb.where('client_id', '==', clientId).get();
+    const snap = await this.supplementsDb
+      .where('client_id', '==', clientId)
+      .orderBy('name', 'asc')
+      .get();
     return snap.docs.map((doc) => doc.data() as Supplement);
   }
   async listAllSupplements(): Promise<Supplement[]> {
@@ -741,8 +1174,19 @@ export class FirestoreDocumentsRepository implements IDocumentsRepository {
     await this.db.doc(doc.id).set(doc, { merge: true });
     return doc;
   }
+  async listByClient(clientId: string, limit = 100): Promise<DocumentRecord[]> {
+    const snap = await this.db
+      .where('client_id', '==', clientId)
+      .orderBy('created_at', 'desc')
+      .limit(limit)
+      .get();
+    return snap.docs.map((d) => d.data() as DocumentRecord);
+  }
   async listByAppointment(appointmentId: string): Promise<DocumentRecord[]> {
-    const snap = await this.db.where('appointment_id', '==', appointmentId).get();
+    const snap = await this.db
+      .where('appointment_id', '==', appointmentId)
+      .orderBy('created_at', 'desc')
+      .get();
     return snap.docs.map((d) => d.data() as DocumentRecord);
   }
   async clearAll(): Promise<void> {

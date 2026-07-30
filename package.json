@@ -2,7 +2,7 @@
   "name": "bishopai-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Innerlume Healing automation backend \u2014 correlation engine + checkout state machine",
+  "description": "Innerlume Healing automation backend — correlation engine + checkout state machine",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -15,7 +15,7 @@
     "seed:journey": "tsx scripts/seed-demo-journey.mts",
     "demo:templates": "tsx scripts/demo-templates.mts",
     "google-auth": "node scripts/google-auth.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "firebase:emulators": "npx -y firebase-tools@latest emulators:start --only firestore,functions,hosting,storage",

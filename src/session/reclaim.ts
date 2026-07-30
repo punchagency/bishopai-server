@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent } from '../observability/logger';
 import { processConversation } from './process';
 
@@ -12,6 +12,10 @@ import { processConversation } from './process';
 // swept it, and the only symptom was an appointment that quietly never got a
 // sheet. `failed` was barely better: retried only if a human happened to
 // re-match the conversation.
+//
+// Under Cloud Functions this matters MORE, not less: an instance can be torn
+// down mid-call at any time, so "the process died holding a claim" stops being
+// an outage-only event and becomes routine.
 
 /** How long a claim may go unfinished before we assume its owner died. */
 const LEASE_MINUTES = Number(process.env.EXTRACTION_LEASE_MINUTES ?? 10);
@@ -24,6 +28,9 @@ export function backoffMinutes(attempts: number): number {
   return BACKOFF_MINUTES[Math.min(attempts, BACKOFF_MINUTES.length - 1)];
 }
 
+const minutesFromNow = (minutes: number): string =>
+  new Date(Date.now() + minutes * 60_000).toISOString();
+
 export interface ReclaimResult {
   reclaimed: number;
 }
@@ -35,28 +42,37 @@ export interface ReclaimResult {
  * free would just hang forever, repeatedly.
  */
 export async function reclaimStuckExtractions(): Promise<ReclaimResult> {
-  const r = await pool.query<{ id: string }>(
-    `UPDATE conversations
-        SET extraction_status = 'failed',
-            extraction_attempts = extraction_attempts + 1,
-            extraction_error = COALESCE(extraction_error,
-              'extraction lease expired — process died mid-flight'),
-            extraction_next_attempt_at = now(),
-            updated_at = now()
-      WHERE extraction_status = 'processing'
-        AND COALESCE(extraction_leased_at, updated_at) < now() - ($1 || ' minutes')::interval
-    RETURNING id`,
-    [String(LEASE_MINUTES)],
-  );
-  const reclaimed = r.rowCount ?? 0;
-  if (reclaimed > 0) {
+  const db = getDatabase();
+  const cutoff = new Date(Date.now() - LEASE_MINUTES * 60_000).toISOString();
+  const stuck = await db.conversations.listStuckExtractions(cutoff);
+
+  const ids: string[] = [];
+  for (const row of stuck) {
+    const attempts = (row.extraction_attempts ?? 0) + 1;
+    // Guarded, not a blind write: between the query and here another worker may
+    // have finished the very call this is about to declare dead.
+    const moved = await db.conversations.transitionExtraction(row.id, ['processing'], {
+      extraction_status: 'failed',
+      extraction_attempts: attempts,
+      extraction_error:
+        row.extraction_error ?? 'extraction lease expired — process died mid-flight',
+      // Always written, never left absent: listDueExtractions ranges on this
+      // field, and Firestore drops documents that lack it from the result (§3.5),
+      // so a reclaimed row with no next-attempt time would never be retried.
+      extraction_next_attempt_at: new Date().toISOString(),
+      extraction_leased_at: null,
+    });
+    if (moved) ids.push(row.id);
+  }
+
+  if (ids.length > 0) {
     logEvent('warn', 'session.extract', 'reclaimed stuck extractions', {
-      reclaimed,
+      reclaimed: ids.length,
       lease_minutes: LEASE_MINUTES,
-      ids: r.rows.map((x) => x.id),
+      ids,
     });
   }
-  return { reclaimed };
+  return { reclaimed: ids.length };
 }
 
 export interface RetryResult {
@@ -71,45 +87,40 @@ export interface RetryResult {
  * see rather than discover when an appointment sheet is missing.
  */
 export async function processDueExtractions(limit = 20): Promise<RetryResult> {
-  const dead = await pool.query(
-    `UPDATE conversations
-        SET extraction_status = 'needs_review', updated_at = now()
-      WHERE extraction_status = 'failed'
-        AND extraction_attempts >= $1
-    RETURNING id`,
-    [MAX_ATTEMPTS],
-  );
-  const deadLettered = dead.rowCount ?? 0;
-  if (deadLettered > 0) {
+  const db = getDatabase();
+
+  const exhausted = await db.conversations.listExhaustedExtractions(MAX_ATTEMPTS);
+  const deadIds: string[] = [];
+  for (const row of exhausted) {
+    const moved = await db.conversations.transitionExtraction(row.id, ['failed'], {
+      extraction_status: 'needs_review',
+    });
+    if (moved) deadIds.push(row.id);
+  }
+  if (deadIds.length > 0) {
     logEvent('error', 'session.extract', 'extraction exhausted retries — needs review', {
-      count: deadLettered,
-      ids: dead.rows.map((r: { id: string }) => r.id),
+      count: deadIds.length,
+      ids: deadIds,
       max_attempts: MAX_ATTEMPTS,
     });
   }
 
   // Only rows that are actually processable: matched, transcribed, and due.
-  const due = await pool.query<{ id: string }>(
-    `SELECT id FROM conversations
-      WHERE extraction_status = 'failed'
-        AND extraction_attempts < $1
-        AND appointment_id IS NOT NULL
-        AND transcript IS NOT NULL
-        AND (extraction_next_attempt_at IS NULL OR extraction_next_attempt_at <= now())
-      ORDER BY extraction_next_attempt_at NULLS FIRST
-      LIMIT $2`,
-    [MAX_ATTEMPTS, limit],
+  const due = await db.conversations.listDueExtractions(
+    new Date().toISOString(),
+    MAX_ATTEMPTS,
+    limit,
   );
 
   let retried = 0;
-  for (const row of due.rows) {
+  for (const row of due) {
     // Sequential on purpose: these are paid LLM calls and a backlog should drain
     // steadily rather than stampede the provider after an outage.
     await processConversation(row.id);
     retried++;
   }
   if (retried > 0) logEvent('info', 'session.extract', 'retried failed extractions', { retried });
-  return { retried, deadLettered };
+  return { retried, deadLettered: deadIds.length };
 }
 
 /** Record a failure with its backoff. Called by processConversation. */
@@ -118,24 +129,30 @@ export async function markExtractionFailed(
   error: string,
   raw: string | null,
 ): Promise<void> {
-  await pool
-    .query(
-      `UPDATE conversations
-          SET extraction_status = 'failed',
-              extraction_attempts = extraction_attempts + 1,
-              extraction_error = $2,
-              extraction_raw = $3,
-              extraction_next_attempt_at =
-                now() + (CASE
-                  WHEN extraction_attempts + 1 >= 4 THEN 60
-                  WHEN extraction_attempts + 1 = 3 THEN 15
-                  WHEN extraction_attempts + 1 = 2 THEN 5
-                  ELSE 1 END || ' minutes')::interval,
-              updated_at = now()
-        WHERE id = $1`,
-      [conversationId, error.slice(0, 2000), raw?.slice(0, 4096) ?? null],
-    )
-    .catch(() => {
-      /* best-effort; the original error is already logged */
-    });
+  try {
+    const db = getDatabase();
+    const row = await db.conversations.findById(conversationId);
+    if (!row) return;
+    const prior = row.extraction_attempts ?? 0;
+    const attempts = prior + 1;
+    await db.conversations.transitionExtraction(
+      conversationId,
+      // 'pending' is included because a claim that failed before its transition
+      // landed leaves the row where it started, and that failure still counts.
+      ['processing', 'failed', 'pending'],
+      {
+        extraction_status: 'failed',
+        extraction_attempts: attempts,
+        extraction_error: error.slice(0, 2000),
+        extraction_raw: raw?.slice(0, 4096) ?? null,
+        // backoffMinutes is indexed by the PRIOR attempt count, matching the
+        // `CASE WHEN extraction_attempts + 1 = n` ladder it replaces: the first
+        // failure waits 1 minute, then 5, 15, and 60.
+        extraction_next_attempt_at: minutesFromNow(backoffMinutes(prior)),
+        extraction_leased_at: null,
+      },
+    );
+  } catch {
+    /* best-effort; the original error is already logged */
+  }
 }

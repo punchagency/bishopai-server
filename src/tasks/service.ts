@@ -33,7 +33,6 @@ export interface TaskRow {
 }
 
 export async function createTasksFromNote(
-  _db: unknown,
   args: { clientId: string; appointmentId: string | null; sessionDate: Date; note: SessionNote },
 ): Promise<{ created: number }> {
   const followUps = normalizeFollowUps(args.note.follow_ups);
@@ -70,10 +69,9 @@ export async function createTasksFromNote(
 }
 
 export async function reconcileTasksAfterAmend(
-  db: unknown,
   args: { clientId: string; appointmentId: string; sessionDate: Date; note: SessionNote },
 ): Promise<{ created: number; dismissed: number }> {
-  const { created } = await createTasksFromNote(db, args);
+  const { created } = await createTasksFromNote(args);
   const keepTitles = normalizeFollowUps(args.note.follow_ups).map((f) => f.text);
 
   const database = getDatabase();
