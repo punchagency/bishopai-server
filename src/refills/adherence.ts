@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 
 // WF4 adherence bundling. A light adherence signal from a client's refill
 // history: the share of refills they acted on (notified/closed) versus refills
@@ -23,14 +23,20 @@ export function suggestedMonths(a: Adherence): number {
 
 /** Compute a client's adherence from their refill history. No history → score 0 (won't bundle). */
 export async function computeAdherence(clientId: string): Promise<Adherence> {
-  const r = await pool.query<{ actioned: number; overdue: number }>(
-    `SELECT
-       count(*) FILTER (WHERE status IN ('notified', 'closed'))::int AS actioned,
-       count(*) FILTER (WHERE status = 'pending' AND due_date < current_date)::int AS overdue
-       FROM refills WHERE client_id = $1`,
-    [clientId],
-  );
-  const { actioned, overdue } = r.rows[0] ?? { actioned: 0, overdue: 0 };
+  // Two `count(*) FILTER` aggregates over one client's refills. Firestore has no
+  // filtered aggregate, and a client's refill history is a handful of documents,
+  // so both counts come off a single indexed read of that client's rows rather
+  // than two count() queries with different predicates.
+  const refills = await getDatabase().refills.listByClient(clientId);
+  const today = new Date().toISOString().slice(0, 10);
+
+  let actioned = 0;
+  let overdue = 0;
+  for (const r of refills) {
+    if (r.status === 'notified' || r.status === 'closed') actioned++;
+    else if (r.status === 'pending' && r.due_date < today) overdue++;
+  }
+
   const denom = actioned + overdue;
   return { score: denom === 0 ? 0 : actioned / denom, actioned, overdue };
 }

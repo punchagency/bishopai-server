@@ -42,7 +42,7 @@ suite('session approval against Firestore', () => {
   let db: IDatabase;
 
   beforeAll(async () => {
-    db = installFirestore();
+    db = installFirestore('session');
     const svc = await import('../src/session/sessionService');
     approveSession = svc.approveSession;
     amendSession = svc.amendSession;

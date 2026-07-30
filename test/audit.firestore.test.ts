@@ -21,7 +21,7 @@ suite('audit/log against Firestore', () => {
   let db: IDatabase;
 
   beforeAll(async () => {
-    db = installFirestore();
+    db = installFirestore('audit');
     const mod = await import('../src/audit/log');
     recordAudit = mod.recordAudit;
     auditForEntity = mod.auditForEntity;

@@ -43,7 +43,7 @@ suite('checkout money path against Firestore', () => {
   let db: IDatabase;
 
   beforeAll(async () => {
-    db = installFirestore();
+    db = installFirestore('checkout');
     machine = await import('../src/checkout/machine');
   });
 

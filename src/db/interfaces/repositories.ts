@@ -17,6 +17,7 @@ import type {
   ClientQboMap,
   Supplement,
   Refill,
+  RefillStatus,
   RefillOrder,
   Lead,
   LeadActivity,
@@ -245,6 +246,8 @@ export interface ICheckoutsRepository {
   findByAppointment(appointmentId: string): Promise<Checkout | null>;
   findByPbAppointmentId(pbAppointmentId: string): Promise<Checkout | null>;
   listAll(): Promise<Checkout[]>;
+  /** One client's checkouts. Small by construction — a client has a few visits. */
+  listByClient(clientId: string): Promise<Checkout[]>;
   save(checkout: Checkout): Promise<Checkout>;
 
   /**
@@ -349,16 +352,27 @@ export interface IRefillsRepository {
   listAllSupplements(): Promise<Supplement[]>;
   saveOrder(order: RefillOrder): Promise<RefillOrder>;
   listOrders(clientId?: string): Promise<RefillOrder[]>;
+  /** Orders against specific refills — what the brief's "ordered" flag reads. */
+  listOrdersForRefills(refillIds: string[]): Promise<RefillOrder[]>;
+  /** Refills due on or before `onOrBefore`, soonest first. */
+  listDue(onOrBefore: string, limit?: number): Promise<Refill[]>;
+  /** One status's refills — the cadence and digest both scan `pending`. */
+  listByStatus(status: RefillStatus): Promise<Refill[]>;
+  findRefillBySupplement(supplementId: string): Promise<Refill | null>;
   clearAll(): Promise<void>;
 }
 
 export interface IReengagementRepository {
   listLeads(): Promise<Lead[]>;
+  /** Leads still in a cadence — everything not closed or booked. */
+  listActiveLeads(): Promise<Lead[]>;
   findLeadById(id: string): Promise<Lead | null>;
   findLeadByEmail(email: string): Promise<Lead | null>;
   saveLead(lead: Lead): Promise<Lead>;
   logActivity(activity: LeadActivity): Promise<LeadActivity>;
   listActivities(leadId: string): Promise<LeadActivity[]>;
+  /** Activity across all leads since a cutoff, newest first — the engagement view. */
+  listRecentActivity(since: string, limit?: number): Promise<LeadActivity[]>;
   clearAll(): Promise<void>;
 }
 
@@ -390,6 +404,7 @@ export interface IDocumentsRepository {
 export interface IConsentsRepository {
   save(consent: Consent): Promise<Consent>;
   findByClientAndType(clientId: string, type: string): Promise<Consent | null>;
+  listByClient(clientId: string): Promise<Consent[]>;
   clearAll(): Promise<void>;
 }
 

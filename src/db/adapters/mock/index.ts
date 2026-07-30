@@ -17,6 +17,7 @@ import type {
   ClientQboMap,
   Supplement,
   Refill,
+  RefillStatus,
   RefillOrder,
   Lead,
   LeadActivity,
@@ -43,7 +44,7 @@ import type {
   GuardedSessionWrite,
   GuardedSessionResult,
 } from '../../interfaces/repositories.js';
-import { noteRevisionDocId, supplementDocId } from '../../ids.js';
+import { consentDocId, noteRevisionDocId, supplementDocId } from '../../ids.js';
 import { combineStatus } from '../../sessionStatus.js';
 
 export class MockClientsRepository implements IClientsRepository {
@@ -533,6 +534,9 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
   async listAll(): Promise<Checkout[]> {
     return Array.from(this.checkouts.values());
   }
+  async listByClient(clientId: string): Promise<Checkout[]> {
+    return Array.from(this.checkouts.values()).filter((c) => c.client_id === clientId);
+  }
   async save(checkout: Checkout): Promise<Checkout> {
     this.checkouts.set(checkout.id, checkout);
     return checkout;
@@ -721,6 +725,25 @@ export class MockRefillsRepository implements IRefillsRepository {
     this.orders.push(order);
     return order;
   }
+  async listOrdersForRefills(refillIds: string[]): Promise<RefillOrder[]> {
+    const wanted = new Set(refillIds);
+    return this.orders.filter((o) => o.refill_id != null && wanted.has(o.refill_id));
+  }
+  async listDue(onOrBefore: string, limit?: number): Promise<Refill[]> {
+    const rows = Array.from(this.refills.values())
+      .filter((r) => r.due_date <= onOrBefore)
+      .sort((a, b) => a.due_date.localeCompare(b.due_date));
+    return limit ? rows.slice(0, limit) : rows;
+  }
+  async listByStatus(status: RefillStatus): Promise<Refill[]> {
+    return Array.from(this.refills.values()).filter((r) => r.status === status);
+  }
+  async findRefillBySupplement(supplementId: string): Promise<Refill | null> {
+    for (const r of this.refills.values()) {
+      if (r.supplement_id === supplementId) return r;
+    }
+    return null;
+  }
   async listOrders(clientId?: string): Promise<RefillOrder[]> {
     if (clientId) return this.orders.filter((o) => o.client_id === clientId);
     return this.orders;
@@ -742,9 +765,14 @@ export class MockReengagementRepository implements IReengagementRepository {
   async findLeadById(id: string): Promise<Lead | null> {
     return this.leads.get(id) ?? null;
   }
+  async listActiveLeads(): Promise<Lead[]> {
+    return Array.from(this.leads.values()).filter(
+      (l) => l.status !== 'closed' && l.status !== 'booked',
+    );
+  }
   async findLeadByEmail(email: string): Promise<Lead | null> {
     for (const lead of this.leads.values()) {
-      if (lead.email.toLowerCase() === email.toLowerCase()) return lead;
+      if ((lead.email ?? '').toLowerCase() === email.toLowerCase()) return lead;
     }
     return null;
   }
@@ -757,7 +785,15 @@ export class MockReengagementRepository implements IReengagementRepository {
     return activity;
   }
   async listActivities(leadId: string): Promise<LeadActivity[]> {
-    return this.activities.filter((a) => a.lead_id === leadId);
+    return this.activities
+      .filter((a) => a.lead_id === leadId)
+      .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at));
+  }
+  async listRecentActivity(since: string, limit = 500): Promise<LeadActivity[]> {
+    return this.activities
+      .filter((a) => a.occurred_at >= since)
+      .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at))
+      .slice(0, limit);
   }
   async clearAll(): Promise<void> {
     this.leads.clear();
@@ -833,10 +869,14 @@ export class MockConsentsRepository implements IConsentsRepository {
     return consent;
   }
   async findByClientAndType(clientId: string, type: string): Promise<Consent | null> {
-    for (const c of this.consents.values()) {
-      if (c.client_id === clientId && c.type === type) return c;
-    }
-    return null;
+    // By document id, matching the Firestore lookup — a scan would hide a caller
+    // that built the id differently from consentDocId.
+    return this.consents.get(consentDocId(clientId, type)) ?? null;
+  }
+  async listByClient(clientId: string): Promise<Consent[]> {
+    return Array.from(this.consents.values())
+      .filter((c) => c.client_id === clientId)
+      .sort((a, b) => a.type.localeCompare(b.type));
   }
   async clearAll(): Promise<void> {
     this.consents.clear();

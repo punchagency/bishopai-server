@@ -22,7 +22,7 @@ suite('integration_state durability', () => {
   let db: IDatabase;
 
   beforeAll(async () => {
-    db = installFirestore();
+    db = installFirestore('state');
     const mod = await import('../src/db/state');
     getState = mod.getState;
     setState = mod.setState;

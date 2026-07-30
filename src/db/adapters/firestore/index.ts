@@ -18,6 +18,7 @@ import type {
   ClientQboMap,
   Supplement,
   Refill,
+  RefillStatus,
   RefillOrder,
   Lead,
   LeadActivity,
@@ -45,7 +46,7 @@ import type {
   GuardedSessionWrite,
   GuardedSessionResult,
 } from '../../interfaces/repositories.js';
-import { noteRevisionDocId, supplementDocId } from '../../ids.js';
+import { consentDocId, noteRevisionDocId, supplementDocId } from '../../ids.js';
 import { combineStatus } from '../../sessionStatus.js';
 
 /**
@@ -781,6 +782,10 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
     const snap = await this.db.get();
     return snap.docs.map((doc) => doc.data() as Checkout);
   }
+  async listByClient(clientId: string): Promise<Checkout[]> {
+    const snap = await this.db.where('client_id', '==', clientId).get();
+    return snap.docs.map((doc) => doc.data() as Checkout);
+  }
   async save(checkout: Checkout): Promise<Checkout> {
     await this.db.doc(checkout.id).set(checkout, { merge: true });
     return checkout;
@@ -1072,6 +1077,39 @@ export class FirestoreRefillsRepository implements IRefillsRepository {
     const snap = await this.ordersDb.get();
     return snap.docs.map((doc) => doc.data() as RefillOrder);
   }
+  async listOrdersForRefills(refillIds: string[]): Promise<RefillOrder[]> {
+    if (refillIds.length === 0) return [];
+    // `in` takes at most 30 values per query, so chunk rather than fall back to
+    // reading the whole collection and filtering (§3.6).
+    const CHUNK = 30;
+    const out: RefillOrder[] = [];
+    for (let i = 0; i < refillIds.length; i += CHUNK) {
+      const snap = await this.ordersDb
+        .where('refill_id', 'in', refillIds.slice(i, i + CHUNK))
+        .get();
+      out.push(...snap.docs.map((doc) => doc.data() as RefillOrder));
+    }
+    return out;
+  }
+  async listDue(onOrBefore: string, limit?: number): Promise<Refill[]> {
+    let query: admin.firestore.Query = this.db
+      .where('due_date', '<=', onOrBefore)
+      .orderBy('due_date', 'asc');
+    if (limit) query = query.limit(limit);
+    const snap = await query.get();
+    return snap.docs.map((doc) => doc.data() as Refill);
+  }
+  async listByStatus(status: RefillStatus): Promise<Refill[]> {
+    const snap = await this.db.where('status', '==', status).get();
+    return snap.docs.map((doc) => doc.data() as Refill);
+  }
+  async findRefillBySupplement(supplementId: string): Promise<Refill | null> {
+    // `refills_supplement_id_key` made this one-per-supplement; the projection
+    // keys the document the same way, so this is a lookup, not a scan.
+    const snap = await this.db.where('supplement_id', '==', supplementId).limit(1).get();
+    if (snap.empty) return null;
+    return snap.docs[0].data() as Refill;
+  }
   async clearAll(): Promise<void> {
     await deleteAllDocs([this.db, this.supplementsDb, this.ordersDb]);
   }
@@ -1093,6 +1131,13 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
     const doc = await this.db.doc(id).get();
     return doc.exists ? (doc.data() as Lead) : null;
   }
+  async listActiveLeads(): Promise<Lead[]> {
+    // `status NOT IN ('closed','booked')` — Firestore's not-in takes the same
+    // index as an equality filter and is the direct equivalent here, since the
+    // status vocabulary is small and closed/booked are the only terminal ones.
+    const snap = await this.db.where('status', 'not-in', ['closed', 'booked']).get();
+    return snap.docs.map((doc) => doc.data() as Lead);
+  }
   async findLeadByEmail(email: string): Promise<Lead | null> {
     const snap = await this.db.where('email', '==', email.toLowerCase()).limit(1).get();
     if (snap.empty) return null;
@@ -1107,7 +1152,18 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
     return activity;
   }
   async listActivities(leadId: string): Promise<LeadActivity[]> {
-    const snap = await this.activitiesDb.where('lead_id', '==', leadId).get();
+    const snap = await this.activitiesDb
+      .where('lead_id', '==', leadId)
+      .orderBy('occurred_at', 'desc')
+      .get();
+    return snap.docs.map((doc) => doc.data() as LeadActivity);
+  }
+  async listRecentActivity(since: string, limit = 500): Promise<LeadActivity[]> {
+    const snap = await this.activitiesDb
+      .where('occurred_at', '>=', since)
+      .orderBy('occurred_at', 'desc')
+      .limit(limit)
+      .get();
     return snap.docs.map((doc) => doc.data() as LeadActivity);
   }
   async clearAll(): Promise<void> {
@@ -1204,8 +1260,12 @@ export class FirestoreConsentsRepository implements IConsentsRepository {
     return consent;
   }
   async findByClientAndType(clientId: string, type: string): Promise<Consent | null> {
-    const doc = await this.db.doc(`${clientId}__${type}`).get();
+    const doc = await this.db.doc(consentDocId(clientId, type)).get();
     return doc.exists ? (doc.data() as Consent) : null;
+  }
+  async listByClient(clientId: string): Promise<Consent[]> {
+    const snap = await this.db.where('client_id', '==', clientId).orderBy('type', 'asc').get();
+    return snap.docs.map((doc) => doc.data() as Consent);
   }
   async clearAll(): Promise<void> {
     await deleteAllDocs([this.db]);

@@ -40,6 +40,22 @@ export function useEmulator(projectId = 'demo-bishopai'): void {
 }
 
 /**
+ * A project id unique to the calling suite.
+ *
+ * The emulator keeps a separate dataset per project, and vitest runs test files
+ * concurrently — so with a shared project id, one suite's `clearFirestore`
+ * between tests wipes another suite's fixtures mid-assertion. That shows up as
+ * an intermittent failure in whichever file lost the race, which is the worst
+ * possible signal on a money-path test.
+ *
+ * Derived from the suite name so a failure is traceable to a dataset in the
+ * emulator UI, and prefixed `demo-` so the Admin SDK never asks for credentials.
+ */
+export function emulatorProject(suiteName: string): string {
+  return `demo-${suiteName.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
+}
+
+/**
  * Wipe every collection between tests. The adapter is a process-level singleton
  * (`activeDatabase` in db/index.ts), so without this, state leaks across test
  * files — which is exactly how the current suite hides cross-test contamination.
@@ -61,9 +77,14 @@ export async function clearFirestore(db: IDatabase): Promise<void> {
   ]);
 }
 
-/** Install a live Firestore adapter for the current suite and hand it back. */
-export function installFirestore(): IDatabase {
-  useEmulator();
+/**
+ * Install a live Firestore adapter for the current suite and hand it back.
+ *
+ * Pass a distinct `suiteName` per test FILE — see emulatorProject for why a
+ * shared dataset makes concurrent suites flaky.
+ */
+export function installFirestore(suiteName?: string): IDatabase {
+  useEmulator(suiteName ? emulatorProject(suiteName) : undefined);
   const db = new FirestoreDatabase();
   setDatabaseAdapter(db);
   return db;

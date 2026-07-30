@@ -31,7 +31,7 @@ suite('projectRefills against Firestore', () => {
   let db: IDatabase;
 
   beforeAll(async () => {
-    db = installFirestore();
+    db = installFirestore('refills');
     projectRefills = (await import('../src/refills/project')).projectRefills;
   });
 

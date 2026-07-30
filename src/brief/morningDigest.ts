@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { sendEmail } from '../integrations/outlook';
 import { logEvent } from '../observability/logger';
 import { buildBrief, renderBriefText, type Brief } from './service';
@@ -15,17 +15,20 @@ export interface DigestResult {
 
 /** Today's non-cancelled appointments, in the order she'll see them. */
 async function todaysAppointments(now: Date): Promise<string[]> {
-  const day = now.toISOString().slice(0, 10);
-  const r = await pool.query<{ id: string }>(
-    `SELECT id FROM appointments
-      WHERE starts_at >= $1::date
-        AND starts_at <  $1::date + interval '1 day'
-        AND status <> 'cancelled'
-        AND client_id IS NOT NULL
-      ORDER BY starts_at ASC`,
-    [day],
+  const start = new Date(now);
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(start.getTime() + 86_400_000);
+
+  // The day window is the indexed range; the two remaining predicates are
+  // equality-free null checks Firestore cannot express, so they filter here over
+  // one day's worth of rows.
+  const rows = await getDatabase().appointments.listBetween(
+    start.toISOString(),
+    end.toISOString(),
   );
-  return r.rows.map((x) => x.id);
+  return rows
+    .filter((a) => a.status !== 'cancelled' && !!a.client_id)
+    .map((a) => a.id);
 }
 
 export async function runMorningDigest(now: Date = new Date()): Promise<DigestResult> {

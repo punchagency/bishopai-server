@@ -360,30 +360,70 @@ export interface Refill {
   updated_at: string;
 }
 
+/**
+ * One client's refill send, as 0004 defines it — NOT a basket of items. An
+ * earlier draft of this interface had an `items` array and a
+ * pending|sent|failed status; the real table is one row per refill, grouped by
+ * `batch_id` so Nicole can see which clients in a bulk send received theirs and
+ * which didn't, with a `queued|sent|received|failed` status.
+ *
+ * `refill_id` is what the prep brief's "ordered" flag reads: it is the link
+ * between a projected run-out and the invitation that was actually sent.
+ */
+export type RefillOrderStatus = 'queued' | 'sent' | 'received' | 'failed';
+
 export interface RefillOrder {
   id: string;
-  client_id: string;
+  /** One bulk send groups many orders. */
+  batch_id: string;
+  client_id: string | null;
+  refill_id: string | null;
+  supplement_name?: string | null;
+  status: RefillOrderStatus;
   fullscript_order_id?: string | null;
-  items: Array<{ supplement_name: string; quantity: number }>;
-  status: 'pending' | 'sent' | 'failed';
+  /** The Fullscript treatment-plan link, persisted so the card survives reloads (0009). */
+  invitation_url?: string | null;
+  /** Populated when status = 'failed'. */
+  error?: string | null;
+  sent_at?: string | null;
+  received_at?: string | null;
   created_at: string;
+  updated_at?: string;
 }
 
+/**
+ * A WF3 enquiry. Reconciled to the real 0001 columns — the earlier draft had a
+ * required `name` (leads have none; the address is the identity), a
+ * `cadence_state` string in place of the `sequence_state` map the cadence
+ * actually reads, and no `cadence_cancelled_at`, so a cancelled sequence would
+ * have kept sending.
+ */
 export interface Lead {
   id: string;
-  name: string;
-  email: string;
-  source: string;
-  cadence_state: string;
-  last_contacted_at?: string | null;
+  email: string | null;
+  source?: string | null;
+  status: string;
+  /** Which cadence steps have already gone out — `{ sent: [...] }`. */
+  sequence_state: { sent?: string[] } & Record<string, unknown>;
+  last_touch?: string | null;
+  /**
+   * Silences the remaining cadence without changing status (0025). Clearing it
+   * resumes where it left off, so it doubles as the audit trail of the stop.
+   */
+  cadence_cancelled_at?: string | null;
   created_at: string;
+  updated_at?: string;
 }
 
+/** page_view | form_open | form_submit | email_open | reply | booked (0006). */
 export interface LeadActivity {
   id: string;
   lead_id: string;
-  activity_type: string;
-  payload?: Record<string, unknown> | null;
+  type: string;
+  /** e.g. /book-a-consult — site activity. */
+  path?: string | null;
+  detail?: string | null;
+  occurred_at: string;
   created_at: string;
 }
 
@@ -422,11 +462,22 @@ export interface DocumentRecord {
   created_at: string;
 }
 
+/**
+ * Document id == `${client_id}__${type}`, replacing `0012_consent_unique`.
+ *
+ * `granted_at` is nullable and IS the grant: a revoked consent keeps its row
+ * with a null timestamp rather than being deleted, so the record shows that
+ * consent was considered and withdrawn, not that it was never asked for. An
+ * earlier draft called this non-null `consented_at`, which cannot express a
+ * revocation at all.
+ */
 export interface Consent {
-  id: string; // ${clientId}__${type}
+  id: string;
   client_id: string;
   type: string;
-  consented_at: string;
+  granted_at: string | null;
+  notes?: string | null;
+  created_at: string;
 }
 
 export interface AuthState {

@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { computeRunOut, type DoseSchedule } from '../refills/project';
 import { reminderLeadDays, reminderMessage, type RefillTier } from '../refills/reminders';
 import { nextScheduledStep, type LeadState } from '../reengagement/cadence';
@@ -140,22 +140,57 @@ export async function listUpcomingReminders(
 ): Promise<ScheduledReminder[]> {
   const horizon = addDays(today, withinDays);
   const out: ScheduledReminder[] = [];
+  const db = getDatabase();
 
   // --- WF4: refill reminders ------------------------------------------------
-  const refills = await pool.query<RefillRow>(
-    `SELECT rf.id, rf.status, to_char(rf.due_date, 'YYYY-MM-DD') AS due_date,
-            rf.reminder_stage, to_char(rf.reminder_next_at, 'YYYY-MM-DD') AS reminder_next_at,
-            c.id AS client_id, c.name AS client_name, c.email,
-            s.name AS supplement_name, s.dose, s.qty,
-            to_char(s.start_date, 'YYYY-MM-DD') AS start_date, s.schedule
-       FROM refills rf
-       JOIN clients c ON c.id = rf.client_id
-  LEFT JOIN supplements s ON s.id = rf.supplement_id
-      WHERE rf.status = 'pending' AND rf.due_date IS NOT NULL
-        AND rf.reminders_cancelled_at IS NULL`,
+  // The pg query joined clients and supplements onto every pending refill. Here
+  // `pending` is the indexed read and the two joins become per-client lookups,
+  // memoised — a client with four refills is fetched once, not four times.
+  const pending = (await db.refills.listByStatus('pending')).filter(
+    (r) => !!r.due_date && !r.reminders_cancelled_at,
   );
 
-  for (const r of refills.rows) {
+  const clientCache = new Map<string, Awaited<ReturnType<typeof db.clients.findById>>>();
+  const loadClient = async (id: string) => {
+    if (!clientCache.has(id)) clientCache.set(id, await db.clients.findById(id));
+    return clientCache.get(id) ?? null;
+  };
+  const planCache = new Map<string, Map<string, Awaited<ReturnType<typeof db.refills.listSupplementsByClient>>[number]>>();
+  const loadPlan = async (clientId: string) => {
+    if (!planCache.has(clientId)) {
+      const rows = await db.refills.listSupplementsByClient(clientId);
+      planCache.set(clientId, new Map(rows.map((s) => [s.id, s])));
+    }
+    return planCache.get(clientId)!;
+  };
+
+  const refillRows: RefillRow[] = [];
+  for (const rf of pending) {
+    const client = await loadClient(rf.client_id);
+    // `JOIN clients` — a refill whose client is gone is not a reminder anyone
+    // can send, and the inner join dropped it too.
+    if (!client) continue;
+    const supplement = rf.supplement_id
+      ? (await loadPlan(rf.client_id)).get(rf.supplement_id)
+      : undefined;
+    refillRows.push({
+      id: rf.id,
+      status: rf.status,
+      due_date: rf.due_date,
+      reminder_stage: rf.reminder_stage ?? 0,
+      reminder_next_at: rf.reminder_next_at ?? null,
+      client_id: client.id,
+      client_name: client.name,
+      email: client.email || null,
+      supplement_name: supplement?.name ?? rf.supplement_name ?? null,
+      dose: supplement?.dose ?? rf.dose ?? null,
+      qty: supplement?.qty ?? null,
+      start_date: supplement?.start_date ?? null,
+      schedule: (supplement?.schedule as DoseSchedule | null) ?? null,
+    });
+  }
+
+  for (const r of refillRows) {
     const { perDay, daysSupply } = computeRunOut(r);
     const sendAt = nextRefillSendDate({ ...r, days_supply: daysSupply }, today);
     if (!sendAt || sendAt > horizon) continue;
@@ -188,24 +223,31 @@ export async function listUpcomingReminders(
   }
 
   // --- WF3: re-engagement cadence ------------------------------------------
-  const leads = await pool.query<LeadRow>(
-    // A lead may also exist as a client (they enquired, then booked); the
-    // LATERAL keeps that a name lookup — one row per lead even if two client
-    // records share the address.
-    `SELECT l.id, l.email, l.status, l.sequence_state, l.last_touch, l.created_at,
-            c.id AS client_id, c.name AS client_name
-       FROM leads l
-  LEFT JOIN LATERAL (
-         SELECT id, name FROM clients
-          WHERE l.email IS NOT NULL AND lower(email) = lower(l.email)
-          LIMIT 1
-       ) c ON true
-      WHERE l.status NOT IN ('closed', 'booked')
-        AND l.cadence_cancelled_at IS NULL`,
+  const activeLeads = (await db.reengagement.listActiveLeads()).filter(
+    (l) => !l.cadence_cancelled_at,
   );
 
+  // A lead may also exist as a client (they enquired, then booked). The LATERAL
+  // that kept that to one row per lead becomes a per-address lookup, which is
+  // what findByEmail already guarantees — one client even if two records share
+  // the address.
+  const leadRows: LeadRow[] = [];
+  for (const l of activeLeads) {
+    const client = l.email ? await db.clients.findByEmail(l.email) : null;
+    leadRows.push({
+      id: l.id,
+      email: l.email,
+      status: l.status,
+      sequence_state: l.sequence_state ?? null,
+      last_touch: l.last_touch ?? null,
+      created_at: l.created_at,
+      client_id: client?.id ?? null,
+      client_name: client?.name ?? null,
+    });
+  }
+
   const now = new Date(`${today}T00:00:00Z`);
-  for (const l of leads.rows) {
+  for (const l of leadRows) {
     const state: LeadState = {
       status: l.status,
       created_at: new Date(l.created_at),

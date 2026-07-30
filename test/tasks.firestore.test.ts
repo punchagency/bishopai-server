@@ -28,7 +28,7 @@ suite('tasks/service against Firestore', () => {
   let db: IDatabase;
 
   beforeAll(async () => {
-    db = installFirestore();
+    db = installFirestore('tasks');
     const mod = await import('../src/tasks/service');
     createTasksFromNote = mod.createTasksFromNote;
     reconcileTasksAfterAmend = mod.reconcileTasksAfterAmend;
