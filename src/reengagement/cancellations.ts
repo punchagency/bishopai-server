@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent } from '../observability/logger';
 
 // WF3 linkage: a Practice Better cancellation should enroll the client into the
@@ -17,7 +17,11 @@ export interface CancellationResult {
 // A lead in one of these statuses is settled — not reused; but for cancellations
 // we specifically want to (re)start the cancelled track, so we reuse any lead
 // that isn't closed and isn't already on the cancelled track.
-const REUSABLE = `status NOT IN ('closed', 'cancelled')`;
+const NOT_REUSABLE = new Set(['closed', 'cancelled']);
+
+let seq = 0;
+const newId = (kind: string): string =>
+  `${kind}_${Date.now().toString(36)}_${(seq++).toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
 /**
  * Enroll the client behind a cancelled PB appointment into the cancelled cadence.
@@ -30,82 +34,78 @@ const REUSABLE = `status NOT IN ('closed', 'cancelled')`;
  * - Otherwise → create a fresh cancelled lead.
  */
 export async function enrollCancelledAppointment(pbAppointmentId: string): Promise<CancellationResult> {
-  const client = await pool.query<{ email: string | null; name: string | null }>(
-    `SELECT c.email, c.name
-       FROM appointments a
-       JOIN clients c ON c.id = a.client_id
-      WHERE a.pb_id = $1`,
-    [pbAppointmentId],
-  );
-  const email = client.rows[0]?.email?.trim();
+  const db = getDatabase();
+
+  const appointment = await db.appointments.findByPbId(pbAppointmentId);
+  const client = appointment?.client_id ? await db.clients.findById(appointment.client_id) : null;
+  const email = client?.email?.trim().toLowerCase();
   if (!email) {
     logEvent('info', 'reengagement.cancelled', 'cancellation has no client email — cannot re-engage', {
       pb_appointment_id: pbAppointmentId,
     });
     return { outcome: 'skipped_no_email' };
   }
-  const name = client.rows[0]?.name ?? null;
+  const name = client?.name ?? null;
 
-  const db = await pool.connect();
-  try {
-    await db.query('BEGIN');
+  // One read of this address's leads answers both questions the two SELECTs
+  // asked — already on the cancelled track, and is there a reusable lead —
+  // newest first, which is the ORDER BY.
+  const leads = await db.reengagement.listLeadsByEmail(email);
 
-    // Already on the cancelled track for this email? Idempotent no-op.
-    const onTrack = await db.query<{ id: string }>(
-      `SELECT id FROM leads WHERE lower(email) = lower($1) AND status = 'cancelled' LIMIT 1`,
-      [email],
-    );
-    if (onTrack.rowCount) {
-      await db.query('COMMIT');
-      return { outcome: 'noop', leadId: onTrack.rows[0].id };
-    }
+  // Already on the cancelled track for this email? Idempotent no-op, which is
+  // what makes a duplicate PB webhook harmless.
+  const onTrack = leads.find((l) => l.status === 'cancelled');
+  if (onTrack) return { outcome: 'noop', leadId: onTrack.id };
 
-    // Reuse an active non-cancelled lead if present; else create one.
-    const reusable = await db.query<{ id: string }>(
-      `SELECT id FROM leads WHERE lower(email) = lower($1) AND ${REUSABLE} ORDER BY created_at DESC LIMIT 1`,
-      [email],
-    );
+  const now = new Date().toISOString();
+  const reusable = leads.find((l) => !NOT_REUSABLE.has(l.status));
 
-    let leadId: string;
-    let outcome: CancellationOutcome;
-    if (reusable.rowCount) {
-      leadId = reusable.rows[0].id;
-      // Reset the cadence to start from now, on the cancelled track.
-      await db.query(
-        `UPDATE leads
-            SET status = 'cancelled',
-                sequence_state = '{"sent": []}'::jsonb,
-                last_touch = NULL,
-                created_at = now()
-          WHERE id = $1`,
-        [leadId],
-      );
-      outcome = 'converted';
-    } else {
-      const ins = await db.query<{ id: string }>(
-        `INSERT INTO leads (source, email, status) VALUES ('pb_cancellation', $1, 'cancelled') RETURNING id`,
-        [email],
-      );
-      leadId = ins.rows[0].id;
-      outcome = 'created';
-    }
-
-    await db.query(
-      `INSERT INTO lead_activity (lead_id, type, detail) VALUES ($1, 'cancelled', $2)`,
-      [leadId, name ? `cancelled appointment — ${name}` : 'cancelled appointment'],
-    );
-
-    await db.query('COMMIT');
-    logEvent('info', 'reengagement.cancelled', 'client enrolled in cancelled cadence', {
-      pb_appointment_id: pbAppointmentId,
-      lead_id: leadId,
-      outcome,
+  let leadId: string;
+  let outcome: CancellationOutcome;
+  if (reusable) {
+    leadId = reusable.id;
+    // Reset the cadence to start from now, on the cancelled track. created_at is
+    // deliberately moved: the 7/14-day timings are measured from it, so a reset
+    // lead counts from the cancellation rather than the original enquiry.
+    await db.reengagement.saveLead({
+      ...reusable,
+      status: 'cancelled',
+      sequence_state: { sent: [] },
+      last_touch: null,
+      created_at: now,
+      updated_at: now,
     });
-    return { outcome, leadId };
-  } catch (err) {
-    await db.query('ROLLBACK');
-    throw err;
-  } finally {
-    db.release();
+    outcome = 'converted';
+  } else {
+    leadId = newId('lead');
+    await db.reengagement.saveLead({
+      id: leadId,
+      email,
+      source: 'pb_cancellation',
+      status: 'cancelled',
+      sequence_state: { sent: [] },
+      last_touch: null,
+      cadence_cancelled_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+    outcome = 'created';
   }
+
+  await db.reengagement.logActivity({
+    id: newId('activity'),
+    lead_id: leadId,
+    type: 'cancelled',
+    path: null,
+    detail: name ? `cancelled appointment — ${name}` : 'cancelled appointment',
+    occurred_at: now,
+    created_at: now,
+  });
+
+  logEvent('info', 'reengagement.cancelled', 'client enrolled in cancelled cadence', {
+    pb_appointment_id: pbAppointmentId,
+    lead_id: leadId,
+    outcome,
+  });
+  return { outcome, leadId };
 }

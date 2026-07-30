@@ -22,6 +22,7 @@ import type {
   RefillOrder,
   Lead,
   LeadActivity,
+  MessageRecord,
   TaskItem,
   DocumentRecord,
   Consent,
@@ -84,6 +85,23 @@ async function deleteAllDocs(
       await batch.commit();
       if (snap.size < BATCH_LIMIT) break;
     }
+  }
+}
+
+/**
+ * `messages_one_recipient` (0001) as a runtime check.
+ *
+ * Postgres refused the write; Firestore stores whatever it is handed, so an
+ * invalid message would accumulate silently until someone tried to answer it.
+ * Validating at the repository boundary is the discipline §7 calls for on every
+ * CHECK constraint the migration gives up.
+ */
+function assertOneRecipient(message: MessageRecord): void {
+  const recipients = (message.client_id ? 1 : 0) + (message.lead_id ? 1 : 0);
+  if (recipients !== 1) {
+    throw new Error(
+      `message ${message.id} must have exactly one recipient (client_id XOR lead_id), got ${recipients}`,
+    );
   }
 }
 
@@ -1103,6 +1121,10 @@ export class FirestoreRefillsRepository implements IRefillsRepository {
     const snap = await this.db.where('status', '==', status).get();
     return snap.docs.map((doc) => doc.data() as Refill);
   }
+  async findById(id: string): Promise<Refill | null> {
+    const doc = await this.db.doc(id).get();
+    return doc.exists ? (doc.data() as Refill) : null;
+  }
   async findRefillBySupplement(supplementId: string): Promise<Refill | null> {
     // `refills_supplement_id_key` made this one-per-supplement; the projection
     // keys the document the same way, so this is a lookup, not a scan.
@@ -1121,6 +1143,9 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
   }
   private get activitiesDb() {
     return getFirestoreInstance().collection('lead_activity');
+  }
+  private get messagesDb() {
+    return getFirestoreInstance().collection('messages');
   }
 
   async listLeads(): Promise<Lead[]> {
@@ -1142,6 +1167,20 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
     const snap = await this.db.where('email', '==', email.toLowerCase()).limit(1).get();
     if (snap.empty) return null;
     return snap.docs[0].data() as Lead;
+  }
+  async listLeadsByStatus(status: string): Promise<Lead[]> {
+    const snap = await this.db.where('status', '==', status).get();
+    return snap.docs.map((doc) => doc.data() as Lead);
+  }
+  async listLeadsByEmail(email: string): Promise<Lead[]> {
+    // Addresses are stored lowercased, which is what replaces `lower(email) =
+    // lower($1)` — Firestore has no case-insensitive comparison, so the
+    // normalization has to happen on write.
+    const snap = await this.db
+      .where('email', '==', email.toLowerCase())
+      .orderBy('created_at', 'desc')
+      .get();
+    return snap.docs.map((doc) => doc.data() as Lead);
   }
   async saveLead(lead: Lead): Promise<Lead> {
     await this.db.doc(lead.id).set(lead, { merge: true });
@@ -1166,8 +1205,20 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
       .get();
     return snap.docs.map((doc) => doc.data() as LeadActivity);
   }
+  async logMessage(message: MessageRecord): Promise<MessageRecord> {
+    assertOneRecipient(message);
+    await this.messagesDb.doc(message.id).set(message, { merge: true });
+    return message;
+  }
+  async listMessagesForLead(leadId: string): Promise<MessageRecord[]> {
+    const snap = await this.messagesDb
+      .where('lead_id', '==', leadId)
+      .orderBy('created_at', 'desc')
+      .get();
+    return snap.docs.map((doc) => doc.data() as MessageRecord);
+  }
   async clearAll(): Promise<void> {
-    await deleteAllDocs([this.db, this.activitiesDb]);
+    await deleteAllDocs([this.db, this.activitiesDb, this.messagesDb]);
   }
 }
 

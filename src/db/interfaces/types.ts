@@ -415,10 +415,33 @@ export interface Lead {
   updated_at?: string;
 }
 
+/**
+ * A message sent to exactly one of a client or a lead (0001).
+ *
+ * `messages_one_recipient` was a CHECK constraint; Firestore has none (§7), so
+ * the exclusivity is validated on write at the repository boundary instead. A
+ * message addressed to both, or neither, is a message nobody can answer for.
+ */
+export interface MessageRecord {
+  id: string;
+  client_id?: string | null;
+  lead_id?: string | null;
+  channel: string;
+  body?: string | null;
+  sent_at?: string | null;
+  status: string;
+  created_at: string;
+}
+
 /** page_view | form_open | form_submit | email_open | reply | booked (0006). */
 export interface LeadActivity {
   id: string;
-  lead_id: string;
+  /**
+   * Nullable: an anonymous site event (a page view from someone who hasn't left
+   * an address) is still recorded for funnel analysis, with no lead to attach
+   * it to. The pg column is a nullable FK for exactly that.
+   */
+  lead_id: string | null;
   type: string;
   /** e.g. /book-a-consult — site activity. */
   path?: string | null;

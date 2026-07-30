@@ -21,6 +21,7 @@ import type {
   RefillOrder,
   Lead,
   LeadActivity,
+  MessageRecord,
   TaskItem,
   DocumentRecord,
   Consent,
@@ -358,6 +359,7 @@ export interface IRefillsRepository {
   listDue(onOrBefore: string, limit?: number): Promise<Refill[]>;
   /** One status's refills — the cadence and digest both scan `pending`. */
   listByStatus(status: RefillStatus): Promise<Refill[]>;
+  findById(id: string): Promise<Refill | null>;
   findRefillBySupplement(supplementId: string): Promise<Refill | null>;
   clearAll(): Promise<void>;
 }
@@ -366,13 +368,31 @@ export interface IReengagementRepository {
   listLeads(): Promise<Lead[]>;
   /** Leads still in a cadence — everything not closed or booked. */
   listActiveLeads(): Promise<Lead[]>;
+  /** Leads in one status, e.g. the 'booked' claims the reconcile sweep checks. */
+  listLeadsByStatus(status: string): Promise<Lead[]>;
   findLeadById(id: string): Promise<Lead | null>;
   findLeadByEmail(email: string): Promise<Lead | null>;
+  /**
+   * Every lead ever recorded for an address, newest first.
+   *
+   * Deliberately plural: one address legitimately has several leads over time
+   * (they enquired, went quiet, closed, then enquired again a year later), and
+   * intake must be able to tell an active one from a settled one.
+   */
+  listLeadsByEmail(email: string): Promise<Lead[]>;
   saveLead(lead: Lead): Promise<Lead>;
   logActivity(activity: LeadActivity): Promise<LeadActivity>;
   listActivities(leadId: string): Promise<LeadActivity[]>;
   /** Activity across all leads since a cutoff, newest first — the engagement view. */
   listRecentActivity(since: string, limit?: number): Promise<LeadActivity[]>;
+
+  /**
+   * Record a sent message. Throws when it is addressed to both a client and a
+   * lead, or to neither — that was `messages_one_recipient`, and Firestore has
+   * no CHECK constraint to enforce it (§7), so it is enforced here.
+   */
+  logMessage(message: MessageRecord): Promise<MessageRecord>;
+  listMessagesForLead(leadId: string): Promise<MessageRecord[]>;
   clearAll(): Promise<void>;
 }
 

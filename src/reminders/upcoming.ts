@@ -1,5 +1,6 @@
 import { getDatabase } from '../db/index.js';
-import { computeRunOut, type DoseSchedule } from '../refills/project';
+import { computeRunOut } from '../refills/project';
+import { loadPendingRefills } from '../refills/pendingRefills';
 import { reminderLeadDays, reminderMessage, type RefillTier } from '../refills/reminders';
 import { nextScheduledStep, type LeadState } from '../reengagement/cadence';
 
@@ -101,22 +102,6 @@ const STEP_LABELS: Record<string, string> = {
   first_appt_14d: 'day-14 return offer',
 };
 
-interface RefillRow {
-  id: string;
-  status: string;
-  due_date: string | null;
-  reminder_stage: number;
-  reminder_next_at: string | null;
-  client_id: string | null;
-  client_name: string | null;
-  email: string | null;
-  supplement_name: string | null;
-  dose: string | null;
-  qty: number | null;
-  start_date: string | null;
-  schedule: DoseSchedule | null;
-}
-
 interface LeadRow {
   id: string;
   email: string | null;
@@ -143,54 +128,10 @@ export async function listUpcomingReminders(
   const db = getDatabase();
 
   // --- WF4: refill reminders ------------------------------------------------
-  // The pg query joined clients and supplements onto every pending refill. Here
-  // `pending` is the indexed read and the two joins become per-client lookups,
-  // memoised — a client with four refills is fetched once, not four times.
-  const pending = (await db.refills.listByStatus('pending')).filter(
-    (r) => !!r.due_date && !r.reminders_cancelled_at,
-  );
-
-  const clientCache = new Map<string, Awaited<ReturnType<typeof db.clients.findById>>>();
-  const loadClient = async (id: string) => {
-    if (!clientCache.has(id)) clientCache.set(id, await db.clients.findById(id));
-    return clientCache.get(id) ?? null;
-  };
-  const planCache = new Map<string, Map<string, Awaited<ReturnType<typeof db.refills.listSupplementsByClient>>[number]>>();
-  const loadPlan = async (clientId: string) => {
-    if (!planCache.has(clientId)) {
-      const rows = await db.refills.listSupplementsByClient(clientId);
-      planCache.set(clientId, new Map(rows.map((s) => [s.id, s])));
-    }
-    return planCache.get(clientId)!;
-  };
-
-  const refillRows: RefillRow[] = [];
-  for (const rf of pending) {
-    const client = await loadClient(rf.client_id);
-    // `JOIN clients` — a refill whose client is gone is not a reminder anyone
-    // can send, and the inner join dropped it too.
-    if (!client) continue;
-    const supplement = rf.supplement_id
-      ? (await loadPlan(rf.client_id)).get(rf.supplement_id)
-      : undefined;
-    refillRows.push({
-      id: rf.id,
-      status: rf.status,
-      due_date: rf.due_date,
-      reminder_stage: rf.reminder_stage ?? 0,
-      reminder_next_at: rf.reminder_next_at ?? null,
-      client_id: client.id,
-      client_name: client.name,
-      email: client.email || null,
-      supplement_name: supplement?.name ?? rf.supplement_name ?? null,
-      dose: supplement?.dose ?? rf.dose ?? null,
-      qty: supplement?.qty ?? null,
-      start_date: supplement?.start_date ?? null,
-      schedule: (supplement?.schedule as DoseSchedule | null) ?? null,
-    });
-  }
-
-  for (const r of refillRows) {
+  // Exactly the working set the cadence runner acts on — shared so the preview
+  // can never disagree with what actually goes out, which is the whole promise
+  // of this list.
+  for (const r of await loadPendingRefills()) {
     const { perDay, daysSupply } = computeRunOut(r);
     const sendAt = nextRefillSendDate({ ...r, days_supply: daysSupply }, today);
     if (!sendAt || sendAt > horizon) continue;

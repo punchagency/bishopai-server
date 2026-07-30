@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent, logError } from '../observability/logger';
 
 // Stuck-booking reconcile — recovers from the one crash window in the public
@@ -25,27 +25,40 @@ export interface BookingReconcileResult {
   reopened: number;
 }
 
-export async function reconcileStuckBookings(): Promise<BookingReconcileResult> {
+export async function reconcileStuckBookings(now: Date = new Date()): Promise<BookingReconcileResult> {
   try {
-    const { rows } = await pool.query<{ id: string }>(
-      `UPDATE leads
-          SET status = $2
-        WHERE status = 'booked'
-          AND updated_at < now() - ($1 || ' minutes')::interval
-          AND NOT EXISTS (
-            SELECT 1 FROM lead_activity la
-             WHERE la.lead_id = leads.id AND la.type = 'booked'
-          )
-      RETURNING id`,
-      [String(GRACE_MINUTES), REOPEN_STATUS],
-    );
-    if (rows.length > 0) {
+    const db = getDatabase();
+    const cutoff = new Date(now.getTime() - GRACE_MINUTES * 60_000).toISOString();
+    const stamp = new Date().toISOString();
+
+    // The single UPDATE … WHERE NOT EXISTS becomes a query plus a per-lead
+    // check. The set is tiny by construction: it is only the leads currently
+    // claimed as booked, and a stranded one is a crash-window artefact.
+    const claimed = await db.reengagement.listLeadsByStatus('booked');
+    const reopened: string[] = [];
+
+    for (const lead of claimed) {
+      // The grace window ensures an in-flight booking (which completes in
+      // seconds) is never touched.
+      if ((lead.updated_at ?? lead.created_at) >= cutoff) continue;
+
+      // Detection is precise: a SUCCESSFULLY booked lead always has a 'booked'
+      // activity, written alongside the appointment. So "claimed as booked with
+      // NO booked activity" is a stranded claim and nothing else.
+      const activities = await db.reengagement.listActivities(lead.id);
+      if (activities.some((a) => a.type === 'booked')) continue;
+
+      await db.reengagement.saveLead({ ...lead, status: REOPEN_STATUS, updated_at: stamp });
+      reopened.push(lead.id);
+    }
+
+    if (reopened.length > 0) {
       logEvent('warn', 'reengagement.booking_reconcile', 'reopened stranded booking claims', {
-        reopened: rows.length,
-        lead_ids: rows.map((r) => r.id),
+        reopened: reopened.length,
+        lead_ids: reopened,
       });
     }
-    return { reopened: rows.length };
+    return { reopened: reopened.length };
   } catch (err) {
     logError('reengagement.booking_reconcile', 'stuck-booking sweep failed', err);
     return { reopened: 0 };

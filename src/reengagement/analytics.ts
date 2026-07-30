@@ -1,10 +1,10 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 
 // WF3 site-behavior ingest: land website analytics events (page views, form
 // opens/submits, email opens) into `lead_activity`. Provider-agnostic — a
 // PostHog/Hotjar webhook or a first-party pixel can POST here. Events with a
 // known email attribute to that lead (and refresh its last_touch so the cadence
-// sees engagement); anonymous events are still recorded (lead_id NULL) for
+// sees engagement); anonymous events are still recorded (lead_id null) for
 // funnel/heat-map analysis.
 
 export const SITE_EVENT_TYPES = ['page_view', 'form_open', 'form_submit', 'email_open'] as const;
@@ -19,27 +19,44 @@ export interface SiteEvent {
   occurredAt?: string | null;
 }
 
-export async function ingestSiteEvent(e: SiteEvent): Promise<{ activityId: string; leadId: string | null }> {
+let seq = 0;
+const activityId = (): string =>
+  `activity_${Date.now().toString(36)}_${(seq++).toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+
+export async function ingestSiteEvent(
+  e: SiteEvent,
+): Promise<{ activityId: string; leadId: string | null }> {
+  const db = getDatabase();
+
   let leadId: string | null = null;
   if (e.leadId) {
     leadId = e.leadId;
   } else if (e.email) {
-    const r = await pool.query<{ id: string }>(
-      `SELECT id FROM leads WHERE lower(email) = lower($1) ORDER BY created_at DESC LIMIT 1`,
-      [e.email],
-    );
-    leadId = r.rows[0]?.id ?? null;
+    // Newest lead for the address — the same `ORDER BY created_at DESC LIMIT 1`,
+    // which matters because one address can have several leads over time and the
+    // engagement belongs to the current one.
+    leadId = (await db.reengagement.listLeadsByEmail(e.email))[0]?.id ?? null;
   }
 
-  const ins = await pool.query<{ id: string }>(
-    `INSERT INTO lead_activity (lead_id, type, path, detail, occurred_at)
-          VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, now()))
-       RETURNING id`,
-    [leadId, e.type, e.path ?? null, e.detail ?? null, e.occurredAt ?? null],
-  );
+  const now = new Date().toISOString();
+  const id = activityId();
+  await db.reengagement.logActivity({
+    id,
+    lead_id: leadId,
+    type: e.type,
+    path: e.path ?? null,
+    detail: e.detail ?? null,
+    // COALESCE($5, now()) — a provider that reports when the event happened wins
+    // over when we received it.
+    occurred_at: e.occurredAt ?? now,
+    created_at: now,
+  });
 
   // Surface recent engagement to the cadence.
-  if (leadId) await pool.query(`UPDATE leads SET last_touch = now() WHERE id = $1`, [leadId]);
+  if (leadId) {
+    const lead = await db.reengagement.findLeadById(leadId);
+    if (lead) await db.reengagement.saveLead({ ...lead, last_touch: now, updated_at: now });
+  }
 
-  return { activityId: ins.rows[0].id, leadId };
+  return { activityId: id, leadId };
 }

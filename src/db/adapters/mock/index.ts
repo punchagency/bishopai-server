@@ -21,6 +21,7 @@ import type {
   RefillOrder,
   Lead,
   LeadActivity,
+  MessageRecord,
   TaskItem,
   DocumentRecord,
   Consent,
@@ -738,6 +739,9 @@ export class MockRefillsRepository implements IRefillsRepository {
   async listByStatus(status: RefillStatus): Promise<Refill[]> {
     return Array.from(this.refills.values()).filter((r) => r.status === status);
   }
+  async findById(id: string): Promise<Refill | null> {
+    return this.refills.get(id) ?? null;
+  }
   async findRefillBySupplement(supplementId: string): Promise<Refill | null> {
     for (const r of this.refills.values()) {
       if (r.supplement_id === supplementId) return r;
@@ -758,6 +762,7 @@ export class MockRefillsRepository implements IRefillsRepository {
 export class MockReengagementRepository implements IReengagementRepository {
   private leads = new Map<string, Lead>();
   private activities: LeadActivity[] = [];
+  private messages: MessageRecord[] = [];
 
   async listLeads(): Promise<Lead[]> {
     return Array.from(this.leads.values());
@@ -775,6 +780,14 @@ export class MockReengagementRepository implements IReengagementRepository {
       if ((lead.email ?? '').toLowerCase() === email.toLowerCase()) return lead;
     }
     return null;
+  }
+  async listLeadsByStatus(status: string): Promise<Lead[]> {
+    return Array.from(this.leads.values()).filter((l) => l.status === status);
+  }
+  async listLeadsByEmail(email: string): Promise<Lead[]> {
+    return Array.from(this.leads.values())
+      .filter((l) => (l.email ?? '') === email.toLowerCase())
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
   }
   async saveLead(lead: Lead): Promise<Lead> {
     this.leads.set(lead.id, lead);
@@ -795,9 +808,28 @@ export class MockReengagementRepository implements IReengagementRepository {
       .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at))
       .slice(0, limit);
   }
+  async logMessage(message: MessageRecord): Promise<MessageRecord> {
+    // Same `messages_one_recipient` check the Firestore adapter applies — a mock
+    // that accepted an invalid message would let a test pass that production
+    // would reject.
+    const recipients = (message.client_id ? 1 : 0) + (message.lead_id ? 1 : 0);
+    if (recipients !== 1) {
+      throw new Error(
+        `message ${message.id} must have exactly one recipient (client_id XOR lead_id), got ${recipients}`,
+      );
+    }
+    this.messages.push(message);
+    return message;
+  }
+  async listMessagesForLead(leadId: string): Promise<MessageRecord[]> {
+    return this.messages
+      .filter((m) => m.lead_id === leadId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  }
   async clearAll(): Promise<void> {
     this.leads.clear();
     this.activities = [];
+    this.messages = [];
   }
 }
 

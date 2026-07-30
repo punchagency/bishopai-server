@@ -1,8 +1,9 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent, logError } from '../observability/logger';
 import { sendEmail } from '../integrations/outlook';
-import { computeRunOut, type DoseSchedule } from './project';
-import { nextReminderAction, reminderMessage, followUpDays, type ReminderState } from './reminders';
+import { computeRunOut } from './project';
+import { loadPendingRefills } from './pendingRefills';
+import { nextReminderAction, reminderMessage, followUpDays } from './reminders';
 
 // Daily WF4 pass: for each projected refill, send the client a tiered reminder,
 // a follow-up, or auto-close it after the client never acted. Sends go to the
@@ -21,36 +22,9 @@ export interface ReminderRunResult {
   skipped: number;
 }
 
-type ReminderRow = ReminderState & {
-  id: string;
-  client_name: string | null;
-  email: string | null;
-  supplement_name: string | null;
-  dose: string | null;
-  qty: number | null;
-  start_date: string | null;
-  schedule: DoseSchedule | null;
-};
-
-/** The columns the cadence needs, shared with the upcoming-reminders listing. */
-export const REMINDER_SELECT = `rf.id, rf.status, to_char(rf.due_date, 'YYYY-MM-DD') AS due_date,
-            rf.reminder_stage, to_char(rf.reminder_next_at, 'YYYY-MM-DD') AS reminder_next_at,
-            rf.reminders_cancelled_at,
-            c.name AS client_name, c.email,
-            s.name AS supplement_name, s.dose, s.qty,
-            to_char(s.start_date, 'YYYY-MM-DD') AS start_date, s.schedule`;
-
-export const REMINDER_FROM = `FROM refills rf
-       JOIN clients c ON c.id = rf.client_id
-  LEFT JOIN supplements s ON s.id = rf.supplement_id`;
-
 export async function runRefillReminders(today = new Date().toISOString().slice(0, 10)): Promise<ReminderRunResult> {
-  const { rows } = await pool.query<ReminderRow>(
-    `SELECT ${REMINDER_SELECT}
-       ${REMINDER_FROM}
-      WHERE rf.status = 'pending' AND rf.due_date IS NOT NULL
-        AND rf.reminders_cancelled_at IS NULL`,
-  );
+  const db = getDatabase();
+  const rows = await loadPendingRefills();
 
   const result: ReminderRunResult = { scanned: rows.length, sent: 0, closed: 0, skipped: 0 };
 
@@ -64,9 +38,16 @@ export async function runRefillReminders(today = new Date().toISOString().slice(
     }
     try {
       if (action.kind === 'close') {
-        await pool.query(`UPDATE refills SET status = 'closed' WHERE id = $1 AND status = 'pending'`, [r.id]);
-        logEvent('info', 'refills.reminders', 'auto-closed refill after final reminder', { refill_id: r.id });
-        result.closed++;
+        // Guarded on `status = 'pending'`: a human may have acted on this refill
+        // since the scan, and auto-close must never overwrite that.
+        const current = await db.refills.findById(r.id);
+        if (current?.status === 'pending') {
+          await db.refills.save({ ...current, status: 'closed', updated_at: new Date().toISOString() });
+          logEvent('info', 'refills.reminders', 'auto-closed refill after final reminder', { refill_id: r.id });
+          result.closed++;
+        } else {
+          result.skipped++;
+        }
         continue;
       }
 
@@ -84,10 +65,18 @@ export async function runRefillReminders(today = new Date().toISOString().slice(
       await sendEmail({ to: r.email, subject: msg.subject, body: msg.body });
       const next = new Date(`${today}T00:00:00Z`);
       next.setUTCDate(next.getUTCDate() + followUpDays(daysSupply));
-      await pool.query(
-        `UPDATE refills SET reminder_stage = $2, reminded_at = now(), reminder_next_at = $3 WHERE id = $1 AND status = 'pending'`,
-        [r.id, action.stage, next.toISOString().slice(0, 10)],
-      );
+      // Same `AND status = 'pending'` guard. Advancing the cadence on a refill
+      // a human already closed would re-open a decision they made.
+      const current = await db.refills.findById(r.id);
+      if (current?.status === 'pending') {
+        await db.refills.save({
+          ...current,
+          reminder_stage: action.stage,
+          reminded_at: new Date().toISOString(),
+          reminder_next_at: next.toISOString().slice(0, 10),
+          updated_at: new Date().toISOString(),
+        });
+      }
       result.sent++;
     } catch (err) {
       logError('refills.reminders', 'reminder step failed', err, { refill_id: r.id });

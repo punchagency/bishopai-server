@@ -1,4 +1,5 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
+import type { Lead } from '../db/interfaces/types.js';
 import { logEvent, logError } from '../observability/logger';
 import { sendEmail } from '../integrations/outlook';
 import { nextCadenceAction, FIXED_TRACK_STATUSES, type LeadState } from './cadence';
@@ -15,20 +16,12 @@ export interface ReengagementResult {
   skipped: number; // due to send but no email on file
 }
 
-interface LeadRow {
-  id: string;
-  email: string | null;
-  status: string;
-  sequence_state: { sent?: string[] } | null;
-  last_touch: string | null;
-  created_at: string;
-  cadence_cancelled_at: string | null;
-}
-
-const LEAD_COLUMNS = `id, email, status, sequence_state, last_touch, created_at, cadence_cancelled_at`;
-
 /** Outcome of evaluating one lead — tallied by the batch runner. */
 type LeadOutcome = 'sent' | 'deactivated' | 'skipped' | 'none';
+
+let seq = 0;
+const messageId = (): string =>
+  `msg_${Date.now().toString(36)}_${(seq++).toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 
 /**
  * Evaluate and action a single lead: send the due cadence step (dry-run until
@@ -36,19 +29,21 @@ type LeadOutcome = 'sent' | 'deactivated' | 'skipped' | 'none';
  * batch pass and the on-intake immediate first response, so both take the exact
  * same send path. Never throws — logs and returns 'none' on failure.
  */
-async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
+async function processLead(row: Lead, now: Date): Promise<LeadOutcome> {
+  const db = getDatabase();
+  const sentSteps = row.sequence_state?.sent ?? [];
   const state: LeadState = {
     status: row.status,
     created_at: new Date(row.created_at),
     last_touch: row.last_touch ? new Date(row.last_touch) : null,
-    sentSteps: row.sequence_state?.sent ?? [],
-    cadenceCancelled: row.cadence_cancelled_at !== null,
+    sentSteps,
+    cadenceCancelled: !!row.cadence_cancelled_at,
   };
   const action = nextCadenceAction(state, now);
 
   try {
     if (action.kind === 'deactivate') {
-      await pool.query(`UPDATE leads SET status = 'closed' WHERE id = $1`, [row.id]);
+      await db.reengagement.saveLead({ ...row, status: 'closed', updated_at: new Date().toISOString() });
       return 'deactivated';
     }
     if (action.kind === 'send') {
@@ -56,11 +51,19 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
       // Inject available booking slots into emails that reference scheduling.
       const body = await appendSlotSuggestions(action.body, row.id);
       await sendEmail({ to: row.email, subject: action.subject, body });
-      await pool.query(
-        `INSERT INTO messages (lead_id, channel, body, sent_at, status)
-              VALUES ($1, 'email', $2, now(), 'sent')`,
-        [row.id, `${action.subject}\n\n${body}`],
-      );
+
+      const stamp = new Date().toISOString();
+      await db.reengagement.logMessage({
+        id: messageId(),
+        lead_id: row.id,
+        client_id: null,
+        channel: 'email',
+        body: `${action.subject}\n\n${body}`,
+        sent_at: stamp,
+        status: 'sent',
+        created_at: stamp,
+      });
+
       // Advance sequence state + status, and stamp last_touch. Fixed-track
       // leads (cancelled/maintenance) keep their status so they stay on that
       // track; inquiry leads progress new → contacted → nurturing.
@@ -69,16 +72,16 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
         : row.status === 'new'
           ? 'contacted'
           : 'nurturing';
-      await pool.query(
-        `UPDATE leads
-            SET sequence_state = jsonb_set(
-                  coalesce(sequence_state, '{}'::jsonb), '{sent}',
-                  coalesce(sequence_state->'sent', '[]'::jsonb) || to_jsonb($2::text)),
-                last_touch = now(),
-                status = $3
-          WHERE id = $1`,
-        [row.id, action.step, nextStatus],
-      );
+      // `jsonb_set(... || to_jsonb(step))` becomes an array append on the map.
+      // Appending the step is what makes the cadence idempotent — nextCadenceAction
+      // never re-offers a step already listed here.
+      await db.reengagement.saveLead({
+        ...row,
+        sequence_state: { ...row.sequence_state, sent: [...sentSteps, action.step] },
+        last_touch: stamp,
+        status: nextStatus,
+        updated_at: stamp,
+      });
       return 'sent';
     }
     return 'none';
@@ -89,9 +92,7 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
 }
 
 export async function runReengagement(now: Date = new Date()): Promise<ReengagementResult> {
-  const { rows } = await pool.query<LeadRow>(
-    `SELECT ${LEAD_COLUMNS} FROM leads WHERE status NOT IN ('closed', 'booked')`,
-  );
+  const rows = await getDatabase().reengagement.listActiveLeads();
 
   let sent = 0;
   let deactivated = 0;
@@ -119,12 +120,9 @@ export async function runReengagement(now: Date = new Date()): Promise<Reengagem
  * due yet. Idempotent: won't resend a step already recorded in sequence_state.
  */
 export async function runReengagementForLead(leadId: string, now: Date = new Date()): Promise<LeadOutcome> {
-  const { rows } = await pool.query<LeadRow>(
-    `SELECT ${LEAD_COLUMNS} FROM leads WHERE id = $1 AND status NOT IN ('closed', 'booked')`,
-    [leadId],
-  );
-  if (rows.length === 0) return 'none';
-  return processLead(rows[0], now);
+  const lead = await getDatabase().reengagement.findLeadById(leadId);
+  if (!lead || lead.status === 'closed' || lead.status === 'booked') return 'none';
+  return processLead(lead, now);
 }
 
 // ---------------------------------------------------------------------------
