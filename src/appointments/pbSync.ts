@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent, logError } from '../observability/logger';
 import { isPbConfigured } from '../integrations/pb/config';
 import { listSessions, getClientRecord } from '../integrations/pb/reads';
@@ -60,7 +60,16 @@ async function backfillClientEmail(clientId: string, pbClientId: string): Promis
     const record = await getClientRecord(pbClientId);
     const email = record.profile?.emailAddress?.trim();
     if (!email) return;
-    await pool.query(`UPDATE clients SET email = $2 WHERE id = $1 AND email IS NULL`, [clientId, email]);
+    const db = getDatabase();
+    const client = await db.clients.findById(clientId);
+    // `AND email IS NULL` — a backfill must never overwrite an address someone
+    // entered by hand, which is more likely to be the one the client reads.
+    if (!client || client.email) return;
+    await db.clients.save({
+      ...client,
+      email: email.toLowerCase(),
+      updated_at: new Date().toISOString(),
+    });
   } catch (err) {
     logError('pb.sessionsSync', 'client email backfill failed', err, { pb_client_id: pbClientId });
   }
@@ -120,38 +129,29 @@ export async function syncSessionsFromPb(now: Date = new Date()): Promise<Sessio
     const status = statusFor(s, now);
 
     try {
-      const prev = await pool.query<{ status: string }>(
-        `SELECT status FROM appointments WHERE pb_id = $1`,
-        [s.id],
-      );
-      const prevStatus = prev.rows[0]?.status;
-
-      const clientRes = await pool.query<{ id: string; email: string | null }>(
-        `INSERT INTO clients (name, pb_id)
-              VALUES ($1, $2)
-         ON CONFLICT (pb_id) DO UPDATE SET name = EXCLUDED.name
-           RETURNING id, email`,
-        [clientRecordName(s.clientRecord) ?? 'Unknown client', String(pbClientId)],
-      );
-      const clientId = clientRes.rows[0].id;
-      const clientEmail = clientRes.rows[0].email;
+      const db = getDatabase();
+      const client = await db.clients.upsertByPbId(String(pbClientId), {
+        name: clientRecordName(s.clientRecord) ?? 'Unknown client',
+      });
 
       const endsAt = s.endDate ?? addMinutes(s.sessionDate, s.duration ?? 60);
-      const apptRes = await pool.query<{ id: string }>(
-        `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-              VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (pb_id) DO UPDATE
-              SET starts_at = EXCLUDED.starts_at,
-                  ends_at   = EXCLUDED.ends_at,
-                  status    = EXCLUDED.status,
-                  client_id = EXCLUDED.client_id
-           RETURNING id`,
-        [clientId, s.id, s.sessionDate, endsAt, status],
-      );
+      // The previous status comes back from the upsert rather than a separate
+      // SELECT, so it is read inside the same transaction that overwrites it —
+      // between two calls, a concurrent tick could change it and both would then
+      // see "no change" and skip the side effects entirely.
+      const { appointment, previousStatus } = await db.appointments.upsertByPbId(s.id, {
+        client_id: client.id,
+        client_name: client.name,
+        starts_at: s.sessionDate,
+        ends_at: endsAt,
+        status,
+      });
       upserted++;
-      const appointmentId = apptRes.rows[0].id;
+      const appointmentId = appointment.id;
+      const clientId = client.id;
+      const clientEmail = client.email || null;
 
-      if (status !== prevStatus) {
+      if (status !== previousStatus) {
         if (status === 'completed') {
           checkoutsDetected++;
           void detectCheckout(appointmentId).catch((e) =>

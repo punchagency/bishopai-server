@@ -1,4 +1,4 @@
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent, logError } from '../observability/logger';
 import { isPbConfigured } from '../integrations/pb/config';
 import { listProtocols } from '../integrations/pb/reads';
@@ -39,26 +39,38 @@ export async function syncProtocolsFromPb(): Promise<SyncResult> {
 
   // For each protocol, find the matching client by the PB record id embedded in
   // the protocol's clientRecord (confirmed shape).
+  const db = getDatabase();
+  // One pass over the clients builds the pb_id → id map, replacing a lookup
+  // query per protocol.
+  const byPbId = new Map<string, string>();
+  for (const c of await db.clients.listAll()) {
+    if (c.pb_id) byPbId.set(String(c.pb_id), c.id);
+  }
+
   let upserted = 0;
   for (const proto of protocols) {
     try {
       const pbClientId = proto.clientRecord?.id;
       if (!pbClientId) continue;
+      const clientId = byPbId.get(String(pbClientId));
+      if (!clientId) continue;
 
-      const clientRes = await pool.query<{ id: string }>(
-        `SELECT id FROM clients WHERE pb_id = $1`,
-        [String(pbClientId)],
-      );
-      if (clientRes.rowCount === 0) continue;
-      const clientId = clientRes.rows[0].id;
-
-      // Upsert the protocol row (by PB id) so the dashboard can reference it.
-      await pool.query(
-        `INSERT INTO protocols (client_id, content_json, status)
-         VALUES ($1, $2, 'draft')
-         ON CONFLICT DO NOTHING`,
-        [clientId, JSON.stringify(proto)],
-      );
+      // Keyed on the PB protocol id, in its own collection.
+      //
+      // The pg version inserted into `protocols` with a NULL appointment_id and
+      // `ON CONFLICT DO NOTHING` — but the unique index on appointment_id is
+      // partial (`WHERE appointment_id IS NOT NULL`), so nothing ever conflicted
+      // and every nightly run appended another copy of every protocol. It also
+      // put appointment-less rows in a collection whose every other reader keys
+      // on the appointment. Both are fixed by giving these their own home with a
+      // real key.
+      await db.sessionNotes.savePbProtocol({
+        id: String(proto.id),
+        client_id: clientId,
+        pb_client_id: String(pbClientId),
+        content_json: proto as unknown as Record<string, unknown>,
+        synced_at: new Date().toISOString(),
+      });
       upserted++;
     } catch (err) {
       logError('pb.sync', 'protocol upsert failed', err, { protocol_id: proto.id });

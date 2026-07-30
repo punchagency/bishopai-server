@@ -7,6 +7,7 @@ import type {
   SessionNoteRecord,
   AppointmentSheet,
   SupplementProtocol,
+  PbProtocol,
   DocStatus,
   Approval,
   NoteRevision,
@@ -45,14 +46,45 @@ import type {
   GuardedSessionWrite,
   GuardedSessionResult,
 } from '../../interfaces/repositories.js';
-import { consentDocId, noteRevisionDocId, supplementDocId } from '../../ids.js';
+import { consentDocId, noteRevisionDocId, pbIndexDocId, supplementDocId } from '../../ids.js';
 import { combineStatus } from '../../sessionStatus.js';
 
 export class MockClientsRepository implements IClientsRepository {
   private clients = new Map<string, Client>();
+  /** `{pbId} -> localId`, mirroring the Firestore index collection. */
+  private pbIndex = new Map<string, string>();
 
   async findById(id: string): Promise<Client | null> {
     return this.clients.get(id) ?? null;
+  }
+  async findByPbId(pbId: string): Promise<Client | null> {
+    const localId = this.pbIndex.get(pbIndexDocId(pbId));
+    return localId ? (this.clients.get(localId) ?? null) : null;
+  }
+  async upsertByPbId(pbId: string, fields: { name: string }): Promise<Client> {
+    const key = pbIndexDocId(pbId);
+    const now = new Date().toISOString();
+    const existingId = this.pbIndex.get(key);
+    const existing = existingId ? this.clients.get(existingId) : undefined;
+    if (existing) {
+      // Name only — a PB session embed carries nothing else, and writing the
+      // whole record would clear the email and Drive ids other paths filled in.
+      const updated = { ...existing, name: fields.name, updated_at: now };
+      this.clients.set(updated.id, updated);
+      return updated;
+    }
+    const id = `client_${key}`;
+    const client: Client = {
+      id,
+      name: fields.name,
+      email: '',
+      pb_id: pbId,
+      created_at: now,
+      updated_at: now,
+    };
+    this.clients.set(id, client);
+    this.pbIndex.set(key, id);
+    return client;
   }
   async findByEmail(email: string): Promise<Client | null> {
     for (const client of this.clients.values()) {
@@ -72,11 +104,44 @@ export class MockClientsRepository implements IClientsRepository {
   }
   async clearAll(): Promise<void> {
     this.clients.clear();
+    this.pbIndex.clear();
   }
 }
 
 export class MockAppointmentsRepository implements IAppointmentsRepository {
   private appointments = new Map<string, Appointment>();
+  private pbIndex = new Map<string, string>();
+
+  async upsertByPbId(
+    pbId: string,
+    fields: {
+      client_id: string;
+      client_name: string | null;
+      starts_at: string;
+      ends_at: string;
+      status: string;
+    },
+  ): Promise<{ appointment: Appointment; previousStatus: string | null }> {
+    const key = pbIndexDocId(pbId);
+    const now = new Date().toISOString();
+    const localId = this.pbIndex.get(key) ?? `appt_${key}`;
+    const previous = this.appointments.get(localId) ?? null;
+
+    const appointment: Appointment = {
+      id: localId,
+      pb_id: pbId,
+      client_id: fields.client_id,
+      client_name: fields.client_name,
+      starts_at: fields.starts_at,
+      ends_at: fields.ends_at,
+      status: fields.status,
+      created_at: previous?.created_at ?? now,
+      updated_at: now,
+    };
+    this.appointments.set(localId, appointment);
+    this.pbIndex.set(key, localId);
+    return { appointment, previousStatus: previous?.status ?? null };
+  }
 
   async findById(id: string): Promise<Appointment | null> {
     return this.appointments.get(id) ?? null;
@@ -101,10 +166,10 @@ export class MockAppointmentsRepository implements IAppointmentsRepository {
       .sort((a, b) => a.starts_at.localeCompare(b.starts_at));
   }
   async findByPbId(pbId: string): Promise<Appointment | null> {
-    for (const a of this.appointments.values()) {
-      if (a.pb_id === pbId) return a;
-    }
-    return null;
+    // Through the index, matching Firestore — a scan here would hide a caller
+    // that never registered the pb id.
+    const localId = this.pbIndex.get(pbIndexDocId(pbId));
+    return localId ? (this.appointments.get(localId) ?? null) : null;
   }
   async findOverlapping(startsAt: string, endsAt: string): Promise<Appointment[]> {
     const start = new Date(startsAt).getTime();
@@ -124,6 +189,7 @@ export class MockAppointmentsRepository implements IAppointmentsRepository {
   }
   async clearAll(): Promise<void> {
     this.appointments.clear();
+    this.pbIndex.clear();
   }
 }
 
@@ -250,6 +316,7 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
   private protocols = new Map<string, SupplementProtocol>();
   private approvals: Approval[] = [];
   private revisions: NoteRevision[] = [];
+  private pbProtocols = new Map<string, PbProtocol>();
 
   async findById(id: string): Promise<SessionNoteRecord | null> {
     return this.notes.get(id) ?? null;
@@ -315,6 +382,14 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
     return this.revisions
       .filter((r) => r.source_table === sourceTable && r.source_id === sourceId)
       .sort((a, b) => b.revision - a.revision);
+  }
+
+  async savePbProtocol(protocol: PbProtocol): Promise<PbProtocol> {
+    this.pbProtocols.set(protocol.id, protocol);
+    return protocol;
+  }
+  async listPbProtocolsByClient(clientId: string): Promise<PbProtocol[]> {
+    return Array.from(this.pbProtocols.values()).filter((p) => p.client_id === clientId);
   }
 
   async findSessionDocs(appointmentId: string): Promise<SessionDocs> {
@@ -507,6 +582,7 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
     this.protocols.clear();
     this.approvals = [];
     this.revisions = [];
+    this.pbProtocols.clear();
   }
 }
 

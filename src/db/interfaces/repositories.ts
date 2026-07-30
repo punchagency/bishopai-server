@@ -7,6 +7,7 @@ import type {
   SessionNoteRecord,
   AppointmentSheet,
   SupplementProtocol,
+  PbProtocol,
   DocStatus,
   Approval,
   NoteRevision,
@@ -33,8 +34,22 @@ import type {
 export interface IClientsRepository {
   findById(id: string): Promise<Client | null>;
   findByEmail(email: string): Promise<Client | null>;
+  findByPbId(pbId: string): Promise<Client | null>;
   listAll(): Promise<Client[]>;
   save(client: Client): Promise<Client>;
+
+  /**
+   * `ON CONFLICT (pb_id) DO UPDATE` — find-or-create the client behind a PB
+   * record, keyed on the PB id.
+   *
+   * `clients.pb_id` was a UNIQUE column, and Firestore has no unique index on a
+   * non-ID field, so uniqueness moves to an index document keyed on the PB id
+   * (§3.1). It is claimed inside the same transaction that creates the client,
+   * which is what stops two concurrent poll ticks creating two client records
+   * for one person — a duplicate that would then split their chart in half.
+   */
+  upsertByPbId(pbId: string, fields: { name: string }): Promise<Client>;
+
   delete(id: string): Promise<void>;
   clearAll(): Promise<void>;
 }
@@ -50,6 +65,19 @@ export interface IAppointmentsRepository {
   findByPbId(pbId: string): Promise<Appointment | null>;
   findOverlapping(startsAt: string, endsAt: string): Promise<Appointment[]>;
   save(appointment: Appointment): Promise<Appointment>;
+
+  /**
+   * `ON CONFLICT (pb_id) DO UPDATE` — land a PB booking, keyed on the PB id.
+   *
+   * Same index-document mechanism as clients.upsertByPbId. Returns the row as
+   * it now stands plus the status it had BEFORE, because the caller fires
+   * checkout detection and cancellation enrollment only on an actual change —
+   * without that, every poll tick would re-fire them.
+   */
+  upsertByPbId(
+    pbId: string,
+    fields: { client_id: string; client_name: string | null; starts_at: string; ends_at: string; status: string },
+  ): Promise<{ appointment: Appointment; previousStatus: string | null }>;
   delete(id: string): Promise<void>;
   clearAll(): Promise<void>;
 }
@@ -165,6 +193,14 @@ export interface ISessionNotesRepository {
 
   /** History behind one live row, newest superseded version first. */
   listRevisions(sourceTable: NoteTable, sourceId: string): Promise<NoteRevision[]>;
+
+  /**
+   * PB-synced protocol metadata, keyed on the PB protocol id so a re-sync
+   * overwrites rather than appends. Kept out of the session protocols
+   * collection — see PbProtocol for why.
+   */
+  savePbProtocol(protocol: PbProtocol): Promise<PbProtocol>;
+  listPbProtocolsByClient(clientId: string): Promise<PbProtocol[]>;
 
   /** Both halves of a session, by known ref — never a scan. */
   findSessionDocs(appointmentId: string): Promise<SessionDocs>;

@@ -155,6 +155,28 @@ export interface SupplementProtocol {
 }
 
 /**
+ * A protocol as Practice Better holds it — NOT a session protocol.
+ *
+ * These have no appointment and no session note behind them; they are synced
+ * metadata, kept so the dashboard can reference what PB thinks a client's plan
+ * is. In Postgres they were written into the `protocols` table with a NULL
+ * appointment_id, which was a mistake in two ways: they polluted a table whose
+ * every reader keys on the appointment, and because the unique index on
+ * appointment_id is partial (`WHERE appointment_id IS NOT NULL`), the
+ * `ON CONFLICT DO NOTHING` never fired — so every nightly sync inserted another
+ * copy of every protocol, inflating the dashboard's count without bound.
+ *
+ * Document id == the PB protocol id, which makes the sync genuinely idempotent.
+ */
+export interface PbProtocol {
+  id: string;
+  client_id: string;
+  pb_client_id: string;
+  content_json: Record<string, unknown>;
+  synced_at: string;
+}
+
+/**
  * The unified approvals record: money approvals (type='checkout') carry
  * checkout_id + amount_cents + summary_hash; lighter ones (session, refill
  * digest) reuse the same shape.

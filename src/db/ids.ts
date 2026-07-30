@@ -78,6 +78,18 @@ export function conversationDocId(beeId: string): string {
 }
 
 /**
+ * Index-document id for a Practice Better id.
+ *
+ * `clients.pb_id` and `appointments.pb_id` were UNIQUE columns. Firestore has no
+ * unique index on a non-ID field, and the local documents keep their own ids, so
+ * uniqueness moves to a claim document in a side collection: `{pbId} -> localId`,
+ * created inside the same transaction as the record it points at (§3.1).
+ */
+export function pbIndexDocId(pbId: string): string {
+  return encodeIdSegment(pbId);
+}
+
+/**
  * Make an arbitrary external string safe as a Firestore document id.
  *
  * Firestore forbids '/' in an id and reserves '.' and '..' as whole ids; a

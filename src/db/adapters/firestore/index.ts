@@ -8,6 +8,7 @@ import type {
   SessionNoteRecord,
   AppointmentSheet,
   SupplementProtocol,
+  PbProtocol,
   DocStatus,
   Approval,
   NoteRevision,
@@ -47,7 +48,7 @@ import type {
   GuardedSessionWrite,
   GuardedSessionResult,
 } from '../../interfaces/repositories.js';
-import { consentDocId, noteRevisionDocId, supplementDocId } from '../../ids.js';
+import { consentDocId, noteRevisionDocId, pbIndexDocId, supplementDocId } from '../../ids.js';
 import { combineStatus } from '../../sessionStatus.js';
 
 /**
@@ -116,10 +117,59 @@ export class FirestoreClientsRepository implements IClientsRepository {
   private get db() {
     return getFirestoreInstance().collection('clients');
   }
+  /** `{pbId} -> { local_id }`, the replacement for `clients.pb_id UNIQUE`. */
+  private get pbIndexDb() {
+    return getFirestoreInstance().collection('client_pb_index');
+  }
 
   async findById(id: string): Promise<Client | null> {
     const doc = await this.db.doc(id).get();
     return doc.exists ? (doc.data() as Client) : null;
+  }
+  async findByPbId(pbId: string): Promise<Client | null> {
+    const index = await this.pbIndexDb.doc(pbIndexDocId(pbId)).get();
+    const localId = index.exists ? (index.data() as { local_id: string }).local_id : null;
+    return localId ? this.findById(localId) : null;
+  }
+
+  async upsertByPbId(pbId: string, fields: { name: string }): Promise<Client> {
+    const firestore = getFirestoreInstance();
+    const indexRef = this.pbIndexDb.doc(pbIndexDocId(pbId));
+
+    return firestore.runTransaction(async (tx) => {
+      const index = await tx.get(indexRef);
+      const now = new Date().toISOString();
+
+      if (index.exists) {
+        const localId = (index.data() as { local_id: string }).local_id;
+        const ref = this.db.doc(localId);
+        const existing = await tx.get(ref);
+        if (existing.exists) {
+          // DO UPDATE SET name = EXCLUDED.name — and nothing else. A PB session
+          // embed carries only id and name, so writing the whole record here
+          // would clear the email, Drive folder and flow sheet that other paths
+          // filled in.
+          const row = existing.data() as Client;
+          tx.update(ref, { name: fields.name, updated_at: now });
+          return { ...row, name: fields.name, updated_at: now };
+        }
+        // The index outlived the client (a deleted record). Fall through and
+        // re-create rather than returning a client that isn't there.
+      }
+
+      const id = `client_${pbIndexDocId(pbId)}`;
+      const client: Client = {
+        id,
+        name: fields.name,
+        email: '',
+        pb_id: pbId,
+        created_at: now,
+        updated_at: now,
+      };
+      tx.set(this.db.doc(id), client, { merge: true });
+      tx.set(indexRef, { local_id: id, pb_id: pbId, updated_at: now });
+      return client;
+    });
   }
   async findByEmail(email: string): Promise<Client | null> {
     const snap = await this.db.where('email', '==', email.toLowerCase()).limit(1).get();
@@ -138,13 +188,59 @@ export class FirestoreClientsRepository implements IClientsRepository {
     await this.db.doc(id).delete();
   }
   async clearAll(): Promise<void> {
-    await deleteAllDocs([this.db]);
+    await deleteAllDocs([this.db, this.pbIndexDb]);
   }
 }
 
 export class FirestoreAppointmentsRepository implements IAppointmentsRepository {
   private get db() {
     return getFirestoreInstance().collection('appointments');
+  }
+  /** `{pbId} -> { local_id }`, the replacement for `appointments.pb_id UNIQUE`. */
+  private get pbIndexDb() {
+    return getFirestoreInstance().collection('appointment_pb_index');
+  }
+
+  async upsertByPbId(
+    pbId: string,
+    fields: {
+      client_id: string;
+      client_name: string | null;
+      starts_at: string;
+      ends_at: string;
+      status: string;
+    },
+  ): Promise<{ appointment: Appointment; previousStatus: string | null }> {
+    const firestore = getFirestoreInstance();
+    const indexRef = this.pbIndexDb.doc(pbIndexDocId(pbId));
+
+    return firestore.runTransaction(async (tx) => {
+      const index = await tx.get(indexRef);
+      const now = new Date().toISOString();
+      const localId = index.exists
+        ? (index.data() as { local_id: string }).local_id
+        : `appt_${pbIndexDocId(pbId)}`;
+
+      const ref = this.db.doc(localId);
+      const existing = await tx.get(ref);
+      const previous = existing.exists ? (existing.data() as Appointment) : null;
+
+      const appointment: Appointment = {
+        id: localId,
+        pb_id: pbId,
+        client_id: fields.client_id,
+        client_name: fields.client_name,
+        starts_at: fields.starts_at,
+        ends_at: fields.ends_at,
+        status: fields.status,
+        created_at: previous?.created_at ?? now,
+        updated_at: now,
+      };
+      tx.set(ref, appointment, { merge: true });
+      if (!index.exists) tx.set(indexRef, { local_id: localId, pb_id: pbId, updated_at: now });
+
+      return { appointment, previousStatus: previous?.status ?? null };
+    });
   }
 
   async findById(id: string): Promise<Appointment | null> {
@@ -177,9 +273,11 @@ export class FirestoreAppointmentsRepository implements IAppointmentsRepository 
     return snap.docs.map((doc) => doc.data() as Appointment);
   }
   async findByPbId(pbId: string): Promise<Appointment | null> {
-    const snap = await this.db.where('pb_id', '==', pbId).limit(1).get();
-    if (snap.empty) return null;
-    return snap.docs[0].data() as Appointment;
+    // Through the index document, so this and upsertByPbId can never disagree
+    // about which local row a PB id belongs to.
+    const index = await this.pbIndexDb.doc(pbIndexDocId(pbId)).get();
+    const localId = index.exists ? (index.data() as { local_id: string }).local_id : null;
+    return localId ? this.findById(localId) : null;
   }
   async findOverlapping(startsAt: string, endsAt: string): Promise<Appointment[]> {
     // Overlap is `starts_at < endsAt AND ends_at > startsAt`, but Firestore
@@ -216,7 +314,7 @@ export class FirestoreAppointmentsRepository implements IAppointmentsRepository 
     await this.db.doc(id).delete();
   }
   async clearAll(): Promise<void> {
-    await deleteAllDocs([this.db]);
+    await deleteAllDocs([this.db, this.pbIndexDb]);
   }
 }
 
@@ -387,6 +485,9 @@ export class FirestoreSessionNotesRepository implements ISessionNotesRepository 
   private get revisionsDb() {
     return getFirestoreInstance().collection('note_revisions');
   }
+  private get pbProtocolsDb() {
+    return getFirestoreInstance().collection('pb_protocols');
+  }
 
   async findById(id: string): Promise<SessionNoteRecord | null> {
     const doc = await this.db.doc(id).get();
@@ -479,6 +580,15 @@ export class FirestoreSessionNotesRepository implements ISessionNotesRepository 
       .orderBy('revision', 'desc')
       .get();
     return snap.docs.map((doc) => doc.data() as NoteRevision);
+  }
+
+  async savePbProtocol(protocol: PbProtocol): Promise<PbProtocol> {
+    await this.pbProtocolsDb.doc(protocol.id).set(protocol, { merge: true });
+    return protocol;
+  }
+  async listPbProtocolsByClient(clientId: string): Promise<PbProtocol[]> {
+    const snap = await this.pbProtocolsDb.where('client_id', '==', clientId).get();
+    return snap.docs.map((doc) => doc.data() as PbProtocol);
   }
 
   async findSessionDocs(appointmentId: string): Promise<SessionDocs> {
@@ -761,7 +871,14 @@ export class FirestoreSessionNotesRepository implements ISessionNotesRepository 
   }
 
   async clearAll(): Promise<void> {
-    await deleteAllDocs([this.db, this.sheetsDb, this.protocolsDb, this.approvalsDb, this.revisionsDb]);
+    await deleteAllDocs([
+      this.db,
+      this.sheetsDb,
+      this.protocolsDb,
+      this.approvalsDb,
+      this.revisionsDb,
+      this.pbProtocolsDb,
+    ]);
   }
 }
 
