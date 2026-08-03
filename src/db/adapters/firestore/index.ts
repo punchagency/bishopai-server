@@ -106,11 +106,30 @@ function assertOneRecipient(message: MessageRecord): void {
   }
 }
 
+let settingsApplied = false;
+
 function getFirestoreInstance(): admin.firestore.Firestore {
   if (admin.apps.length === 0) {
     admin.initializeApp();
   }
-  return admin.firestore();
+  const firestore = admin.firestore();
+
+  if (!settingsApplied) {
+    // Firestore REJECTS a document containing `undefined` anywhere in it, at any
+    // depth. Postgres did not: every one of these documents went into a `jsonb`
+    // column via JSON.stringify, which drops undefined keys silently.
+    //
+    // Without this, an extracted note whose optional field came back undefined
+    // (`content_json.extraction.partial`, for one) fails to persist AT ALL — the
+    // whole session note is lost, and the failure is one level down inside a
+    // transaction rather than at the field that caused it. Matching
+    // JSON.stringify's behaviour is what keeps the port faithful.
+    //
+    // settings() throws if called after the first use, hence the guard.
+    firestore.settings({ ignoreUndefinedProperties: true });
+    settingsApplied = true;
+  }
+  return firestore;
 }
 
 export class FirestoreClientsRepository implements IClientsRepository {
@@ -132,7 +151,7 @@ export class FirestoreClientsRepository implements IClientsRepository {
     return localId ? this.findById(localId) : null;
   }
 
-  async upsertByPbId(pbId: string, fields: { name: string }): Promise<Client> {
+  async upsertByPbId(pbId: string, fields: { name: string; email?: string | null }): Promise<Client> {
     const firestore = getFirestoreInstance();
     const indexRef = this.pbIndexDb.doc(pbIndexDocId(pbId));
 
@@ -145,13 +164,15 @@ export class FirestoreClientsRepository implements IClientsRepository {
         const ref = this.db.doc(localId);
         const existing = await tx.get(ref);
         if (existing.exists) {
-          // DO UPDATE SET name = EXCLUDED.name — and nothing else. A PB session
+          // DO UPDATE SET name = EXCLUDED.name, and the email only when one was
+          // supplied — `COALESCE(EXCLUDED.email, clients.email)`. A PB session
           // embed carries only id and name, so writing the whole record here
           // would clear the email, Drive folder and flow sheet that other paths
           // filled in.
           const row = existing.data() as Client;
-          tx.update(ref, { name: fields.name, updated_at: now });
-          return { ...row, name: fields.name, updated_at: now };
+          const email = fields.email ? fields.email.toLowerCase() : row.email;
+          tx.update(ref, { name: fields.name, email, updated_at: now });
+          return { ...row, name: fields.name, email, updated_at: now };
         }
         // The index outlived the client (a deleted record). Fall through and
         // re-create rather than returning a client that isn't there.
@@ -161,7 +182,7 @@ export class FirestoreClientsRepository implements IClientsRepository {
       const client: Client = {
         id,
         name: fields.name,
-        email: '',
+        email: fields.email ? fields.email.toLowerCase() : '',
         pb_id: pbId,
         created_at: now,
         updated_at: now,
@@ -262,6 +283,18 @@ export class FirestoreAppointmentsRepository implements IAppointmentsRepository 
   }
   async listRecent(limit: number): Promise<Appointment[]> {
     const snap = await this.db.orderBy('starts_at', 'desc').limit(limit).get();
+    return snap.docs.map((doc) => doc.data() as Appointment);
+  }
+  async countUpcoming(nowIso: string): Promise<number> {
+    const snap = await this.db.where('starts_at', '>', nowIso).count().get();
+    return snap.data().count;
+  }
+  async listUpcoming(nowIso: string, limit: number): Promise<Appointment[]> {
+    const snap = await this.db
+      .where('starts_at', '>', nowIso)
+      .orderBy('starts_at', 'asc')
+      .limit(limit)
+      .get();
     return snap.docs.map((doc) => doc.data() as Appointment);
   }
   async listBetween(fromIso: string, toIso: string): Promise<Appointment[]> {
@@ -446,6 +479,11 @@ export class FirestoreConversationsRepository implements IConversationsRepositor
       .slice(0, limit);
   }
 
+  async countUnmatched(): Promise<number> {
+    const snap = await this.db.where('correlation_status', '==', 'unmatched').count().get();
+    return snap.data().count;
+  }
+
   async claimAppointment(claim: AppointmentClaim): Promise<boolean> {
     try {
       await this.claimsDb.doc(claim.id).create(claim);
@@ -573,6 +611,9 @@ export class FirestoreSessionNotesRepository implements ISessionNotesRepository 
     return snap.docs.map((doc) => doc.data() as Approval);
   }
 
+  async deleteApproval(id: string): Promise<void> {
+    await this.approvalsDb.doc(id).delete();
+  }
   async listRevisions(sourceTable: NoteTable, sourceId: string): Promise<NoteRevision[]> {
     const snap = await this.revisionsDb
       .where('source_table', '==', sourceTable)
@@ -580,6 +621,22 @@ export class FirestoreSessionNotesRepository implements ISessionNotesRepository 
       .orderBy('revision', 'desc')
       .get();
     return snap.docs.map((doc) => doc.data() as NoteRevision);
+  }
+
+  async countAwaitingReview(): Promise<number> {
+    // A session has a sheet whenever it has anything, and a protocol only when a
+    // client is attached — so the larger of the two counts is the number of
+    // APPOINTMENTS awaiting review, without double-counting the ones with both.
+    const pending: DocStatus[] = ['draft', 'in_review'];
+    const [sheets, protocols] = await Promise.all([
+      this.sheetsDb.where('status', 'in', pending).count().get(),
+      this.protocolsDb.where('status', 'in', pending).count().get(),
+    ]);
+    return Math.max(sheets.data().count, protocols.data().count);
+  }
+  async countApprovalsSince(sinceIso: string): Promise<number> {
+    const snap = await this.approvalsDb.where('approved_at', '>=', sinceIso).count().get();
+    return snap.data().count;
   }
 
   async savePbProtocol(protocol: PbProtocol): Promise<PbProtocol> {
@@ -921,6 +978,13 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
     const snap = await this.db.where('client_id', '==', clientId).get();
     return snap.docs.map((doc) => doc.data() as Checkout);
   }
+  async countAwaiting(): Promise<number> {
+    const snap = await this.db
+      .where('status', 'not-in', ['CLOSED', 'CHARGE_FAILED'])
+      .count()
+      .get();
+    return snap.data().count;
+  }
   async save(checkout: Checkout): Promise<Checkout> {
     await this.db.doc(checkout.id).set(checkout, { merge: true });
     return checkout;
@@ -1127,6 +1191,40 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
     const snap = await this.reconciliationsDb.where('status', '==', 'PENDING').get();
     return snap.docs.map((doc) => doc.data() as PaymentReconciliation);
   }
+  async listReconciliations(status?: string | null): Promise<PaymentReconciliation[]> {
+    const base = status
+      ? this.reconciliationsDb.where('status', '==', status)
+      : this.reconciliationsDb;
+    const snap = await base.orderBy('updated_at', 'desc').get();
+    return snap.docs.map((doc) => doc.data() as PaymentReconciliation);
+  }
+  async retryReconciliation(id: string): Promise<PaymentReconciliation | null> {
+    const ref = this.reconciliationsDb.doc(id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return null;
+      const row = doc.data() as PaymentReconciliation;
+      // Compare-and-set on status. A RECORDED row reset to PENDING would be
+      // recorded in QuickBooks twice; the `WHERE status IN (…)` in the pg
+      // UPDATE was carrying that guarantee, and it has to survive the port.
+      if (row.status !== 'FAILED' && row.status !== 'NEEDS_REVIEW') return null;
+      const now = new Date().toISOString();
+      const next: PaymentReconciliation = {
+        ...row,
+        status: 'PENDING',
+        attempts: 0,
+        next_attempt_at: now,
+        updated_at: now,
+      };
+      tx.update(ref, {
+        status: next.status,
+        attempts: next.attempts,
+        next_attempt_at: next.next_attempt_at,
+        updated_at: next.updated_at,
+      });
+      return next;
+    });
+  }
   async saveQboMap(map: ClientQboMap): Promise<ClientQboMap> {
     await this.qboDb.doc(map.client_id).set(map, { merge: true });
     return map;
@@ -1141,6 +1239,11 @@ export class FirestoreCheckoutsRepository implements ICheckoutsRepository {
   }
   async deleteQboMap(clientId: string): Promise<void> {
     await this.qboDb.doc(clientId).delete();
+  }
+  async deleteCheckout(id: string): Promise<void> {
+    // The reconciliation's document id IS the checkout id, so this is a direct
+    // delete rather than a query.
+    await Promise.all([this.reconciliationsDb.doc(id).delete(), this.db.doc(id).delete()]);
   }
   async clearAll(): Promise<void> {
     await deleteAllDocs([this.db, this.reconciliationsDb, this.qboDb]);
@@ -1238,9 +1341,32 @@ export class FirestoreRefillsRepository implements IRefillsRepository {
     const snap = await this.db.where('status', '==', status).get();
     return snap.docs.map((doc) => doc.data() as Refill);
   }
+  async listByStatuses(statuses: RefillStatus[]): Promise<Refill[]> {
+    if (statuses.length === 0) return [];
+    const snap = await this.db
+      .where('status', 'in', statuses)
+      .orderBy('due_date', 'asc')
+      .get();
+    return snap.docs.map((doc) => doc.data() as Refill);
+  }
+  async countByStatuses(statuses: RefillStatus[]): Promise<number> {
+    if (statuses.length === 0) return 0;
+    const snap = await this.db.where('status', 'in', statuses).count().get();
+    return snap.data().count;
+  }
+  async findSupplementById(id: string): Promise<Supplement | null> {
+    const doc = await this.supplementsDb.doc(id).get();
+    return doc.exists ? (doc.data() as Supplement) : null;
+  }
   async findById(id: string): Promise<Refill | null> {
     const doc = await this.db.doc(id).get();
     return doc.exists ? (doc.data() as Refill) : null;
+  }
+  async deleteRefill(id: string): Promise<void> {
+    // `refill_orders … ON DELETE CASCADE` by hand (§7).
+    const orders = await this.ordersDb.where('refill_id', '==', id).get();
+    await Promise.all(orders.docs.map((doc) => doc.ref.delete()));
+    await this.db.doc(id).delete();
   }
   async findRefillBySupplement(supplementId: string): Promise<Refill | null> {
     // `refills_supplement_id_key` made this one-per-supplement; the projection
@@ -1289,6 +1415,11 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
     const snap = await this.db.where('status', '==', status).get();
     return snap.docs.map((doc) => doc.data() as Lead);
   }
+  async countLeadsByStatuses(statuses: string[]): Promise<number> {
+    if (statuses.length === 0) return 0;
+    const snap = await this.db.where('status', 'in', statuses).count().get();
+    return snap.data().count;
+  }
   async listLeadsByEmail(email: string): Promise<Lead[]> {
     // Addresses are stored lowercased, which is what replaces `lower(email) =
     // lower($1)` — Firestore has no case-insensitive comparison, so the
@@ -1302,6 +1433,46 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
   async saveLead(lead: Lead): Promise<Lead> {
     await this.db.doc(lead.id).set(lead, { merge: true });
     return lead;
+  }
+  async claimLeadForBooking(
+    leadId: string,
+  ): Promise<{ lead: Lead; previousStatus: string } | null> {
+    const ref = this.db.doc(leadId);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return null;
+      const stored = doc.data() as Lead;
+      // `WHERE status NOT IN ('closed','booked')` — the compare half.
+      if (stored.status === 'closed' || stored.status === 'booked') return null;
+      const next: Lead = { ...stored, status: 'booked', updated_at: new Date().toISOString() };
+      tx.update(ref, { status: next.status, updated_at: next.updated_at });
+      return { lead: next, previousStatus: stored.status };
+    });
+  }
+  async releaseLeadBookingClaim(leadId: string, previousStatus: string): Promise<void> {
+    const ref = this.db.doc(leadId);
+    await getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(ref);
+      if (!doc.exists) return;
+      // Only while we still own it: a booking that succeeded elsewhere, or a
+      // lead Nicole has since closed, must not be dragged back.
+      if ((doc.data() as Lead).status !== 'booked') return;
+      tx.update(ref, { status: previousStatus, updated_at: new Date().toISOString() });
+    });
+  }
+  async markLeadReplied(leadId: string, activity: LeadActivity): Promise<Lead | null> {
+    const leadRef = this.db.doc(leadId);
+    const activityRef = this.activitiesDb.doc(activity.id);
+    return getFirestoreInstance().runTransaction(async (tx) => {
+      const doc = await tx.get(leadRef);
+      if (!doc.exists) return null;
+      const stored = doc.data() as Lead;
+      const next: Lead = { ...stored, status: 'replied', updated_at: new Date().toISOString() };
+      // One entity plus one child document — exactly the shape §2 calls faithful.
+      tx.update(leadRef, { status: next.status, updated_at: next.updated_at });
+      tx.set(activityRef, activity);
+      return next;
+    });
   }
   async logActivity(activity: LeadActivity): Promise<LeadActivity> {
     await this.activitiesDb.doc(activity.id).set(activity, { merge: true });
@@ -1321,6 +1492,35 @@ export class FirestoreReengagementRepository implements IReengagementRepository 
       .limit(limit)
       .get();
     return snap.docs.map((doc) => doc.data() as LeadActivity);
+  }
+  async listActivityFeed(limit: number): Promise<LeadActivity[]> {
+    const snap = await this.activitiesDb.orderBy('occurred_at', 'desc').limit(limit).get();
+    return snap.docs.map((doc) => doc.data() as LeadActivity);
+  }
+  async summarizeActivity(
+    leadIds: string[],
+  ): Promise<Map<string, { count: number; last_activity: string | null }>> {
+    const entries = await Promise.all(
+      leadIds.map(async (leadId) => {
+        const byLead = this.activitiesDb.where('lead_id', '==', leadId);
+        const [count, latest] = await Promise.all([
+          byLead.count().get(),
+          byLead.orderBy('occurred_at', 'desc').limit(1).get(),
+        ]);
+        const last = latest.empty ? null : (latest.docs[0].data() as LeadActivity).occurred_at;
+        return [leadId, { count: count.data().count, last_activity: last }] as const;
+      }),
+    );
+    return new Map(entries);
+  }
+  async deleteLead(id: string): Promise<void> {
+    // Both `ON DELETE CASCADE` FKs that pointed at leads, by hand (§7).
+    const [activities, messages] = await Promise.all([
+      this.activitiesDb.where('lead_id', '==', id).get(),
+      this.messagesDb.where('lead_id', '==', id).get(),
+    ]);
+    await Promise.all([...activities.docs, ...messages.docs].map((doc) => doc.ref.delete()));
+    await this.db.doc(id).delete();
   }
   async logMessage(message: MessageRecord): Promise<MessageRecord> {
     assertOneRecipient(message);

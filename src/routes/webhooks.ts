@@ -1,7 +1,7 @@
 import { Router, type RequestHandler } from 'express';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { isPbConfigured } from '../integrations/pb/config';
 import { verifyBookingToken } from '../reengagement/bookingToken';
 import { ingestConversation } from '../conversations/ingest';
@@ -52,43 +52,32 @@ webhooksRouter.post('/pb/booking', requireWebhookSecret('PB_WEBHOOK_SECRET'), as
     return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
   }
   const b = parsed.data;
-  const db = await pool.connect();
   try {
-    await db.query('BEGIN');
+    const db = getDatabase();
+    // The pg version wrapped both upserts in one transaction. Each upsert is now
+    // individually atomic through its own pb-id claim document (§3.1), which is
+    // what the uniqueness actually depended on; a retry of this webhook lands on
+    // the same two documents either way, so a crash between them self-heals on
+    // PB's redelivery rather than needing a shared transaction.
+    const client = await db.clients.upsertByPbId(b.pb_client_id, {
+      name: b.client_name,
+      email: b.client_email ?? null,
+    });
 
-    const clientRes = await db.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id, email)
-            VALUES ($1, $2, $3)
-       ON CONFLICT (pb_id) DO UPDATE
-            SET name  = EXCLUDED.name,
-                email = COALESCE(EXCLUDED.email, clients.email)
-         RETURNING id`,
-      [b.client_name, b.pb_client_id, b.client_email ?? null],
-    );
-    const clientId = clientRes.rows[0].id;
+    const { appointment } = await db.appointments.upsertByPbId(b.pb_appointment_id, {
+      client_id: client.id,
+      client_name: client.name,
+      starts_at: b.starts_at,
+      ends_at: b.ends_at,
+      status: b.status,
+    });
 
-    const apptRes = await db.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-            VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (pb_id) DO UPDATE
-            SET starts_at = EXCLUDED.starts_at,
-                ends_at   = EXCLUDED.ends_at,
-                status    = EXCLUDED.status,
-                client_id = EXCLUDED.client_id
-         RETURNING id`,
-      [clientId, b.pb_appointment_id, b.starts_at, b.ends_at, b.status],
-    );
-
-    await db.query('COMMIT');
-    res.status(200).json({ appointment_id: apptRes.rows[0].id, client_id: clientId });
+    res.status(200).json({ appointment_id: appointment.id, client_id: client.id });
   } catch (err) {
-    await db.query('ROLLBACK');
     await logError('webhook.pb_booking', 'appointment upsert failed', err, {
       pb_appointment_id: b.pb_appointment_id,
     });
     res.status(500).json({ error: 'internal error' });
-  } finally {
-    db.release();
   }
 });
 
@@ -111,15 +100,16 @@ webhooksRouter.post('/pb/session', requirePbSignature('PB_SIGNING_SECRET'), asyn
   try {
     const status = appointmentStatusFor(ev.kind);
     if (status && ev.objectId) {
-      const r = await pool.query<{ id: string }>(
-        `UPDATE appointments SET status = $2 WHERE pb_id = $1 RETURNING id`,
-        [ev.objectId, status],
-      );
-      if (r.rowCount) {
+      const db = getDatabase();
+      // `UPDATE … WHERE pb_id = $1` — through the pb index, so a pb id we've
+      // never seen is a miss rather than a scan.
+      const existing = await db.appointments.findByPbId(ev.objectId);
+      if (existing) {
+        await db.appointments.save({ ...existing, status, updated_at: new Date().toISOString() });
         logEvent('info', 'webhook.pb_session', `appointment marked ${status}`, { pb_id: ev.objectId });
         // Session complete → kick off WF2 checkout (off the request path).
         if (ev.kind === 'session_completed') {
-          const apptId = r.rows[0].id;
+          const apptId = existing.id;
           void detectCheckout(apptId).catch((e) =>
             logError('checkout.detect', 'auto-detect failed', e, { appointment_id: apptId }),
           );
@@ -330,11 +320,8 @@ webhooksRouter.get('/appointments/book', async (req, res) => {
 
   try {
     // 1. Verify lead exists and is active
-    const leadRes = await pool.query(
-      `SELECT * FROM leads WHERE id = $1 AND status NOT IN ('closed', 'booked')`,
-      [leadId]
-    );
-    if (leadRes.rowCount === 0) {
+    const existingLead = await getDatabase().reengagement.findLeadById(leadId);
+    if (!existingLead || existingLead.status === 'closed' || existingLead.status === 'booked') {
       return res.status(400).send(
         bookingErrorHtml('Link Expired', 'This booking link has expired, or the appointment has already been scheduled.'),
       );
@@ -471,12 +458,9 @@ webhooksRouter.post('/appointments/book', async (req, res) => {
 
   try {
     // 1. Lead must exist and be active.
-    const leadRes = await pool.query<{ id: string; email: string; status: string }>(
-      `SELECT id, email, status FROM leads WHERE id = $1`,
-      [leadId],
-    );
-    const lead = leadRes.rows[0];
-    if (!lead || lead.status === 'closed' || lead.status === 'booked') {
+    const db = getDatabase();
+    const lead = await db.reengagement.findLeadById(leadId);
+    if (!lead || !lead.email || lead.status === 'closed' || lead.status === 'booked') {
       return res.status(400).send(
         bookingErrorHtml('Link Expired', 'This link has expired or the appointment has already been scheduled.'),
       );
@@ -497,16 +481,13 @@ webhooksRouter.post('/appointments/book', async (req, res) => {
     // 3. Optimistically CLAIM the booking with an atomic conditional update — no
     //    DB lock is held across the PB API call. A concurrent submit for the same
     //    lead loses the race here (rowCount 0).
-    const claim = await pool.query(
-      `UPDATE leads SET status = 'booked' WHERE id = $1 AND status NOT IN ('closed','booked') RETURNING id`,
-      [leadId],
-    );
-    if (claim.rowCount === 0) {
+    const claim = await db.reengagement.claimLeadForBooking(leadId);
+    if (!claim) {
       return res.status(409).send(
         bookingErrorHtml('Already Booked', 'This appointment has already been scheduled.'),
       );
     }
-    const previousStatus = lead.status;
+    const previousStatus = claim.previousStatus;
 
     const pbConfigured = isPbConfigured();
     try {
@@ -518,22 +499,21 @@ webhooksRouter.post('/appointments/book', async (req, res) => {
       //    and skip the PB write — the flow still records + confirms locally.
       let clientPbId: string | null = null;
       let clientName = 'Lead Inquiry';
-      const localClient = await pool.query<{ pb_id: string | null; name: string }>(
-        `SELECT pb_id, name FROM clients WHERE email = $1 LIMIT 1`,
-        [lead.email],
-      );
-      if ((localClient.rowCount ?? 0) > 0 && localClient.rows[0].pb_id) {
-        clientPbId = localClient.rows[0].pb_id;
-        clientName = localClient.rows[0].name;
+      const localClient = await db.clients.findByEmail(lead.email);
+      if (localClient?.pb_id) {
+        clientPbId = localClient.pb_id;
+        clientName = localClient.name;
       } else {
-        const actRes = await pool.query<{ detail: string }>(
-          `SELECT detail FROM lead_activity WHERE lead_id = $1 AND type = 'form_submit' ORDER BY occurred_at DESC LIMIT 1`,
-          [lead.id],
-        );
+        // `WHERE type='form_submit' ORDER BY occurred_at DESC LIMIT 1` — the
+        // activities come back newest-first from the indexed query, so the
+        // newest form_submit is the first match (§3.5: an extra equality plus
+        // this ordering would need its own composite index for no gain).
+        const activities = await db.reengagement.listActivities(lead.id);
+        const latestSubmit = activities.find((a) => a.type === 'form_submit') ?? null;
         let firstName = 'Lead';
         let lastName = 'Inquiry';
-        if ((actRes.rowCount ?? 0) > 0 && actRes.rows[0].detail) {
-          const nameMatch = /name:\s*([^—\n]+)/i.exec(actRes.rows[0].detail);
+        if (latestSubmit?.detail) {
+          const nameMatch = /name:\s*([^—\n]+)/i.exec(latestSubmit.detail);
           if (nameMatch && nameMatch[1]) {
             const parts = nameMatch[1].trim().split(/\s+/);
             if (parts.length > 0) firstName = parts[0];
@@ -544,11 +524,7 @@ webhooksRouter.post('/appointments/book', async (req, res) => {
         clientPbId = pbConfigured
           ? (await createClientRecord({ profile: { firstName, lastName, emailAddress: lead.email } })).id
           : `dry-client-${randomUUID()}`;
-        await pool.query(
-          `INSERT INTO clients (name, pb_id, email) VALUES ($1, $2, $3)
-             ON CONFLICT (pb_id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name`,
-          [clientName, clientPbId, lead.email],
-        );
+        await db.clients.upsertByPbId(clientPbId, { name: clientName, email: lead.email });
       }
 
       // 5–6. Book the session. When PB is configured, resolve the service and
@@ -583,41 +559,41 @@ webhooksRouter.post('/appointments/book', async (req, res) => {
         });
       }
 
-      // 7. Record locally in ONE short, all-local transaction.
+      // 7. Record locally. Each write is keyed on an id that a retry reuses —
+      // the pb-id claim documents for the client and appointment (§3.1) — so
+      // the sequence is replay-safe without a shared transaction. The 'booked'
+      // activity is written LAST and remains the marker bookingReconcile.ts
+      // uses to tell a completed booking from a stranded claim, so it must not
+      // move earlier.
       const endsAt = new Date(new Date(slot).getTime() + oh.session_duration_min * 60_000).toISOString();
-      const db = await pool.connect();
-      try {
-        await db.query('BEGIN');
-        const lc = await db.query<{ id: string }>(
-          `INSERT INTO clients (name, pb_id, email) VALUES ($1, $2, $3)
-             ON CONFLICT (pb_id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email
-             RETURNING id`,
-          [clientName, clientPbId, lead.email],
-        );
-        await db.query(
-          `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-             VALUES ($1, $2, $3, $4, 'confirmed')
-             ON CONFLICT (pb_id) DO UPDATE SET starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at, status = EXCLUDED.status`,
-          [lc.rows[0].id, sessionId, slot, endsAt],
-        );
-        await db.query(
-          `INSERT INTO lead_activity (lead_id, type, detail) VALUES ($1, 'booked', $2)`,
-          [leadId, `Booked session for ${new Date(slot).toLocaleString()}`],
-        );
-        await db.query('COMMIT');
-      } catch (e) {
-        await db.query('ROLLBACK');
-        throw e;
-      } finally {
-        db.release();
-      }
+      const bookedClient = await db.clients.upsertByPbId(clientPbId, {
+        name: clientName,
+        email: lead.email,
+      });
+      await db.appointments.upsertByPbId(sessionId, {
+        client_id: bookedClient.id,
+        client_name: bookedClient.name,
+        starts_at: slot,
+        ends_at: endsAt,
+        status: 'confirmed',
+      });
+      const bookedAt = new Date().toISOString();
+      await db.reengagement.logActivity({
+        id: randomUUID(),
+        lead_id: leadId,
+        type: 'booked',
+        path: null,
+        detail: `Booked session for ${new Date(slot).toLocaleString()}`,
+        occurred_at: bookedAt,
+        created_at: bookedAt,
+      });
 
       logEvent('info', 'webhook.appointments.book', 'booked session', { lead_id: leadId, pb_session_id: sessionId, dry_run: !pbConfigured });
     } catch (bookErr) {
       // We claimed the lead before the PB call; on failure, revert the claim so
       // the client can retry — but only if we still own it ('booked').
-      await pool
-        .query(`UPDATE leads SET status = $2 WHERE id = $1 AND status = 'booked'`, [leadId, previousStatus])
+      await db.reengagement
+        .releaseLeadBookingClaim(leadId, previousStatus)
         .catch((e) => logError('webhook.appointments.book_post', 'failed to revert lead claim', e, { lead_id: leadId }));
       throw bookErr;
     }

@@ -1,13 +1,14 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logError, logEvent } from '../observability/logger';
 import { fullscriptDispensaryUrl } from '../integrations/fullscript';
 import { computeAdherence, suggestedMonths } from '../refills/adherence';
 import { computeRunOut, dailyUnits, type DoseSchedule } from '../refills/project';
 import { recordAudit } from '../audit/log';
 import { sendEmail, resolveOutlookAccess } from '../integrations/outlook';
+import { isDocId } from '../db/ids.js';
 
 // WF4 dashboard surface: the daily refill digest (who's running low, tiered by
 // urgency) plus Nicole's actions — snooze, skip, or bulk-send the orders to
@@ -15,7 +16,10 @@ import { sendEmail, resolveOutlookAccess } from '../integrations/outlook';
 // No auth yet — consistent with the rest of the review surface.
 export const refillsRouter = Router();
 
-const isUuid = (id: string) => z.uuid().safeParse(id).success;
+// Path ids are Firestore document ids, not uuids — the port mints deterministic
+// ones (`appt_…`, `client_…`, `${clientId}__${nameKey}`). Gating on uuid shape
+// here would 404 every PB-synced record; see isDocId.
+const isUuid = isDocId;
 
 // Tier thresholds (days until run-out). Kept here so the API and UI agree.
 const SOON_DAYS = 14;
@@ -25,38 +29,79 @@ const SOON_DAYS = 14;
 // ---------------------------------------------------------------------------
 refillsRouter.get('/digest', async (_req, res) => {
   try {
-    const r = await pool.query(
-      `SELECT rf.id, rf.due_date, rf.status,
-              (rf.due_date - current_date) AS days_left,
-              c.id AS client_id, c.name AS client_name,
-              s.name AS supplement_name, s.dose, s.qty, s.schedule,
-              to_char(s.start_date, 'YYYY-MM-DD') AS start_date,
-              rf.reminders_cancelled_at,
-              o.fullscript_order_id AS fullscript_plan_id, o.invitation_url
-         FROM refills rf
-    LEFT JOIN clients c ON c.id = rf.client_id
-    LEFT JOIN supplements s ON s.id = rf.supplement_id
-    LEFT JOIN LATERAL (
-           SELECT fullscript_order_id, invitation_url
-             FROM refill_orders ro
-            WHERE ro.refill_id = rf.id AND ro.status = 'sent'
-         ORDER BY ro.sent_at DESC NULLS LAST
-            LIMIT 1
-         ) o ON true
-        WHERE rf.status IN ('pending', 'notified', 'snoozed')
-          AND rf.due_date IS NOT NULL
-     ORDER BY rf.due_date ASC`,
+    const db = getDatabase();
+    const open = (await db.refills.listByStatuses(['pending', 'notified', 'snoozed'])).filter(
+      (rf) => !!rf.due_date, // `AND rf.due_date IS NOT NULL`
     );
+
+    // The two LEFT JOINs and the LATERAL become three batched lookups: the
+    // supplements and clients by known ref, and every order for this set in one
+    // pass (§3.4). Nothing here is a per-row query against an unindexed field.
+    const [supplements, clients, orders] = await Promise.all([
+      Promise.all(
+        [...new Set(open.map((rf) => rf.supplement_id))].map(
+          async (id) => [id, await db.refills.findSupplementById(id)] as const,
+        ),
+      ),
+      Promise.all(
+        [...new Set(open.map((rf) => rf.client_id))].map(
+          async (id) => [id, await db.clients.findById(id)] as const,
+        ),
+      ),
+      db.refills.listOrdersForRefills(open.map((rf) => rf.id)),
+    ]);
+    const suppById = new Map(supplements);
+    const clientById = new Map(clients);
+
+    // `ORDER BY ro.sent_at DESC NULLS LAST LIMIT 1`, per refill — the most
+    // recent successful send is the one whose link the card shows.
+    const latestSent = new Map<string, (typeof orders)[number]>();
+    for (const o of orders) {
+      if (o.status !== 'sent' || !o.refill_id) continue;
+      const prev = latestSent.get(o.refill_id);
+      if (!prev || (o.sent_at ?? '') > (prev.sent_at ?? '')) latestSent.set(o.refill_id, o);
+    }
+
+    // `(rf.due_date - current_date)` was computed in pg; there is no such
+    // expression here, so the day difference is computed in UTC against the
+    // same yyyy-mm-dd strings the projection writes.
+    const today = new Date().toISOString().slice(0, 10);
+    const daysBetween = (from: string, to: string) =>
+      Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
+
     // Surface the dosing maths the projection ran on: how many units a day the
     // dose works out to and how long the bottle lasts at that rate. It's what
     // makes a due date checkable at a glance rather than a number to trust.
-    const items = r.rows.map((row) => {
-      const { perDay, daysSupply } = computeRunOut(row);
+    const items = open.map((rf) => {
+      const supp = suppById.get(rf.supplement_id) ?? null;
+      const order = latestSent.get(rf.id) ?? null;
+      const daysLeft = daysBetween(today, rf.due_date);
+      const { perDay, daysSupply } = computeRunOut({
+        dose: supp?.dose ?? rf.dose ?? null,
+        qty: supp?.qty ?? null,
+        schedule: supp?.schedule ?? null,
+        start_date: supp?.start_date ?? null,
+        units_per_dose: supp?.units_per_dose ?? null,
+        doses_per_day: supp?.doses_per_day ?? null,
+      });
       return {
-        ...row,
+        id: rf.id,
+        due_date: rf.due_date,
+        status: rf.status,
+        days_left: daysLeft,
+        client_id: rf.client_id,
+        client_name: clientById.get(rf.client_id)?.name ?? rf.client_name ?? null,
+        supplement_name: supp?.name ?? rf.supplement_name,
+        dose: supp?.dose ?? rf.dose ?? null,
+        qty: supp?.qty ?? null,
+        schedule: supp?.schedule ?? null,
+        start_date: supp?.start_date ?? null,
+        reminders_cancelled_at: rf.reminders_cancelled_at ?? null,
+        fullscript_plan_id: order?.fullscript_order_id ?? null,
+        invitation_url: order?.invitation_url ?? null,
         per_day: perDay,
         days_supply: daysSupply,
-        tier: tierFor(row.days_left),
+        tier: tierFor(daysLeft),
       };
     });
     const outlookAccess = await resolveOutlookAccess().catch(() => null);
@@ -99,16 +144,24 @@ refillsRouter.post('/:id/snooze', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'invalid payload' });
   const days = parsed.data.days ?? 14;
   try {
-    const r = await pool.query(
-      `UPDATE refills
-          SET status = 'snoozed', due_date = coalesce(due_date, current_date) + ($2 || ' days')::interval
-        WHERE id = $1
-    RETURNING id, status, due_date`,
-      [req.params.id, String(days)],
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    const db = getDatabase();
+    const refill = await db.refills.findById(req.params.id);
+    if (!refill) return res.status(404).json({ error: 'not found' });
+
+    // `coalesce(due_date, current_date) + N days`, in UTC on the yyyy-mm-dd
+    // strings the projection writes.
+    const base = refill.due_date || new Date().toISOString().slice(0, 10);
+    const dueDate = new Date(Date.parse(`${base}T00:00:00Z`) + days * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+    await db.refills.save({
+      ...refill,
+      status: 'snoozed',
+      due_date: dueDate,
+      updated_at: new Date().toISOString(),
+    });
     await recordAudit({ entityType: 'refill', entityId: req.params.id, action: 'refill.snoozed', actor: 'nicole', summary: `Refill snoozed ${days} days`, metadata: { days } });
-    return res.json(r.rows[0]);
+    return res.json({ id: refill.id, status: 'snoozed', due_date: dueDate });
   } catch (err) {
     logError('refills.snooze', 'snooze failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
@@ -118,13 +171,12 @@ refillsRouter.post('/:id/snooze', async (req, res) => {
 refillsRouter.post('/:id/skip', async (req, res) => {
   if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   try {
-    const r = await pool.query(
-      `UPDATE refills SET status = 'closed' WHERE id = $1 RETURNING id, status`,
-      [req.params.id],
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    const db = getDatabase();
+    const refill = await db.refills.findById(req.params.id);
+    if (!refill) return res.status(404).json({ error: 'not found' });
+    await db.refills.save({ ...refill, status: 'closed', updated_at: new Date().toISOString() });
     await recordAudit({ entityType: 'refill', entityId: req.params.id, action: 'refill.skipped', actor: 'nicole', summary: 'Refill closed for this cycle' });
-    return res.json(r.rows[0]);
+    return res.json({ id: refill.id, status: 'closed' });
   } catch (err) {
     logError('refills.skip', 'skip failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
@@ -151,9 +203,12 @@ refillsRouter.post('/orders', async (req, res) => {
   const batchId = randomUUID();
 
   try {
+    const db = getDatabase();
     // Resolve the refills into order lines (client + supplement + patient email
-    // + dose/qty for the Fullscript dosage).
-    const info = await pool.query<{
+    // + dose/qty for the Fullscript dosage). `WHERE rf.id = ANY(...)` becomes
+    // parallel gets by id, and the two LEFT JOINs likewise (§3.4); a refill id
+    // that no longer exists is simply dropped, as the SQL did.
+    type OrderLine = {
       id: string;
       client_id: string | null;
       client_name: string | null;
@@ -162,16 +217,41 @@ refillsRouter.post('/orders', async (req, res) => {
       dose: string | null;
       qty: number | null;
       schedule: DoseSchedule | null;
-    }>(
-      `SELECT rf.id, rf.client_id, c.name AS client_name, c.email AS client_email,
-              s.name AS supplement_name, s.dose, s.qty, s.schedule
-         FROM refills rf
-    LEFT JOIN clients c ON c.id = rf.client_id
-    LEFT JOIN supplements s ON s.id = rf.supplement_id
-        WHERE rf.id = ANY($1::uuid[])`,
-      [refill_ids],
-    );
-    if (info.rowCount === 0) return res.status(404).json({ error: 'no matching refills' });
+    };
+    const found = (
+      await Promise.all(refill_ids.map((id) => db.refills.findById(id)))
+    ).filter((rf): rf is NonNullable<typeof rf> => rf !== null);
+
+    const [lineClients, lineSupplements] = await Promise.all([
+      Promise.all(
+        [...new Set(found.map((rf) => rf.client_id))].map(
+          async (id) => [id, await db.clients.findById(id)] as const,
+        ),
+      ),
+      Promise.all(
+        [...new Set(found.map((rf) => rf.supplement_id))].map(
+          async (id) => [id, await db.refills.findSupplementById(id)] as const,
+        ),
+      ),
+    ]);
+    const lineClientById = new Map(lineClients);
+    const lineSuppById = new Map(lineSupplements);
+
+    const rows: OrderLine[] = found.map((rf) => {
+      const client = lineClientById.get(rf.client_id) ?? null;
+      const supp = lineSuppById.get(rf.supplement_id) ?? null;
+      return {
+        id: rf.id,
+        client_id: rf.client_id,
+        client_name: client?.name ?? rf.client_name ?? null,
+        client_email: client?.email ?? null,
+        supplement_name: supp?.name ?? rf.supplement_name ?? null,
+        dose: supp?.dose ?? rf.dose ?? null,
+        qty: supp?.qty ?? null,
+        schedule: (supp?.schedule ?? null) as DoseSchedule | null,
+      };
+    });
+    if (rows.length === 0) return res.status(404).json({ error: 'no matching refills' });
 
     // Group the refills by client email so we can send consolidated emails.
     // For clients with no email, we fail them.
@@ -190,10 +270,10 @@ refillsRouter.post('/orders', async (req, res) => {
     };
 
     const groupedByEmail = new Map<string, GroupedClientRefills>();
-    const noEmailRefills: typeof info.rows = [];
+    const noEmailRefills: OrderLine[] = [];
     const monthsCache = new Map<string, number>();
 
-    for (const row of info.rows) {
+    for (const row of rows) {
       if (!row.client_email) {
         noEmailRefills.push(row);
         continue;
@@ -239,14 +319,22 @@ refillsRouter.post('/orders', async (req, res) => {
     }> = [];
 
     const dispensaryUrl = fullscriptDispensaryUrl();
+    // Every refill_orders insert becomes a saveOrder with an explicit id — the
+    // pg table generated one, Firestore needs it up front.
+    const orderStamp = () => new Date().toISOString();
 
     // 1. Process refills for clients with no email
     for (const row of noEmailRefills) {
-      await pool.query(
-        `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status, error)
-              VALUES ($1, $2, $3, $4, 'failed', 'no client email on file')`,
-        [batchId, row.client_id, row.id, row.supplement_name],
-      );
+      await db.refills.saveOrder({
+        id: randomUUID(),
+        batch_id: batchId,
+        client_id: row.client_id,
+        refill_id: row.id,
+        supplement_name: row.supplement_name,
+        status: 'failed',
+        error: 'no client email on file',
+        created_at: orderStamp(),
+      });
       results.push({
         refill_id: row.id,
         client_name: row.client_name ?? 'Unknown client',
@@ -284,11 +372,18 @@ refillsRouter.post('/orders', async (req, res) => {
 
       for (const r of group.refills) {
         if (sendOk) {
-          await pool.query(
-            `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status, invitation_url, sent_at)
-                  VALUES ($1, $2, $3, $4, 'sent', $5, now())`,
-            [batchId, group.clientId, r.refillId, r.supplementName, dispensaryUrl],
-          );
+          const now = orderStamp();
+          await db.refills.saveOrder({
+            id: randomUUID(),
+            batch_id: batchId,
+            client_id: group.clientId,
+            refill_id: r.refillId,
+            supplement_name: r.supplementName,
+            status: 'sent',
+            invitation_url: dispensaryUrl,
+            sent_at: now,
+            created_at: now,
+          });
           results.push({
             refill_id: r.refillId,
             client_name: group.clientName,
@@ -297,11 +392,16 @@ refillsRouter.post('/orders', async (req, res) => {
             invitation_url: dispensaryUrl,
           });
         } else {
-          await pool.query(
-            `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status, error)
-                  VALUES ($1, $2, $3, $4, 'failed', $5)`,
-            [batchId, group.clientId, r.refillId, r.supplementName, sendError || 'email delivery failed'],
-          );
+          await db.refills.saveOrder({
+            id: randomUUID(),
+            batch_id: batchId,
+            client_id: group.clientId,
+            refill_id: r.refillId,
+            supplement_name: r.supplementName,
+            status: 'failed',
+            error: sendError || 'email delivery failed',
+            created_at: orderStamp(),
+          });
           results.push({
             refill_id: r.refillId,
             client_name: group.clientName,
@@ -317,21 +417,32 @@ refillsRouter.post('/orders', async (req, res) => {
       .filter((r) => r.ok)
       .map((r) => r.refill_id);
 
-    if (sentRefillIds.length > 0) {
-      await pool.query(`UPDATE refills SET status = 'notified' WHERE id = ANY($1::uuid[])`, [
-        sentRefillIds,
-      ]);
-    }
-
-    // Audit the bulk action.
-    await pool.query(
-      `INSERT INTO approvals (type, payload_json, status, approved_by, approved_at)
-            VALUES ('refill_bulk_send', $1, 'approved', $2, now())`,
-      [JSON.stringify({ batch_id: batchId, count: info.rows.length }), approved_by || 'nicole'],
+    // `UPDATE refills SET status='notified' WHERE id = ANY(...)` — the refills
+    // are already in hand from the lookup above, so this is a write per id
+    // rather than a re-read.
+    const foundById = new Map(found.map((rf) => [rf.id, rf]));
+    await Promise.all(
+      sentRefillIds.map(async (id) => {
+        const rf = foundById.get(id);
+        if (!rf) return;
+        await db.refills.save({ ...rf, status: 'notified', updated_at: new Date().toISOString() });
+      }),
     );
 
+    // Audit the bulk action.
+    const approvedAt = new Date().toISOString();
+    await db.sessionNotes.saveApproval({
+      id: randomUUID(),
+      type: 'refill_bulk_send',
+      payload_json: { batch_id: batchId, count: rows.length },
+      status: 'approved',
+      approved_by: approved_by || 'nicole',
+      approved_at: approvedAt,
+      created_at: approvedAt,
+    });
+
     const ok = results.filter((r) => r.ok).length;
-    logEvent('info', 'refills.orders', 'bulk refill send via email', { batch_id: batchId, count: info.rows.length, ok });
+    logEvent('info', 'refills.orders', 'bulk refill send via email', { batch_id: batchId, count: rows.length, ok });
     return res.json({ batch_id: batchId, sent: ok, failed: results.length - ok, results });
   } catch (err) {
     logError('refills.orders', 'bulk send failed', err, { batch_id: batchId });

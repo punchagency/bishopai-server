@@ -2,18 +2,23 @@ import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedCheckout } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { updateAuthConfig } from '../src/auth/service';
 
 // Card capture on the approve flow (Option A — backend tokenizes). Validates the
 // card is accepted and threaded through the charge, that a malformed card is
 // rejected with no echo, and that the raw PAN never appears in what we return.
-// DB-gated.
-let dbUp = true;
-try {
-  await pool.query('SELECT 1');
-} catch {
-  dbUp = false;
+// Emulator-gated.
+const up = await emulatorUp();
+if (!up) {
+  console.log('[checkout-card.int] Firestore emulator not running — skipping. Start: npm run firestore:emulator');
 }
 
 const summary = {
@@ -32,24 +37,26 @@ const validCard = {
   name: 'Test User',
 };
 
-describe.skipIf(!dbUp)('checkout approve — card capture (integration)', () => {
+describe.skipIf(!up)('checkout approve — card capture (integration)', () => {
   let server: http.Server;
   let base = '';
-  const created: string[] = [];
+  let db: IDatabase;
 
   // These tests assert the DRY-RUN charge path. test/setup.ts blanks the QB_* env so
   // the suite can never reach Intuit, whatever a developer holds in .env.
   beforeAll(async () => {
+    db = installFirestore('checkout-card-int');
     await updateAuthConfig({ enabled: false });
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   });
   afterEach(async () => {
-    for (const id of created.splice(0)) await pool.query(`DELETE FROM checkout WHERE id = $1`, [id]);
+    await clearFirestore(db);
   });
   afterAll(async () => {
     await new Promise<void>((r) => server.close(() => r()));
+    uninstallFirestore();
   });
 
   const approve = (id: string, body: unknown) =>
@@ -60,13 +67,12 @@ describe.skipIf(!dbUp)('checkout approve — card capture (integration)', () => 
     });
 
   async function newAwaitingCheckout(): Promise<string> {
-    const ch = await pool.query<{ id: string }>(
-      `INSERT INTO checkout (status, summary_snapshot, qb_invoice_id)
-            VALUES ('AWAITING_APPROVAL', $1, 'mock-inv-card') RETURNING id`,
-      [JSON.stringify(summary)],
-    );
-    created.push(ch.rows[0].id);
-    return ch.rows[0].id;
+    const checkout = await seedCheckout(db, {
+      status: 'AWAITING_APPROVAL',
+      summary_snapshot: summary,
+      qb_invoice_id: 'mock-inv-card',
+    });
+    return checkout.id;
   }
 
   it('accepts a valid card and completes the charge (dry-run), never echoing the PAN', async () => {
@@ -78,8 +84,8 @@ describe.skipIf(!dbUp)('checkout approve — card capture (integration)', () => 
     expect(JSON.parse(bodyText).status).toBe('PB_MARKED');
 
     // Charge happened and reconciliation was recorded.
-    const recon = await pool.query(`SELECT status FROM payment_reconciliation WHERE checkout_id = $1`, [id]);
-    expect(recon.rows[0]?.status).toBe('RECORDED');
+    const recon = await db.checkouts.findReconciliationByCheckout(id);
+    expect(recon?.status).toBe('RECORDED');
   });
 
   it('rejects a malformed card with 400 and no echo', async () => {
@@ -89,8 +95,8 @@ describe.skipIf(!dbUp)('checkout approve — card capture (integration)', () => 
     const text = await res.text();
     expect(text).not.toContain('not-a-number');
     // Checkout stays approvable — the bad request didn't move money.
-    const ch = await pool.query(`SELECT status FROM checkout WHERE id = $1`, [id]);
-    expect(ch.rows[0].status).toBe('AWAITING_APPROVAL');
+    const ch = await db.checkouts.findById(id);
+    expect(ch!.status).toBe('AWAITING_APPROVAL');
   });
 
   it('still works with no card in dry-run (backward compatible)', async () => {

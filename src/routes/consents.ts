@@ -2,12 +2,16 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { logError } from '../observability/logger';
 import { listConsents, recordConsent } from '../consent/service';
+import { isDocId } from '../db/ids.js';
 
 // WF1 consent surface: Nicole records a client's consent (e.g. passive session
 // recording) and can revoke it. Guarded by requireAuth (mounted in server.ts).
 export const consentsRouter = Router();
 
-const isUuid = (id: string) => z.uuid().safeParse(id).success;
+// Path ids are Firestore document ids, not uuids — the port mints deterministic
+// ones (`appt_…`, `client_…`, `${clientId}__${nameKey}`). Gating on uuid shape
+// here would 404 every PB-synced record; see isDocId.
+const isUuid = isDocId;
 
 // GET /consents/:clientId — a client's consent records.
 consentsRouter.get('/:clientId', async (req, res) => {

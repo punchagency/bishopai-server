@@ -11,7 +11,6 @@ import { join } from 'node:path';
 
 // Force a self-contained, dry-run + demo-sink configuration before importing app
 // modules (drive dry-run emits local files when DEMO_OUTPUT_DIR is set).
-process.env.DATABASE_URL ||= 'postgres://demo:demo@localhost:5432/demo'; // never queried
 process.env.DEMO_OUTPUT_DIR ||= join(process.cwd(), 'demo-output');
 // Force Drive dry-run so the demo sink runs. Set to empty (not delete): dotenv,
 // loaded transitively at import, won't override an already-present key — so these
@@ -42,8 +41,33 @@ const intake: SessionNote = {
     priority1: 'Immune stressor — upper GI',
     k27: 'Switched; corrected on rub',
     stressors: 'Immune challenge, food (dairy, gluten)',
-    foundation: 'HTA positive; CNS switched; dental clear',
-    body_scan: 'ART: matrix — liver/gallbladder. NRT: cell — adrenal.',
+    // FOUNDATION and BODY SCAN are per-prompt fields, not summary strings —
+    // one cell per line of the paper form. A single string here rendered every
+    // cell blank, which is the exact gap the split-pane review exists to close.
+    foundation: {
+      laying1: 'clear',
+      standing: 'clear',
+      hta: 'positive',
+      hta_post_run: 'clear post-run',
+      laying2: null,
+      art_open: null,
+      art_switch: 'switched',
+      art_cns: 'switched',
+      art_dental: 'clear',
+      art_hormonal: null,
+      additional: null,
+    },
+    body_scan: {
+      art_ectoderm: null,
+      art_priority: 'upper GI',
+      art_matrix: 'liver / gallbladder',
+      art_cell: null,
+      additional_art: null,
+      scan_priority: null,
+      scan_matrix: null,
+      scan_cell: 'adrenal',
+      additional_nrt: null,
+    },
   },
   lifestyle: {
     bm: 'every other day, sluggish',
@@ -75,9 +99,32 @@ const followUp: SessionNote = {
     priority1: 'Hormonal — ovary/pituitary',
     k27: 'Holding',
     stressors: 'Hormonal',
-    foundation: 'HTA clear; CNS holding',
-    body_scan: 'ART: matrix — endocrine. Ectoderm clear.',
-    // Nothing else was muscle-tested this session — those cells stay blank.
+    // Nothing else was muscle-tested this session — those cells stay blank,
+    // which is the point: an unstated reading is never inferred.
+    foundation: {
+      laying1: null,
+      standing: null,
+      hta: 'clear',
+      hta_post_run: null,
+      laying2: null,
+      art_open: null,
+      art_switch: null,
+      art_cns: 'holding',
+      art_dental: null,
+      art_hormonal: null,
+      additional: null,
+    },
+    body_scan: {
+      art_ectoderm: 'clear',
+      art_priority: null,
+      art_matrix: 'endocrine',
+      art_cell: null,
+      additional_art: null,
+      scan_priority: null,
+      scan_matrix: null,
+      scan_cell: null,
+      additional_nrt: null,
+    },
   },
   lifestyle: {
     bm: 'daily, formed',

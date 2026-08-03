@@ -287,4 +287,41 @@ suite('session approval against Firestore', () => {
       expect(await listSessions('pending', 100, 'someone else')).toHaveLength(0);
     });
   });
+  // Regression: Firestore REJECTS a document containing `undefined` at any
+  // depth, where Postgres' jsonb silently dropped those keys via
+  // JSON.stringify. Extraction produces exactly this shape — an optional field
+  // that came back undefined — and without ignoreUndefinedProperties the WHOLE
+  // session note failed to persist, taking the entire WF1 pipeline with it.
+  it('persists a note whose optional fields are undefined, as jsonb did', async () => {
+    const withUndefined = {
+      concerns: ['fatigue'],
+      goals: [],
+      assessments: [],
+      protocol_changes: [],
+      supplements: [],
+      follow_ups: [],
+      extraction: { partial: undefined, conflicts: 0 },
+    } as unknown as Record<string, unknown>;
+
+    await db.sessionNotes.saveSheet({
+      id: APPT,
+      appointment_id: APPT,
+      client_id: CLIENT,
+      client_name: 'Leeza Woodbury',
+      starts_at: STARTS_AT,
+      content_json: withUndefined,
+      status: 'draft',
+      revision: 1,
+      created_at: STARTS_AT,
+      updated_at: STARTS_AT,
+    });
+
+    const stored = await db.sessionNotes.findSheetByAppointment(APPT);
+    expect(stored).not.toBeNull();
+    expect((stored!.content_json as { concerns: string[] }).concerns).toEqual(['fatigue']);
+    // The undefined key is dropped, not stored as null — same as JSON.stringify.
+    const extraction = stored!.content_json.extraction as Record<string, unknown>;
+    expect('partial' in extraction).toBe(false);
+    expect(extraction.conflicts).toBe(0);
+  });
 });

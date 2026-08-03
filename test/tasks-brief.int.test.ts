@@ -1,14 +1,22 @@
-import { describe, it, expect, afterEach, afterAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedAppointment, seedClient, seedSessionDocs, seedSupplement } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { createTasksFromNote, listOpenTasks, setTaskStatus } from '../src/tasks/service';
 import { buildBrief, renderBriefText } from '../src/brief/service';
 import type { SessionNote } from '../src/session/extract';
 
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-const suite = dbUp ? describe : describe.skip;
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[tasks-brief.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
 const NOTE: SessionNote = {
   concerns: ['Fatigue', 'Bloating'],
@@ -39,59 +47,47 @@ const NOTE: SessionNote = {
 };
 
 suite('tasks + prep brief (integration)', () => {
-  const clientIds: string[] = [];
+  let db: IDatabase;
 
-  afterEach(async () => {
-    for (const id of clientIds.splice(0)) {
-      // appointments.client_id is ON DELETE SET NULL — drop appointments first or
-      // they survive as orphans the cockpit shows as "(unknown)". tasks cascade
-      // off the client.
-      await pool.query(`DELETE FROM appointments WHERE client_id = $1`, [id]);
-      await pool.query(`DELETE FROM clients WHERE id = $1`, [id]);
-    }
+  beforeAll(() => {
+    db = installFirestore('tasks-brief-int');
   });
-  afterAll(async () => {
-    await pool.end();
+  afterAll(() => uninstallFirestore());
+  beforeEach(async () => {
+    await clearFirestore(db);
   });
 
   /** A client with a past (approved) session and a future appointment to brief for. */
   async function fixture() {
-    const client = (
-      await pool.query<{ id: string }>(`INSERT INTO clients (name) VALUES ('Brief Test') RETURNING id`)
-    ).rows[0].id;
-    clientIds.push(client);
+    const client = await seedClient(db, { name: 'Brief Test' });
 
-    const past = (
-      await pool.query<{ id: string }>(
-        `INSERT INTO appointments (client_id, starts_at, ends_at, status)
-              VALUES ($1, now() - interval '28 days', now() - interval '28 days' + interval '1 hour', 'completed')
-         RETURNING id`,
-        [client],
-      )
-    ).rows[0].id;
-    await pool.query(
-      `INSERT INTO appointment_sheets (appointment_id, client_id, content_json, status)
-            VALUES ($1, $2, $3::jsonb, 'approved')`,
-      [past, client, JSON.stringify(NOTE)],
-    );
+    const past = await seedAppointment(db, {
+      client_id: client.id,
+      client_name: client.name,
+      starts_at: new Date(Date.now() - 28 * 86_400_000).toISOString(),
+      status: 'completed',
+    });
+    await seedSessionDocs(db, {
+      client,
+      appointment: past,
+      sheet: { content_json: NOTE as unknown as Record<string, unknown>, status: 'approved' },
+    });
 
-    const next = (
-      await pool.query<{ id: string }>(
-        `INSERT INTO appointments (client_id, starts_at, ends_at, status)
-              VALUES ($1, now() + interval '1 day', now() + interval '1 day' + interval '1 hour', 'confirmed')
-         RETURNING id`,
-        [client],
-      )
-    ).rows[0].id;
+    const next = await seedAppointment(db, {
+      client_id: client.id,
+      client_name: client.name,
+      starts_at: new Date(Date.now() + 86_400_000).toISOString(),
+      status: 'confirmed',
+    });
 
-    return { client, past, next };
+    return { client: client.id, past: past.id, next: next.id };
   }
 
   it('promotes follow-ups to tasks, dating only the one that was given a timeframe', async () => {
     const { client, past } = await fixture();
     const sessionDate = new Date('2026-06-01T10:00:00Z');
 
-    const r = await createTasksFromNote(pool, {
+    const r = await createTasksFromNote({
       clientId: client,
       appointmentId: past,
       sessionDate,
@@ -111,16 +107,16 @@ suite('tasks + prep brief (integration)', () => {
     const { client, past } = await fixture();
     const args = { clientId: client, appointmentId: past, sessionDate: new Date(), note: NOTE };
 
-    expect((await createTasksFromNote(pool, args)).created).toBe(2);
-    expect((await createTasksFromNote(pool, args)).created).toBe(0); // protocol approval
-    expect((await createTasksFromNote(pool, args)).created).toBe(0); // re-approval
+    expect((await createTasksFromNote(args)).created).toBe(2);
+    expect((await createTasksFromNote(args)).created).toBe(0); // protocol approval
+    expect((await createTasksFromNote(args)).created).toBe(0); // re-approval
 
     expect((await listOpenTasks(client)).length).toBe(2);
   });
 
   it('completing a task drops it out of the open list', async () => {
     const { client, past } = await fixture();
-    await createTasksFromNote(pool, { clientId: client, appointmentId: past, sessionDate: new Date(), note: NOTE });
+    await createTasksFromNote({ clientId: client, appointmentId: past, sessionDate: new Date(), note: NOTE });
 
     const [first] = await listOpenTasks(client);
     const done = await setTaskStatus(first.id, 'done');
@@ -134,8 +130,8 @@ suite('tasks + prep brief (integration)', () => {
 
   it('builds a brief carrying the last session, open tasks and the plan', async () => {
     const { client, past, next } = await fixture();
-    await createTasksFromNote(pool, { clientId: client, appointmentId: past, sessionDate: new Date(), note: NOTE });
-    await pool.query(`INSERT INTO supplements (client_id, name, dose, qty) VALUES ($1,'Magnesium','2 caps',60)`, [client]);
+    await createTasksFromNote({ clientId: client, appointmentId: past, sessionDate: new Date(), note: NOTE });
+    await seedSupplement(db, { client_id: client, name: 'Magnesium', dose: '2 caps', qty: 60 });
 
     const brief = await buildBrief(next);
     expect(brief).not.toBeNull();
@@ -161,19 +157,26 @@ suite('tasks + prep brief (integration)', () => {
   });
 
   it('returns null for an appointment with no client', async () => {
-    const orphan = (
-      await pool.query<{ id: string }>(
-        `INSERT INTO appointments (starts_at, ends_at, status)
-              VALUES (now(), now() + interval '1 hour', 'confirmed') RETURNING id`,
-      )
-    ).rows[0].id;
+    // client_id is genuinely nullable - a walk-in recording can precede its
+    // client - so the brief has to answer null rather than throw.
+    const now = new Date().toISOString();
+    const orphan = randomUUID();
+    await db.appointments.save({
+      id: orphan,
+      client_id: null,
+      client_name: null,
+      starts_at: now,
+      ends_at: new Date(Date.now() + 3_600_000).toISOString(),
+      status: 'confirmed',
+      created_at: now,
+      updated_at: now,
+    });
     expect(await buildBrief(orphan)).toBeNull();
-    await pool.query(`DELETE FROM appointments WHERE id = $1`, [orphan]);
   });
 
   it('renders a readable text brief for the morning digest', async () => {
     const { client, past, next } = await fixture();
-    await createTasksFromNote(pool, { clientId: client, appointmentId: past, sessionDate: new Date(), note: NOTE });
+    await createTasksFromNote({ clientId: client, appointmentId: past, sessionDate: new Date(), note: NOTE });
 
     const text = renderBriefText((await buildBrief(next))!);
     expect(text).toContain('Brief Test');

@@ -1,57 +1,72 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { pool } from './pool';
+import { getDatabase } from './index.js';
 
-// Plain .sql files, applied in filename order, each in its own transaction.
-// Applied filenames are recorded so re-running is a no-op.
-const MIGRATIONS_DIR = path.join(__dirname, '..', '..', 'migrations');
+/**
+ * Data-migration runner.
+ *
+ * Firestore needs no DDL, so the `migrations/*.sql` files no longer run against
+ * anything — they stay in the repo as the schema's historical record, and as the
+ * specification the document model was reconciled against (Phase 2). What still
+ * needs ordering is DATA work: backfilling a newly denormalized field, reshaping
+ * a document, repairing a bad write. Those must be ordered, recorded, and safe to
+ * replay, which is exactly what `schema_migrations` gave us before.
+ *
+ * The ledger moves to integration_state under `datamigration:<id>`, so a
+ * completed migration is a document that exists. Each step is idempotent on its
+ * own terms; the ledger is what stops a long backfill re-running for nothing.
+ *
+ *   npm run migrate
+ */
 
-async function migrate(): Promise<void> {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        filename   text PRIMARY KEY,
-        applied_at timestamptz NOT NULL DEFAULT now()
-      );
-    `);
-
-    const { rows } = await client.query<{ filename: string }>(
-      'SELECT filename FROM schema_migrations',
-    );
-    const applied = new Set(rows.map((r) => r.filename));
-
-    const files = fs
-      .readdirSync(MIGRATIONS_DIR)
-      .filter((f) => f.endsWith('.sql'))
-      .sort();
-
-    let count = 0;
-    for (const file of files) {
-      if (applied.has(file)) continue;
-      const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
-      process.stdout.write(`Applying ${file} ... `);
-      await client.query('BEGIN');
-      try {
-        await client.query(sql);
-        await client.query('INSERT INTO schema_migrations (filename) VALUES ($1)', [file]);
-        await client.query('COMMIT');
-        console.log('ok');
-        count++;
-      } catch (err) {
-        await client.query('ROLLBACK');
-        console.log('FAILED');
-        throw err;
-      }
-    }
-    console.log(count === 0 ? 'Already up to date.' : `Applied ${count} migration(s).`);
-  } finally {
-    client.release();
-    await pool.end();
-  }
+export interface DataMigration {
+  /** Stable, ordered id — `0001_backfill_client_name`. Never renamed once run. */
+  id: string;
+  /** What it does, printed as it runs. */
+  description: string;
+  run(): Promise<void>;
 }
 
-migrate().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/**
+ * Ordered list of data migrations. Append only; never renumber, because the
+ * ledger keys on the id.
+ *
+ * Empty today: the port wrote every document in its final shape, so there is
+ * nothing to backfill yet. The runner exists so the first one that IS needed has
+ * somewhere to go that is ordered and replay-safe, rather than becoming a
+ * one-off script someone runs twice.
+ */
+export const MIGRATIONS: DataMigration[] = [];
+
+const ledgerKey = (id: string) => `datamigration:${id}`;
+
+export async function runDataMigrations(migrations = MIGRATIONS): Promise<number> {
+  const state = getDatabase().state;
+  let applied = 0;
+
+  for (const migration of migrations) {
+    const key = ledgerKey(migration.id);
+    if (await state.get(key)) continue;
+
+    process.stdout.write(`Applying ${migration.id} — ${migration.description} ... `);
+    // No transaction spans the step and the ledger write: a Firestore
+    // transaction cannot hold a whole backfill (500 documents, and no external
+    // calls inside), so the ledger is written only AFTER the step returns. A
+    // crash mid-step therefore re-runs it, which is why every step must be
+    // idempotent in its own right.
+    await migration.run();
+    await state.set(key, new Date().toISOString());
+    console.log('ok');
+    applied++;
+  }
+
+  console.log(applied === 0 ? 'Already up to date.' : `Applied ${applied} migration(s).`);
+  return applied;
+}
+
+// Run only when invoked directly, so importing the list for a test doesn't
+// execute it.
+if (require.main === module) {
+  runDataMigrations().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

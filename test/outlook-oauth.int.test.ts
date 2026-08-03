@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import {
   buildAuthorizeUrl,
   exchangeCodeForTokens,
@@ -16,18 +22,18 @@ import { getState } from '../src/db/state';
 // Outlook delegated-OAuth manager (MULTI-mailbox): connect handshake (authorize
 // URL + PKCE, code exchange with /me confirmation), silent refresh-grant minting
 // with rotation persistence, and the account list (connect/disconnect/primary).
-// DB-gated (persists to integration_state).
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-const suite = dbUp ? describe : describe.skip;
-
-const KEYS = ['outlook.accounts', 'outlook.refresh_token', 'outlook.sender', 'outlook.connected_at'];
-async function clearState() {
-  await pool.query(`DELETE FROM integration_state WHERE key = ANY($1::text[])`, [KEYS]);
-  await pool.query(`DELETE FROM integration_state WHERE key LIKE 'outlook.oauth.pending:%'`);
+// Emulator-gated (persists to integration_state).
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[outlook-oauth.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
 }
+
+// `DELETE ... WHERE key LIKE 'outlook.oauth.pending:%'` has no Firestore
+// equivalent (§3.5), and this suite owns its emulator dataset outright, so
+// clearing the whole state collection is both simpler and stricter.
+let db: IDatabase;
+const clearState = () => db.state.clearAll();
 
 interface StoredAccount {
   sender: string;
@@ -50,7 +56,10 @@ async function connect(sender: string, refresh = `r-${sender}`, access = `acc-${
 suite('outlook OAuth manager (integration)', () => {
   const saved = { ...process.env };
 
-  beforeAll(() => clearState());
+  beforeAll(async () => {
+    db = installFirestore('outlook-oauth-int');
+    await clearFirestore(db);
+  });
   beforeEach(async () => {
     _resetOutlookTokenCache();
     // Ensure the static shortcut is OFF so the OAuth path is exercised.
@@ -66,9 +75,7 @@ suite('outlook OAuth manager (integration)', () => {
     process.env = { ...saved };
     await clearState();
   });
-  afterAll(async () => {
-    await pool.end();
-  });
+  afterAll(() => uninstallFirestore());
 
   it('builds an authorize URL with PKCE + state and stashes the verifier', async () => {
     const url = await buildAuthorizeUrl();

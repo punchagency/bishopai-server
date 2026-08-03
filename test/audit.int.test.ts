@@ -1,12 +1,22 @@
-import { describe, it, expect, afterAll, beforeEach, afterEach } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedCheckout } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { approveAndCharge } from '../src/checkout/machine';
 import { auditForEntity, recentActivity, recordAudit } from '../src/audit/log';
 
 // The unified audit trail: mutations record here, and the two reads (per-entity
-// history + global feed) return them newest-first. DB-gated.
-const dbUp = await pool.query('SELECT 1').then(() => true).catch(() => false);
-const suite = dbUp ? describe : describe.skip;
+// history + global feed) return them newest-first. Emulator-gated.
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[audit.int] Firestore emulator not running — skipping. Start: npm run firestore:emulator');
+}
 
 const summary = {
   currency: 'USD',
@@ -18,37 +28,34 @@ const summary = {
 
 suite('audit trail (integration)', () => {
   const saved = { ...process.env };
-  const created: string[] = [];
+  let db: IDatabase;
 
-  beforeEach(() => {
+  beforeAll(() => {
+    db = installFirestore('audit-int');
+  });
+  afterAll(() => uninstallFirestore());
+
+  beforeEach(async () => {
+    await clearFirestore(db);
     delete process.env.QB_CLIENT_ID;
     delete process.env.QB_CLIENT_SECRET;
     delete process.env.QB_REFRESH_TOKEN;
     delete process.env.QB_REALM_ID;
   });
-  afterEach(async () => {
+  afterEach(() => {
     process.env = { ...saved };
-    for (const id of created.splice(0)) {
-      await pool.query(`DELETE FROM audit_log WHERE entity_id = $1`, [id]);
-      await pool.query(`DELETE FROM checkout WHERE id = $1`, [id]);
-    }
-  });
-  afterAll(async () => {
-    await pool.end();
   });
 
   it('records the checkout money lifecycle as an entity history, newest first', async () => {
-    const ch = await pool.query<{ id: string }>(
-      `INSERT INTO checkout (status, summary_snapshot, qb_invoice_id)
-            VALUES ('AWAITING_APPROVAL', $1, 'mock-inv-audit') RETURNING id`,
-      [JSON.stringify(summary)],
-    );
-    const checkoutId = ch.rows[0].id;
-    created.push(checkoutId);
+    const checkout = await seedCheckout(db, {
+      status: 'AWAITING_APPROVAL',
+      summary_snapshot: summary,
+      qb_invoice_id: 'mock-inv-audit',
+    });
 
-    await approveAndCharge(checkoutId);
+    await approveAndCharge(checkout.id);
 
-    const history = await auditForEntity('checkout', checkoutId);
+    const history = await auditForEntity('checkout', checkout.id);
     const actions = history.map((h) => h.action);
     // Approval and capture both recorded (detect wasn't used here).
     expect(actions).toContain('checkout.approved');
@@ -63,8 +70,8 @@ suite('audit trail (integration)', () => {
   });
 
   it('never throws on a write failure (best-effort)', async () => {
-    // A too-long entity_type would violate nothing here, but a bad write must be
-    // swallowed rather than surfaced — the action it describes already happened.
+    // The action an audit entry describes has already happened, so a failed
+    // write must be swallowed rather than surfaced to the caller.
     await expect(
       recordAudit({ entityType: 'checkout', entityId: 'x'.repeat(10), action: 'test.noop', summary: 'noop' }),
     ).resolves.toBeUndefined();
@@ -73,14 +80,11 @@ suite('audit trail (integration)', () => {
   it('the global feed returns recent activity across entity types', async () => {
     const id = `audit-feed-${Math.random().toString(36).slice(2)}`;
     await recordAudit({ entityType: 'task', entityId: id, action: 'task.done', actor: 'nicole', summary: 'Task completed: test' });
-    try {
-      const feed = await recentActivity(50);
-      expect(feed.some((e) => e.entity_id === id && e.action === 'task.done')).toBe(true);
 
-      const filtered = await recentActivity(50, 'task');
-      expect(filtered.every((e) => e.entity_type === 'task')).toBe(true);
-    } finally {
-      await pool.query(`DELETE FROM audit_log WHERE entity_id = $1`, [id]);
-    }
+    const feed = await recentActivity(50);
+    expect(feed.some((e) => e.entity_id === id && e.action === 'task.done')).toBe(true);
+
+    const filtered = await recentActivity(50, 'task');
+    expect(filtered.every((e) => e.entity_type === 'task')).toBe(true);
   });
 });

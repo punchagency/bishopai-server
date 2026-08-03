@@ -1,5 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { matchCustomer, normalizeName, syncCustomerMappings } from '../src/checkout/customerSync';
 import { normalizeCustomer, type Customer } from '../src/integrations/quickbooks/customer';
 import { resolveQboCustomerId, setQboCustomerId } from '../src/checkout/customerMap';
@@ -65,34 +72,33 @@ describe('normalizeCustomer', () => {
 });
 
 // --- Integration: the apply logic against real tables (injected customers) ---
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-const suite = dbUp ? describe : describe.skip;
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[customer-sync.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
 suite('syncCustomerMappings (integration)', () => {
   const saved = { ...process.env };
-  const clientIds: string[] = [];
+  let db: IDatabase;
 
-  const addClient = async (name: string, email: string | null) => {
-    const r = await pool.query<{ id: string }>(`INSERT INTO clients (name, email) VALUES ($1, $2) RETURNING id`, [name, email]);
-    clientIds.push(r.rows[0].id);
-    return r.rows[0].id;
-  };
+  const addClient = async (name: string, email: string | null) =>
+    (await seedClient(db, { name, email: email ?? '' })).id;
 
-  beforeEach(() => {
+  beforeAll(() => {
+    db = installFirestore('customer-sync-int');
+  });
+  afterAll(() => uninstallFirestore());
+
+  beforeEach(async () => {
+    await clearFirestore(db);
     process.env.QB_CLIENT_ID = 'cid';
     process.env.QB_CLIENT_SECRET = 'sec';
     process.env.QB_REFRESH_TOKEN = 'rt';
     process.env.QB_REALM_ID = 'realm';
   });
-  afterEach(async () => {
+  afterEach(() => {
     process.env = { ...saved };
-    for (const id of clientIds.splice(0)) await pool.query(`DELETE FROM clients WHERE id = $1`, [id]); // cascades to map
-  });
-  afterAll(async () => {
-    await pool.end();
   });
 
   it('auto-maps unambiguous matches, skips already-mapped, and reports ambiguous/unmatched', async () => {
@@ -113,8 +119,8 @@ suite('syncCustomerMappings (integration)', () => {
 
     const report = await syncCustomerMappings({ fetchCustomers: async () => customers });
 
-    // The sync scans ALL unmapped clients (correct for prod); a shared test DB
-    // may hold other clients, so assert on OUR clients by membership.
+    // Each suite gets its own emulator dataset, wiped per test, so the sync sees
+    // exactly the clients this test created.
     expect(report.ok).toBe(true);
     expect(report.alreadyMapped).toBeGreaterThanOrEqual(1);
     expect(report.mapped.find((m) => m.clientId === maya)).toMatchObject({ qboCustomerId: 'C-MAYA', via: 'email' });

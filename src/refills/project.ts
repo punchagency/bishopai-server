@@ -179,6 +179,12 @@ export async function projectRefills(): Promise<ProjectionResult> {
         dose: winner.dose,
         due_date: dueDate,
         status: existing?.status || 'pending',
+        // `reminder_stage integer NOT NULL DEFAULT 0` (0011). Firestore has no
+        // column defaults, so a field the app treats as always-present has to be
+        // written explicitly — otherwise it exists only where the reminder
+        // runner has already touched the refill, and every reader has to
+        // remember to coalesce it.
+        reminder_stage: existing?.reminder_stage ?? 0,
         updated_at: new Date().toISOString(),
       });
       projected++;

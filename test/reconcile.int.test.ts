@@ -1,7 +1,14 @@
-import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import {
-  enqueueReconciliation,
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient, seedCheckout } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
+import {
+  buildReconciliation,
   reconcileCheckout,
   processDueReconciliations,
   backoffMs,
@@ -10,91 +17,81 @@ import { setQboCustomerId } from '../src/checkout/customerMap';
 import { buildPaymentBody } from '../src/integrations/quickbooks/payment';
 
 // Reconciliation engine: durable outbox, idempotent enqueue, dry-run recording,
-// dead-letter on missing mapping (live), transient backoff, and cap→dead-letter.
-// DB-gated (uses real tables + guarded transitions).
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-
-const suite = dbUp ? describe : describe.skip;
-
-async function makeCheckout(opts: { invoiceId?: string | null; withClient?: boolean } = {}) {
-  const clientId = opts.withClient
-    ? (await pool.query<{ id: string }>(`INSERT INTO clients (name) VALUES ('Recon Test') RETURNING id`)).rows[0].id
-    : null;
-  const ch = await pool.query<{ id: string }>(
-    `INSERT INTO checkout (client_id, status, qb_invoice_id) VALUES ($1, 'CHARGED', $2) RETURNING id`,
-    [clientId, opts.invoiceId ?? 'mock-inv-abc'],
-  );
-  return { checkoutId: ch.rows[0].id, clientId };
+// dead-letter on missing mapping (live), transient backoff, and cap -> dead-letter.
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[reconcile.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
 }
-
-async function enqueue(checkoutId: string, invoiceId: string | null, customerId: string | null) {
-  const db = await pool.connect();
-  try {
-    await enqueueReconciliation(db, {
-      checkoutId,
-      invoiceId,
-      customerId,
-      amountCents: 17500,
-      currency: 'USD',
-      providerTxnId: 'txn-1',
-    });
-  } finally {
-    db.release();
-  }
-}
-
-const rowFor = (checkoutId: string) =>
-  pool
-    .query(`SELECT * FROM payment_reconciliation WHERE checkout_id = $1`, [checkoutId])
-    .then((r) => r.rows[0]);
 
 suite('payment reconciliation engine (integration)', () => {
   const saved = { ...process.env };
-  const created: string[] = [];
+  let db: IDatabase;
 
-  beforeEach(() => {
-    // Default: QuickBooks not configured → dry-run everything.
+  beforeAll(() => {
+    db = installFirestore('reconcile-int');
+  });
+  afterAll(() => uninstallFirestore());
+
+  beforeEach(async () => {
+    await clearFirestore(db);
+    // Default: QuickBooks not configured -> dry-run everything.
     delete process.env.QB_CLIENT_ID;
     delete process.env.QB_CLIENT_SECRET;
     delete process.env.QB_REFRESH_TOKEN;
     delete process.env.QB_REALM_ID;
   });
-  afterEach(async () => {
+  afterEach(() => {
     process.env = { ...saved };
-    for (const id of created.splice(0)) {
-      await pool.query(`DELETE FROM checkout WHERE id = $1`, [id]); // cascades to reconciliation
-    }
-    await pool.query(`DELETE FROM clients WHERE name = 'Recon Test'`);
   });
-  afterAll(async () => {
-    await pool.end();
-  });
+
+  async function makeCheckout(opts: { invoiceId?: string | null; withClient?: boolean } = {}) {
+    const clientId = opts.withClient ? (await seedClient(db, { name: 'Recon Test' })).id : null;
+    const checkout = await seedCheckout(db, {
+      client_id: clientId,
+      status: 'CHARGED',
+      qb_invoice_id: opts.invoiceId ?? 'mock-inv-abc',
+    });
+    return { checkoutId: checkout.id, clientId };
+  }
+
+  // The intent is built by the money path and committed with the CHARGED
+  // transition; here it is written directly, since these tests are about what
+  // happens to the row afterwards. saveReconciliation keys on the checkout id,
+  // which is what makes the enqueue idempotent.
+  const enqueue = (checkoutId: string, invoiceId: string | null, customerId: string | null) =>
+    db.checkouts.saveReconciliation(
+      buildReconciliation({
+        checkoutId,
+        invoiceId,
+        customerId,
+        amountCents: 17500,
+        currency: 'USD',
+        providerTxnId: 'txn-1',
+      }),
+    );
+
+  const rowFor = (checkoutId: string) => db.checkouts.findReconciliationByCheckout(checkoutId);
 
   it('enqueue is idempotent (one row per checkout)', async () => {
     const { checkoutId } = await makeCheckout();
-    created.push(checkoutId);
     await enqueue(checkoutId, 'mock-inv-abc', null);
     await enqueue(checkoutId, 'mock-inv-abc', null); // replay
-    const r = await pool.query(`SELECT count(*)::int AS n FROM payment_reconciliation WHERE checkout_id = $1`, [checkoutId]);
-    expect(r.rows[0].n).toBe(1);
+    const all = await db.checkouts.listReconciliations();
+    expect(all.filter((r) => r.checkout_id === checkoutId)).toHaveLength(1);
   });
 
-  it('records a dry-run payment (unconfigured) → RECORDED with a synthetic id', async () => {
+  it('records a dry-run payment (unconfigured) -> RECORDED with a synthetic id', async () => {
     const { checkoutId } = await makeCheckout();
-    created.push(checkoutId);
     await enqueue(checkoutId, 'mock-inv-abc', null);
     await reconcileCheckout(checkoutId);
     const row = await rowFor(checkoutId);
-    expect(row.status).toBe('RECORDED');
-    expect(row.accounting_payment_id).toBe(`dry-run-pmt-checkout:${checkoutId}:payment`);
+    expect(row!.status).toBe('RECORDED');
+    expect(row!.accounting_payment_id).toBe(`dry-run-pmt-checkout:${checkoutId}:payment`);
   });
 
   it('dead-letters in live mode when the customer mapping is missing', async () => {
     const { checkoutId } = await makeCheckout({ invoiceId: 'inv-real-1', withClient: true });
-    created.push(checkoutId);
     await enqueue(checkoutId, 'inv-real-1', null);
     process.env.QB_CLIENT_ID = 'cid';
     process.env.QB_CLIENT_SECRET = 'sec';
@@ -102,13 +99,12 @@ suite('payment reconciliation engine (integration)', () => {
     process.env.QB_REALM_ID = 'realm';
     await reconcileCheckout(checkoutId);
     const row = await rowFor(checkoutId);
-    expect(row.status).toBe('NEEDS_REVIEW');
-    expect(row.last_error).toMatch(/customer mapping/);
+    expect(row!.status).toBe('NEEDS_REVIEW');
+    expect(row!.last_error).toMatch(/customer mapping/);
   });
 
-  it('resolves the customer from the mapping table and records (injected accounting write)', async () => {
+  it('resolves the customer from the mapping and records (injected accounting write)', async () => {
     const { checkoutId, clientId } = await makeCheckout({ invoiceId: 'inv-real-2', withClient: true });
-    created.push(checkoutId);
     await setQboCustomerId(clientId!, 'QBO-42');
     await enqueue(checkoutId, 'inv-real-2', null); // customer id unknown at enqueue
     process.env.QB_CLIENT_ID = 'cid';
@@ -125,45 +121,52 @@ suite('payment reconciliation engine (integration)', () => {
     });
     expect(seenCustomer).toBe('QBO-42');
     const row = await rowFor(checkoutId);
-    expect(row.status).toBe('RECORDED');
-    expect(row.accounting_payment_id).toBe('PMT-1');
-    expect(row.customer_id).toBe('QBO-42'); // persisted back
+    expect(row!.status).toBe('RECORDED');
+    expect(row!.accounting_payment_id).toBe('PMT-1');
+    expect(row!.customer_id).toBe('QBO-42'); // persisted back
   });
 
   it('backs off and retries on transient failure, then dead-letters after the cap', async () => {
     const { checkoutId } = await makeCheckout();
-    created.push(checkoutId);
     await enqueue(checkoutId, 'mock-inv-abc', 'QBO-1');
     const transient = { record: async () => ({ ok: false as const, error: 'HTTP 503' }) };
 
-    // First failure → FAILED, attempts=1, next_attempt_at in the future.
+    // First failure -> FAILED, attempts=1, next_attempt_at in the future.
     await reconcileCheckout(checkoutId, transient);
     let row = await rowFor(checkoutId);
-    expect(row.status).toBe('FAILED');
-    expect(row.attempts).toBe(1);
-    expect(new Date(row.next_attempt_at).getTime()).toBeGreaterThan(Date.now());
+    expect(row!.status).toBe('FAILED');
+    expect(row!.attempts).toBe(1);
+    expect(new Date(row!.next_attempt_at).getTime()).toBeGreaterThan(Date.now());
 
-    // Not due yet → the worker leaves it alone.
+    // Not due yet -> the worker leaves it alone.
     expect((await processDueReconciliations(10, transient)).processed).toBe(0);
 
-    // Force it due and exhaust attempts → NEEDS_REVIEW.
-    await pool.query(`UPDATE payment_reconciliation SET attempts = 7, next_attempt_at = now() WHERE checkout_id = $1`, [checkoutId]);
+    // Force it due and exhaust attempts -> NEEDS_REVIEW.
+    await db.checkouts.saveReconciliation({
+      ...row!,
+      attempts: 7,
+      next_attempt_at: new Date().toISOString(),
+    });
     await reconcileCheckout(checkoutId, transient);
     row = await rowFor(checkoutId);
-    expect(row.status).toBe('NEEDS_REVIEW');
-    expect(row.last_error).toMatch(/gave up after 8/);
+    expect(row!.status).toBe('NEEDS_REVIEW');
+    expect(row!.last_error).toMatch(/gave up after 8/);
   });
 
   it('dead-letters immediately on a permanent (4xx) failure without retrying', async () => {
     const { checkoutId } = await makeCheckout();
-    created.push(checkoutId);
     await enqueue(checkoutId, 'mock-inv-abc', 'QBO-1');
     await reconcileCheckout(checkoutId, {
       record: async () => ({ ok: false, error: 'HTTP 400 invalid', permanent: true }),
     });
     const row = await rowFor(checkoutId);
-    expect(row.status).toBe('NEEDS_REVIEW');
-    expect(row.attempts).toBe(0); // never entered the backoff loop
+    expect(row!.status).toBe('NEEDS_REVIEW');
+    // The claim is now the single place that counts a try, so one attempt is
+    // recorded — the pg version counted only retryable failures and left this at
+    // 0. What "without retrying" means either way is that the backoff loop was
+    // never entered: exactly one try, and no future retry scheduled.
+    expect(row!.attempts).toBe(1);
+    expect(new Date(row!.next_attempt_at).getTime()).toBeLessThanOrEqual(Date.now());
   });
 
   it('backoffMs grows and is capped', () => {

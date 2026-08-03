@@ -2,15 +2,25 @@ import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient, seedAppointment, seedSessionDocs } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { combineStatus } from '../src/session/sessionService';
 
 // A session is ONE note. The sheet and the protocol hold identical content and
 // differ only in how they render, so every write has to move both — otherwise a
 // correction reaches the prep brief (which reads the sheet) but never the
 // client's documents (which build from the protocol).
-const dbUp = await pool.query('SELECT 1').then(() => true).catch(() => false);
-const suite = dbUp ? describe : describe.skip;
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[sessionUnit.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
 describe('combineStatus', () => {
   it('is approved only when every document present is approved', () => {
@@ -31,9 +41,12 @@ describe('combineStatus', () => {
   });
 });
 
-suite('session as one unit (integration, real Postgres)', () => {
+// These cases run in order against ONE session (edit -> approve -> amend), so
+// the fixture is built once in beforeAll rather than wiped between tests.
+suite('session as one unit (integration)', () => {
   let server: http.Server;
   let base = '';
+  let db: IDatabase;
   let clientId = '';
   let apptId = '';
   let sheetId = '';
@@ -52,46 +65,48 @@ suite('session as one unit (integration, real Postgres)', () => {
   });
 
   const contents = async () => {
-    const s = await pool.query<{ content_json: { concerns: string[] }; status: string }>(
-      `SELECT content_json, status FROM appointment_sheets WHERE id = $1`, [sheetId]);
-    const p = await pool.query<{ content_json: { concerns: string[] }; status: string }>(
-      `SELECT content_json, status FROM protocols WHERE id = $1`, [protocolId]);
-    return { sheet: s.rows[0], protocol: p.rows[0] };
+    const docs = await db.sessionNotes.findSessionDocs(apptId);
+    return {
+      sheet: docs.sheet as { content_json: { concerns: string[] }; status: string },
+      protocol: docs.protocol as { content_json: { concerns: string[] }; status: string },
+    };
   };
 
+  const sessionApprovals = async () =>
+    (await db.sessionNotes.listApprovals(apptId)).filter((a) => a.status === 'approved');
+
   beforeAll(async () => {
+    db = installFirestore('session-unit-int');
+    await clearFirestore(db);
+
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-    const c = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id) VALUES ('SU Session', 'sutest-session') RETURNING id`);
-    clientId = c.rows[0].id;
-    const a = await pool.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'sutest-appt', now() - interval '2 days', now() - interval '2 days', 'completed')
-       RETURNING id`, [clientId]);
-    apptId = a.rows[0].id;
-    const s = await pool.query<{ id: string }>(
-      `INSERT INTO appointment_sheets (appointment_id, client_id, content_json, status)
-       VALUES ($1, $2, $3, 'draft') RETURNING id`,
-      [apptId, clientId, JSON.stringify(note('original'))]);
-    sheetId = s.rows[0].id;
-    const p = await pool.query<{ id: string }>(
-      `INSERT INTO protocols (appointment_id, client_id, content_json, status)
-       VALUES ($1, $2, $3, 'draft') RETURNING id`,
-      [apptId, clientId, JSON.stringify(note('original'))]);
-    protocolId = p.rows[0].id;
+
+    const client = await seedClient(db, { name: 'SU Session', pb_id: 'sutest-session' });
+    clientId = client.id;
+    const appointment = await seedAppointment(db, {
+      client_id: client.id,
+      client_name: client.name,
+      pb_id: 'sutest-appt',
+      starts_at: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+      status: 'completed',
+    });
+    apptId = appointment.id;
+
+    const docs = await seedSessionDocs(db, {
+      client,
+      appointment,
+      sheet: { content_json: note('original') },
+      protocol: { content_json: note('original') },
+    });
+    sheetId = docs.sheet.id;
+    protocolId = docs.protocol.id;
   });
 
   afterAll(async () => {
-    for (const t of ['note_revisions']) {
-      await pool.query(`DELETE FROM ${t} WHERE source_id IN ($1, $2)`, [sheetId, protocolId]).catch(() => {});
-    }
-    for (const t of ['appointment_sheets', 'protocols', 'supplements', 'tasks', 'appointments']) {
-      await pool.query(`DELETE FROM ${t} WHERE client_id = $1`, [clientId]).catch(() => {});
-    }
-    await pool.query(`DELETE FROM clients WHERE pb_id = 'sutest-session'`).catch(() => {});
-    await pool.end();
+    await new Promise<void>((r) => server.close(() => r()));
+    uninstallFirestore();
   });
 
   it('editing either document writes both, so they cannot drift apart', async () => {
@@ -119,18 +134,13 @@ suite('session as one unit (integration, real Postgres)', () => {
     expect(r.status).toBe(409);
     expect((await r.json()).error).toMatch(/approved/i);
 
-    const approvals = await pool.query(
-      `SELECT count(*)::int n FROM approvals
-        WHERE payload_json->>'appointment_id' = $1 AND status = 'approved'`, [apptId]);
-    expect(approvals.rows[0].n).toBe(1);
+    expect(await sessionApprovals()).toHaveLength(1);
   });
 
   it('records one approval for the session, not one per document', async () => {
-    const r = await pool.query(
-      `SELECT type FROM approvals
-        WHERE payload_json->>'appointment_id' = $1 AND status = 'approved'`, [apptId]);
-    expect(r.rowCount).toBe(1);
-    expect(r.rows[0].type).toBe('session');
+    const approvals = await sessionApprovals();
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0].type).toBe('session');
   });
 
   it('the queue lists the session once, not once per document', async () => {

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logEvent, logError } from '../observability/logger';
 import { isPbConfigured } from '../integrations/pb/config';
 import { listSessions } from '../integrations/pb/reads';
@@ -96,10 +96,8 @@ export interface BookingSlot {
 
 export async function loadOfficeHours(): Promise<OfficeHours> {
   try {
-    const { rows } = await pool.query<{ value: string }>(
-      `SELECT value FROM integration_state WHERE key = 'office_hours'`,
-    );
-    if (rows[0]?.value) return { ...DEFAULT_OFFICE_HOURS, ...JSON.parse(rows[0].value) };
+    const value = await getDatabase().state.get('office_hours');
+    if (value) return { ...DEFAULT_OFFICE_HOURS, ...JSON.parse(value) };
   } catch {
     // fall through to default
   }
@@ -107,12 +105,8 @@ export async function loadOfficeHours(): Promise<OfficeHours> {
 }
 
 async function saveOfficeHours(oh: OfficeHours): Promise<void> {
-  await pool.query(
-    `INSERT INTO integration_state (key, value)
-     VALUES ('office_hours', $1)
-     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-    [JSON.stringify(oh)],
-  );
+  // `ON CONFLICT (key) DO UPDATE` — set() on the key's own document (§3.2).
+  await getDatabase().state.set('office_hours', JSON.stringify(oh));
 }
 
 // --- Fetch upcoming sessions (PB → local DB fallback) ----------------------
@@ -183,30 +177,30 @@ export async function fetchUpcoming(oh: OfficeHours): Promise<UpcomingSession[]>
     }
   }
 
-  // Local DB fallback — webhook-synced appointments
-  const { rows } = await pool.query<{
-    id: string; pb_id: string; client_name: string | null;
-    starts_at: string; ends_at: string; status: string;
-  }>(
-    `SELECT a.id, a.pb_id, c.name AS client_name, a.starts_at, a.ends_at, a.status
-       FROM appointments a
-       LEFT JOIN clients c ON c.id = a.client_id
-      WHERE a.starts_at BETWEEN $1 AND $2
-        AND a.status NOT IN ('cancelled', 'completed')
-      ORDER BY a.starts_at ASC
-      LIMIT 100`,
-    [now.toISOString(), horizon.toISOString()],
+  // Local DB fallback — webhook-synced appointments.
+  //
+  // `starts_at BETWEEN … AND …` is the indexed range; the status exclusion
+  // filters in memory rather than as a second `not-in`, because Firestore
+  // cannot combine an inequality on one field with a not-in on another. The
+  // range is already bounded by the booking horizon, so the set is small.
+  // `LEFT JOIN clients` becomes the denormalized client_name (§3.4).
+  const inWindow = await getDatabase().appointments.listBetween(
+    now.toISOString(),
+    horizon.toISOString(),
   );
-  return rows.map((r): UpcomingSession => ({
-    id: r.id,
-    pb_id: r.pb_id,
-    client_name: r.client_name,
-    starts_at: r.starts_at,
-    ends_at: r.ends_at,
-    status: r.status,
-    service_type: null,
-    source: 'local',
-  }));
+  return inWindow
+    .filter((a) => a.status !== 'cancelled' && a.status !== 'completed')
+    .slice(0, 100)
+    .map((a): UpcomingSession => ({
+      id: a.id,
+      pb_id: a.pb_id ?? '',
+      client_name: a.client_name ?? null,
+      starts_at: a.starts_at,
+      ends_at: a.ends_at,
+      status: a.status,
+      service_type: null,
+      source: 'local',
+    }));
 }
 
 // --- Slot derivation (TZ-correct) ------------------------------------------

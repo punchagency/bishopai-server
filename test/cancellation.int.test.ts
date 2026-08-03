@@ -1,48 +1,54 @@
-import { describe, it, expect, afterAll, beforeAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient, seedAppointment } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { enrollCancelledAppointment } from '../src/reengagement/cancellations';
 import { runReengagementForLead } from '../src/reengagement/runner';
 
-// Integration: PB cancellation → WF3 cancelled cadence. Skips when DB is down.
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
+// Integration: PB cancellation -> WF3 cancelled cadence. Emulator-gated.
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[cancellation.int] Firestore emulator not running \u2014 skipping. Start: npm run firestore:emulator');
+}
 
-const suite = dbUp ? describe : describe.skip;
-
-// Prefix deliberately outside the 'it-%' namespace that correlation.int.test.ts
-// bulk-deletes in its cleanup — otherwise a parallel run can drop these rows mid-test.
 const PB_APPT = 'citest-appt';
 const PB_APPT_NOEMAIL = 'citest-appt-noemail';
 const EMAIL = 'cancel-it@example.test';
 
-suite('cancellation → cancelled cadence (integration)', () => {
-  const cleanup = async () => {
-    await pool.query(`DELETE FROM leads WHERE lower(email) = lower($1)`, [EMAIL]).catch(() => {});
-    await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'citest-%'`).catch(() => {});
-    await pool.query(`DELETE FROM clients WHERE pb_id LIKE 'citest-%'`).catch(() => {});
-  };
+suite('cancellation \u2192 cancelled cadence (integration)', () => {
+  let db: IDatabase;
 
-  async function makeClientWithAppt(pbAppt: string, email: string | null): Promise<void> {
-    const c = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id, email) VALUES ($1, $2, $3)
-       ON CONFLICT (pb_id) DO UPDATE SET email = EXCLUDED.email RETURNING id`,
-      [`CI Cancel ${pbAppt}`, `citest-client-${pbAppt}`, email],
-    );
-    await pool.query(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-            VALUES ($1, $2, now() - interval '2 days', now() - interval '2 days' + interval '1 hour', 'cancelled')
-       ON CONFLICT (pb_id) DO NOTHING`,
-      [c.rows[0].id, pbAppt],
-    );
-  }
-
-  beforeAll(cleanup);
-  afterAll(async () => {
-    await cleanup();
-    await pool.end();
+  beforeAll(() => {
+    db = installFirestore('cancellation-int');
   });
+  afterAll(() => uninstallFirestore());
+  beforeEach(async () => {
+    await clearFirestore(db);
+  });
+
+  // The appointment is written through upsertByPbId so its pb-index claim
+  // document exists \u2014 enrollCancelledAppointment looks the appointment up BY
+  // that pb id, so a plain save() would leave it unfindable.
+  async function makeClientWithAppt(pbAppt: string, email: string | null): Promise<void> {
+    const client = await seedClient(db, {
+      name: `CI Cancel ${pbAppt}`,
+      pb_id: `citest-client-${pbAppt}`,
+      email: email ?? '',
+    });
+    await db.appointments.upsertByPbId(pbAppt, {
+      client_id: client.id,
+      client_name: client.name,
+      starts_at: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+      ends_at: new Date(Date.now() - 2 * 86_400_000 + 3_600_000).toISOString(),
+      status: 'cancelled',
+    });
+  }
 
   it('enrolls a cancelled client, is idempotent, and the cadence fires at 7 days', async () => {
     await makeClientWithAppt(PB_APPT, EMAIL);
@@ -51,18 +57,13 @@ suite('cancellation → cancelled cadence (integration)', () => {
     expect(first.outcome).toBe('created');
     const leadId = first.leadId!;
 
-    const lead = await pool.query<{ status: string }>(`SELECT status FROM leads WHERE id = $1`, [leadId]);
-    expect(lead.rows[0].status).toBe('cancelled');
+    expect((await db.reengagement.findLeadById(leadId))!.status).toBe('cancelled');
 
-    // Duplicate webhook → no-op, same lead (no second cancelled lead).
+    // Duplicate webhook -> no-op, same lead (no second cancelled lead).
     const again = await enrollCancelledAppointment(PB_APPT);
     expect(again.outcome).toBe('noop');
     expect(again.leadId).toBe(leadId);
-    const n = await pool.query<{ n: number }>(
-      `SELECT count(*)::int n FROM leads WHERE lower(email) = lower($1)`,
-      [EMAIL],
-    );
-    expect(n.rows[0].n).toBe(1);
+    expect(await db.reengagement.listLeadsByEmail(EMAIL)).toHaveLength(1);
 
     // Nothing due immediately (cancelled_7d is at 7 days).
     expect(await runReengagementForLead(leadId, new Date())).toBe('none');
@@ -70,12 +71,9 @@ suite('cancellation → cancelled cadence (integration)', () => {
     // At day 8, the first reschedule prompt sends.
     const day8 = new Date(Date.now() + 8 * 86_400_000);
     expect(await runReengagementForLead(leadId, day8)).toBe('sent');
-    const sent = await pool.query<{ sequence_state: { sent?: string[] }; status: string }>(
-      `SELECT sequence_state, status FROM leads WHERE id = $1`,
-      [leadId],
-    );
-    expect(sent.rows[0].sequence_state.sent).toContain('cancelled_7d');
-    expect(sent.rows[0].status).toBe('cancelled'); // stays on the cancelled track
+    const sent = await db.reengagement.findLeadById(leadId);
+    expect(sent!.sequence_state.sent).toContain('cancelled_7d');
+    expect(sent!.status).toBe('cancelled'); // stays on the cancelled track
   });
 
   it('skips a cancellation when the client has no email', async () => {

@@ -1,5 +1,12 @@
-import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 
 const mockListSessions = vi.fn();
 const mockGetClientRecord = vi.fn();
@@ -23,38 +30,36 @@ const { syncSessionsFromPb } = await import('../src/appointments/pbSync');
 // Substitutes for PB's session/booking webhooks while running on localhost
 // (no public URL for PB to deliver to) — see appointments/pbSync.ts.
 
-let dbUp = true;
-try {
-  await pool.query('SELECT 1');
-} catch {
-  dbUp = false;
+const up = await emulatorUp();
+const describeDb = up ? describe : describe.skip;
+if (!up) {
+  console.log('[appointments.pbSync.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
 }
-
-const describeDb = dbUp ? describe : describe.skip;
 
 describeDb('syncSessionsFromPb (integration)', () => {
   const PB_ID = 'pbsync-test-session-1';
   const PB_CLIENT_ID = 'pbsync-test-client-1';
 
-  const clearFixtures = async (): Promise<void> => {
-    await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'pbsync-test-%'`);
-    await pool.query(`DELETE FROM clients WHERE pb_id LIKE 'pbsync-test-%'`);
-  };
+  let db: IDatabase;
+
+  beforeAll(() => {
+    db = installFirestore('appointments-pbsync-int');
+  });
 
   beforeEach(async () => {
+    await clearFirestore(db);
     mockListSessions.mockReset();
     mockGetClientRecord.mockReset().mockResolvedValue({ id: PB_CLIENT_ID, profile: {} });
     mockDetectCheckout.mockReset().mockResolvedValue(null);
     mockEnrollCancelled.mockReset().mockResolvedValue({ outcome: 'noop' });
     process.env.PB_CLIENT_ID = 'test-id';
     process.env.PB_CLIENT_SECRET = 'test-secret';
-    await clearFixtures();
   });
 
-  afterAll(async () => {
-    await clearFixtures();
+  afterAll(() => {
     delete process.env.PB_CLIENT_ID;
     delete process.env.PB_CLIENT_SECRET;
+    uninstallFirestore();
   });
 
   it('is a no-op dry-run when PB is not configured', async () => {
@@ -81,11 +86,10 @@ describeDb('syncSessionsFromPb (integration)', () => {
     const r = await syncSessionsFromPb(now);
     expect(r).toEqual({ fetched: 1, upserted: 1, checkoutsDetected: 0, cancellationsEnrolled: 0 });
 
-    const appt = await pool.query(`SELECT status, starts_at FROM appointments WHERE pb_id = $1`, [PB_ID]);
-    expect(appt.rows[0].status).toBe('confirmed');
-
-    const client = await pool.query(`SELECT name FROM clients WHERE pb_id = $1`, [PB_CLIENT_ID]);
-    expect(client.rows[0].name).toBe('Jamie Fox');
+    // Looked up through the pb index, which is what replaced the UNIQUE column
+    // — so a sync that forgot to claim the pb id would read as "not there".
+    expect((await db.appointments.findByPbId(PB_ID))!.status).toBe('confirmed');
+    expect((await db.clients.findByPbId(PB_CLIENT_ID))!.name).toBe('Jamie Fox');
 
     expect(mockDetectCheckout).not.toHaveBeenCalled();
     expect(mockEnrollCancelled).not.toHaveBeenCalled();
@@ -108,8 +112,7 @@ describeDb('syncSessionsFromPb (integration)', () => {
     expect(r.checkoutsDetected).toBe(1);
     expect(mockDetectCheckout).toHaveBeenCalledTimes(1);
 
-    const appt = await pool.query(`SELECT status FROM appointments WHERE pb_id = $1`, [PB_ID]);
-    expect(appt.rows[0].status).toBe('completed');
+    expect((await db.appointments.findByPbId(PB_ID))!.status).toBe('completed');
   });
 
   it('does not re-fire checkout detection on a re-poll once already completed', async () => {
@@ -175,16 +178,17 @@ describeDb('syncSessionsFromPb (integration)', () => {
     await syncSessionsFromPb(now);
     expect(mockGetClientRecord).toHaveBeenCalledWith(PB_CLIENT_ID);
 
-    const client = await pool.query(`SELECT email FROM clients WHERE pb_id = $1`, [PB_CLIENT_ID]);
-    expect(client.rows[0].email).toBe('backfilled@example.com');
+    expect((await db.clients.findByPbId(PB_CLIENT_ID))!.email).toBe('backfilled@example.com');
   });
 
   it('does not call PB for email when the client already has one on file', async () => {
     const now = new Date('2026-07-15T12:00:00.000Z');
-    await pool.query(
-      `INSERT INTO clients (name, pb_id, email) VALUES ('Existing Client', $1, 'already@example.com')`,
-      [PB_CLIENT_ID],
-    );
+    // Through upsertByPbId so the pb-index claim exists — a plain save() would
+    // leave the sync unable to find them, and it would call PB after all.
+    await db.clients.upsertByPbId(PB_CLIENT_ID, {
+      name: 'Existing Client',
+      email: 'already@example.com',
+    });
     mockListSessions.mockResolvedValue({
       items: [
         {

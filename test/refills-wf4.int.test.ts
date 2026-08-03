@@ -1,5 +1,12 @@
-import { describe, it, expect, afterEach, afterAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient, seedRefill, seedSupplement } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { nextReminderAction, reminderMessage, reminderLeadDays, followUpDays } from '../src/refills/reminders';
 import { pickSupplementWinner, projectRefills, type SupplementRow } from '../src/refills/project';
 import { suggestedMonths } from '../src/refills/adherence';
@@ -125,65 +132,94 @@ describe('suggestedMonths', () => {
 });
 
 // --- Integration ------------------------------------------------------------
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-const suite = dbUp ? describe : describe.skip;
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[refills-wf4.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
 suite('WF4 refills (integration)', () => {
-  const clientIds: string[] = [];
-  const newClient = async (email: string | null) =>
-    (await pool.query<{ id: string }>(`INSERT INTO clients (name, email) VALUES ('WF4 Test', $1) RETURNING id`, [email])).rows[0].id;
-  afterEach(async () => {
-    for (const id of clientIds.splice(0)) await pool.query(`DELETE FROM clients WHERE id = $1`, [id]);
+  let db: IDatabase;
+
+  beforeAll(() => {
+    db = installFirestore('refills-wf4-int');
   });
-  afterAll(async () => {
-    await pool.end();
+  afterAll(() => uninstallFirestore());
+  beforeEach(async () => {
+    await clearFirestore(db);
   });
+
+  const newClient = (email: string | null) =>
+    seedClient(db, { name: 'WF4 Test', email: email ?? '' }).then((c) => c.id);
 
   it('projection collapses duplicate cross-source supplements into one refill', async () => {
     const c = await newClient(null);
-    clientIds.push(c);
     // Same supplement from two sources; both have qty + start so both would project.
-    await pool.query(
-      `INSERT INTO supplements (client_id, name, dose, qty, start_date, source)
-       VALUES ($1,'Magnesium','1 cap daily',30,'2026-06-01','fullscript'),
-              ($1,'Magnesium','1 cap daily',30,'2026-06-20','notes')`,
-      [c],
-    );
+    // Distinct name_keys are required because the document id is
+    // `${client_id}__${name_key}` - two rows sharing a key would be ONE document,
+    // which would hide the dedup this test exists to prove.
+    await seedSupplement(db, {
+      client_id: c,
+      name: 'Magnesium',
+      name_key: 'magnesium__fullscript',
+      dose: '1 cap daily',
+      qty: 30,
+      start_date: '2026-06-01',
+      source: 'fullscript',
+    });
+    await seedSupplement(db, {
+      client_id: c,
+      name: 'Magnesium',
+      name_key: 'magnesium__notes',
+      dose: '1 cap daily',
+      qty: 30,
+      start_date: '2026-06-20',
+      source: 'notes',
+    });
+
     const r = await projectRefills();
     expect(r.deduped).toBeGreaterThanOrEqual(1);
+
     // Exactly one refill for this client, tied to the notes-source supplement.
-    const refills = await pool.query(
-      `SELECT rf.id, s.source FROM refills rf JOIN supplements s ON s.id = rf.supplement_id
-        WHERE rf.client_id = $1 AND rf.status = 'pending'`,
-      [c],
-    );
-    expect(refills.rowCount).toBe(1);
-    expect(refills.rows[0].source).toBe('notes');
+    const refills = (await db.refills.listByClient(c)).filter((rf) => rf.status === 'pending');
+    expect(refills).toHaveLength(1);
+    const winner = await db.refills.findSupplementById(refills[0].supplement_id);
+    expect(winner!.source).toBe('notes');
   });
 
   it('reminder runner sends a due reminder, then auto-closes after the final follow-up', async () => {
     const c = await newClient('client@x.com');
-    clientIds.push(c);
-    const supId = (
-      await pool.query<{ id: string }>(`INSERT INTO supplements (client_id, name, source) VALUES ($1,'Zinc','notes') RETURNING id`, [c])
-    ).rows[0].id;
-    // Pending refill due tomorrow → first reminder should send.
-    const dueSoon = (await pool.query<{ d: string }>(`SELECT to_char(current_date + 1, 'YYYY-MM-DD') AS d`)).rows[0].d;
-    await pool.query(`INSERT INTO refills (client_id, supplement_id, due_date, status) VALUES ($1,$2,$3,'pending')`, [c, supId, dueSoon]);
+    const supplement = await seedSupplement(db, {
+      client_id: c,
+      name: 'Zinc',
+      source: 'notes',
+      dose: null,
+      qty: null,
+      start_date: null,
+    });
+    // Pending refill due tomorrow -> first reminder should send.
+    const dueSoon = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+    const refill = await seedRefill(db, {
+      client_id: c,
+      supplement_id: supplement.id,
+      supplement_name: 'Zinc',
+      due_date: dueSoon,
+      status: 'pending',
+    });
 
     const first = await runRefillReminders();
     expect(first.sent).toBeGreaterThanOrEqual(1);
-    let row = (await pool.query(`SELECT reminder_stage, status FROM refills WHERE client_id = $1`, [c])).rows[0];
-    expect(row.reminder_stage).toBe(1);
+    expect((await db.refills.findById(refill.id))!.reminder_stage).toBe(1);
 
-    // Force the row to the final stage with its follow-up already due → auto-close.
-    await pool.query(`UPDATE refills SET reminder_stage = 2, reminder_next_at = current_date - 1 WHERE client_id = $1`, [c]);
+    // Force the row to the final stage with its follow-up already due -> auto-close.
+    const staged = await db.refills.findById(refill.id);
+    await db.refills.save({
+      ...staged!,
+      reminder_stage: 2,
+      reminder_next_at: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10),
+    });
     const second = await runRefillReminders();
     expect(second.closed).toBeGreaterThanOrEqual(1);
-    row = (await pool.query(`SELECT status FROM refills WHERE client_id = $1`, [c])).rows[0];
-    expect(row.status).toBe('closed');
+    expect((await db.refills.findById(refill.id))!.status).toBe('closed');
   });
 });

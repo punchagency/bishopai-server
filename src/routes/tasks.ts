@@ -2,16 +2,22 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { logError } from '../observability/logger';
 import { createManualTask, listOpenTasks, setTaskStatus } from '../tasks/service';
+import { isDocId } from '../db/ids.js';
 
 // Nicole's open commitments — the follow-ups she made in session, now tracked.
 // Read + tick off. Nothing here sends anything to anyone.
 export const tasksRouter = Router();
 
-const isUuid = (id: string) => z.uuid().safeParse(id).success;
+// Path ids are Firestore document ids, not uuids — the port mints deterministic
+// ones (`appt_…`, `client_…`, `${clientId}__${nameKey}`). Gating on uuid shape
+// here would 404 every PB-synced record; see isDocId.
+const isUuid = isDocId;
 
 const patchSchema = z.object({ status: z.enum(['open', 'done', 'dismissed']) });
 const createSchema = z.object({
-  client_id: z.uuid(),
+  // A document id, not a uuid — a PB-synced client's id is `client_…`, and
+  // Nicole must be able to add a manual task against one. See isDocId.
+  client_id: z.string().refine(isDocId, 'invalid client id'),
   title: z.string().min(1).max(500),
   due_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullish(),
 });

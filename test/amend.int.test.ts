@@ -2,7 +2,15 @@ import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedAppointment, seedClient, seedSessionDocs, seedSupplement } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
+import type { Client } from '../src/db/interfaces/types';
 
 // Integration: correcting a note AFTER Nicole approved it.
 //
@@ -10,16 +18,19 @@ import { pool } from '../src/db/pool';
 // documents are already in Drive and may already be with the client, so a silent
 // rewrite would leave the record and the delivered copy disagreeing with nothing
 // to show it happened.
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[amend.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
-const suite = dbUp ? describe : describe.skip;
-
-suite('amending an approved note (integration, real Postgres)', () => {
+// The cases here build on one session in order (draft -> approve -> amend ->
+// amend again), so the fixture is created once and NOT wiped between tests.
+suite('amending an approved note (integration)', () => {
   let server: http.Server;
   let base = '';
+  let db: IDatabase;
+  let client: Client;
   let clientId = '';
   let appointmentId = '';
   let protocolId = '';
@@ -41,39 +52,56 @@ suite('amending an approved note (integration, real Postgres)', () => {
     follow_ups: [],
   });
 
+  /**
+   * A protocol on its own appointment. The document id is the appointment id
+   * (see seedSessionDocs), which is also why each of these needs an appointment
+   * of its own - two protocols under one appointment would be one document.
+   */
+  async function makeProtocol(
+    owner: Client,
+    pbId: string,
+    daysAgo: number,
+    content: Record<string, unknown>,
+    status: 'draft' | 'approved' = 'draft',
+  ): Promise<{ appointmentId: string; protocolId: string }> {
+    const startsAt = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+    const appointment = await seedAppointment(db, {
+      client_id: owner.id,
+      client_name: owner.name,
+      pb_id: pbId,
+      starts_at: startsAt,
+      ends_at: startsAt,
+      status: 'completed',
+    });
+    const docs = await seedSessionDocs(db, {
+      appointment,
+      client: owner,
+      protocol: { content_json: content, status },
+    });
+    // Only the protocol is wanted here; the sheet would make the session's
+    // combined status depend on a document these cases never touch.
+    await db.sessionNotes.deleteSessionDocs(appointment.id);
+    await db.sessionNotes.saveProtocol(docs.protocol);
+    return { appointmentId: appointment.id, protocolId: docs.protocol.id };
+  }
+
   beforeAll(async () => {
+    db = installFirestore('amend-int');
+    await clearFirestore(db);
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
-    const c = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id) VALUES ('AM Amend', 'amtest-amend') RETURNING id`,
-    );
-    clientId = c.rows[0].id;
-    const a = await pool.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-appt', now() - interval '2 days', now() - interval '2 days', 'completed')
-       RETURNING id`,
-      [clientId],
-    );
-    appointmentId = a.rows[0].id;
-    const p = await pool.query<{ id: string }>(
-      `INSERT INTO protocols (client_id, appointment_id, content_json, status)
-       VALUES ($1, $2, $3, 'draft') RETURNING id`,
-      [clientId, appointmentId, JSON.stringify(note('original concern'))],
-    );
-    protocolId = p.rows[0].id;
+    client = await seedClient(db, { name: 'AM Amend', pb_id: 'amtest-amend' });
+    clientId = client.id;
+    const made = await makeProtocol(client, 'amtest-appt', 2, note('original concern'));
+    appointmentId = made.appointmentId;
+    protocolId = made.protocolId;
   });
 
   afterAll(async () => {
     await new Promise<void>((r) => server.close(() => r()));
-    await pool.query(`DELETE FROM note_revisions WHERE source_id = $1`, [protocolId]).catch(() => {});
-    await pool.query(`DELETE FROM appointment_sheets WHERE client_id = $1`, [clientId]).catch(() => {});
-    await pool.query(`DELETE FROM supplements WHERE client_id = $1`, [clientId]).catch(() => {});
-    await pool.query(`DELETE FROM protocols WHERE client_id = $1`, [clientId]).catch(() => {});
-    await pool.query(`DELETE FROM appointments WHERE client_id = $1`, [clientId]).catch(() => {});
-    await pool.query(`DELETE FROM clients WHERE pb_id = 'amtest-amend'`).catch(() => {});
-    await pool.end();
+    uninstallFirestore();
   });
 
   it('allows a plain edit while the note is still a draft', async () => {
@@ -95,11 +123,8 @@ suite('amending an approved note (integration, real Postgres)', () => {
     expect((await r.json()).error).toBe('already approved');
 
     // The stored note must be untouched by the refused edit.
-    const cur = await pool.query<{ content_json: { concerns: string[] } }>(
-      `SELECT content_json FROM protocols WHERE id = $1`,
-      [protocolId],
-    );
-    expect(cur.rows[0].content_json.concerns).toEqual(['edited while draft']);
+    const cur = await db.sessionNotes.findProtocolByAppointment(appointmentId);
+    expect((cur!.content_json as { concerns: string[] }).concerns).toEqual(['edited while draft']);
   });
 
   it('amends by filing the superseded version, not overwriting it', async () => {
@@ -134,28 +159,17 @@ suite('amending an approved note (integration, real Postgres)', () => {
   });
 
   it('records every amendment in the approvals audit trail', async () => {
-    const r = await pool.query(
-      `SELECT status FROM approvals
-        WHERE payload_json->>'protocol_id' = $1 AND status = 'amended'`,
-      [protocolId],
+    const amended = (await db.sessionNotes.listApprovals(appointmentId)).filter(
+      (a) => a.status === 'amended',
     );
-    expect(r.rowCount).toBe(2);
+    expect(amended).toHaveLength(2);
   });
 
   it('refuses to amend a note that was never approved', async () => {
-    // protocols.appointment_id is unique, so this needs an appointment of its own.
-    const a2 = await pool.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-appt-2', now() - interval '1 day', now() - interval '1 day', 'completed')
-       RETURNING id`,
-      [clientId],
-    );
-    const p = await pool.query<{ id: string }>(
-      `INSERT INTO protocols (client_id, appointment_id, content_json, status)
-       VALUES ($1, $2, $3, 'draft') RETURNING id`,
-      [clientId, a2.rows[0].id, JSON.stringify(note('still a draft'))],
-    );
-    const r = await send('POST', `/review/protocols/${p.rows[0].id}/amend`, {
+    // The protocol's document id IS its appointment id, so this needs an
+    // appointment of its own.
+    const draft = await makeProtocol(client, 'amtest-appt-2', 1, note('still a draft'));
+    const r = await send('POST', `/review/protocols/${draft.protocolId}/amend`, {
       content_json: note('nope'),
     });
     expect(r.status).toBe(409);
@@ -164,21 +178,16 @@ suite('amending an approved note (integration, real Postgres)', () => {
 
   it('retracts a supplement the amendment removed, but keeps ones it only stopped changing', async () => {
     // A fresh client so the plan starts empty and the assertions are unambiguous.
-    const c = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id) VALUES ('AM Retract', 'amtest-retract') RETURNING id`,
-    );
-    const cid = c.rows[0].id;
-    const a = await pool.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-retract-appt', now() - interval '3 days', now() - interval '3 days', 'completed')
-       RETURNING id`,
-      [cid],
-    );
+    const retractClient = await seedClient(db, { name: 'AM Retract', pb_id: 'amtest-retract' });
+    const cid = retractClient.id;
     // Already on the plan from an earlier session.
-    await pool.query(
-      `INSERT INTO supplements (client_id, name, dose, qty, source) VALUES ($1, 'Zypan', '1 w/ meals', 2, 'notes')`,
-      [cid],
-    );
+    await seedSupplement(db, {
+      client_id: cid,
+      name: 'Zypan',
+      dose: '1 w/ meals',
+      qty: 2,
+      source: 'notes',
+    });
 
     const withBoth = {
       ...note('x'),
@@ -187,19 +196,14 @@ suite('amending an approved note (integration, real Postgres)', () => {
         { name: 'Zypan', dose: '2 w/ meals', quantity: 2, change: 'increase' },
       ],
     };
-    const p = await pool.query<{ id: string }>(
-      `INSERT INTO protocols (client_id, appointment_id, content_json, status)
-       VALUES ($1, $2, $3, 'draft') RETURNING id`,
-      [cid, a.rows[0].id, JSON.stringify(withBoth)],
+    const { protocolId: pid } = await makeProtocol(
+      retractClient, 'amtest-retract-appt', 3, withBoth,
     );
-    const pid = p.rows[0].id;
     expect((await send('POST', `/review/protocols/${pid}/approve`, {})).status).toBe(200);
 
-    let names = await pool.query<{ name: string }>(
-      `SELECT name FROM supplements WHERE client_id = $1 ORDER BY name`,
-      [cid],
-    );
-    expect(names.rows.map((r) => r.name)).toEqual(['Min-Tran', 'Zypan']);
+    const planNames = async () =>
+      (await db.refills.listSupplementsByClient(cid)).map((x) => x.name).sort();
+    expect(await planNames()).toEqual(['Min-Tran', 'Zypan']);
 
     // She amends: Min-Tran was never actually prescribed, and the Zypan increase
     // is retracted too — but Zypan itself predates this session and must stay.
@@ -209,30 +213,12 @@ suite('amending an approved note (integration, real Postgres)', () => {
     });
     expect(r.status).toBe(200);
 
-    names = await pool.query<{ name: string }>(
-      `SELECT name FROM supplements WHERE client_id = $1 ORDER BY name`,
-      [cid],
-    );
-    expect(names.rows.map((r) => r.name)).toEqual(['Zypan']);
-
-    await pool.query(`DELETE FROM note_revisions WHERE source_id = $1`, [pid]);
-    await pool.query(`DELETE FROM supplements WHERE client_id = $1`, [cid]);
-    await pool.query(`DELETE FROM protocols WHERE client_id = $1`, [cid]);
-    await pool.query(`DELETE FROM appointments WHERE client_id = $1`, [cid]);
-    await pool.query(`DELETE FROM clients WHERE id = $1`, [cid]);
+    expect(await planNames()).toEqual(['Zypan']);
   });
 
   it('reconciles tasks on amend: creates added follow-ups, dismisses removed ones', async () => {
-    const c = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id) VALUES ('AM Tasks', 'amtest-tasks') RETURNING id`,
-    );
-    const cid = c.rows[0].id;
-    const a = await pool.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-tasks-appt', now() - interval '3 days', now() - interval '3 days', 'completed')
-       RETURNING id`,
-      [cid],
-    );
+    const tasksClient = await seedClient(db, { name: 'AM Tasks', pb_id: 'amtest-tasks' });
+    const cid = tasksClient.id;
     const withFollowUps = {
       ...note('x'),
       follow_ups: [
@@ -240,19 +226,16 @@ suite('amending an approved note (integration, real Postgres)', () => {
         { text: 'Send lab requisition', due_in_days: null },
       ],
     };
-    const p = await pool.query<{ id: string }>(
-      `INSERT INTO protocols (client_id, appointment_id, content_json, status)
-       VALUES ($1, $2, $3, 'draft') RETURNING id`,
-      [cid, a.rows[0].id, JSON.stringify(withFollowUps)],
+    const { protocolId: pid } = await makeProtocol(
+      tasksClient, 'amtest-tasks-appt', 3, withFollowUps,
     );
-    const pid = p.rows[0].id;
     expect((await send('POST', `/review/protocols/${pid}/approve`, {})).status).toBe(200);
 
-    const openTitles = async () => {
-      const r = await pool.query<{ title: string }>(
-        `SELECT title FROM tasks WHERE client_id = $1 AND status = 'open' ORDER BY title`, [cid]);
-      return r.rows.map((x) => x.title);
-    };
+    const openTitles = async () =>
+      (await db.tasks.listByClient(cid))
+        .filter((t) => t.status === 'open')
+        .map((t) => t.title)
+        .sort();
     expect(await openTitles()).toEqual(['Recheck iron in 4 weeks', 'Send lab requisition']);
 
     // Amend: drop the lab requisition (misheard), keep the iron recheck, add a new one.
@@ -270,15 +253,10 @@ suite('amending an approved note (integration, real Postgres)', () => {
 
     expect(await openTitles()).toEqual(['Book a 6-week review', 'Recheck iron in 4 weeks']);
     // The removed one is dismissed, not deleted — its history survives.
-    const dropped = await pool.query<{ status: string }>(
-      `SELECT status FROM tasks WHERE client_id = $1 AND title = 'Send lab requisition'`, [cid]);
-    expect(dropped.rows[0].status).toBe('dismissed');
-
-    await pool.query(`DELETE FROM note_revisions WHERE source_id = $1`, [pid]);
-    await pool.query(`DELETE FROM tasks WHERE client_id = $1`, [cid]);
-    await pool.query(`DELETE FROM protocols WHERE client_id = $1`, [cid]);
-    await pool.query(`DELETE FROM appointments WHERE client_id = $1`, [cid]);
-    await pool.query(`DELETE FROM clients WHERE id = $1`, [cid]);
+    const dropped = (await db.tasks.listByClient(cid)).find(
+      (t) => t.title === 'Send lab requisition',
+    );
+    expect(dropped!.status).toBe('dismissed');
   });
 
   it('never offers this session back as its own history', async () => {
@@ -286,12 +264,13 @@ suite('amending an approved note (integration, real Postgres)', () => {
     // different tables with different ids. Excluding only by row id let the
     // sheet from THIS very session be served as the "previous session", and
     // ordering by updated_at made whichever row was touched last win.
-    const sheet = await pool.query<{ id: string }>(
-      `INSERT INTO appointment_sheets (client_id, appointment_id, content_json, status)
-       VALUES ($1, $2, $3, 'approved') RETURNING id`,
-      [clientId, appointmentId, JSON.stringify(note('same session, other table'))],
-    );
-    expect(sheet.rowCount).toBe(1);
+    const appointment = (await db.appointments.findById(appointmentId))!;
+    await seedSessionDocs(db, {
+      appointment,
+      client,
+      sheet: { content_json: note('same session, other collection'), status: 'approved' },
+      protocol: (await db.sessionNotes.findProtocolByAppointment(appointmentId))!,
+    });
 
     const ctx = await (await get(`/review/protocols/${protocolId}/context`)).json();
     expect(ctx.prior.sheet).toBeNull();
@@ -299,29 +278,11 @@ suite('amending an approved note (integration, real Postgres)', () => {
   });
 
   it('picks the previous session by appointment date, not row modification time', async () => {
-    const older = await pool.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-older', now() - interval '30 days', now() - interval '30 days', 'completed')
-       RETURNING id`,
-      [clientId],
-    );
-    const middle = await pool.query<{ id: string }>(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-middle', now() - interval '10 days', now() - interval '10 days', 'completed')
-       RETURNING id`,
-      [clientId],
-    );
-    // Insert the OLDER session last, so updated_at ordering would pick it.
-    await pool.query(
-      `INSERT INTO protocols (client_id, appointment_id, content_json, status)
-       VALUES ($1, $2, $3, 'approved')`,
-      [clientId, middle.rows[0].id, JSON.stringify(note('ten days ago'))],
-    );
-    await pool.query(
-      `INSERT INTO protocols (client_id, appointment_id, content_json, status)
-       VALUES ($1, $2, $3, 'approved')`,
-      [clientId, older.rows[0].id, JSON.stringify(note('thirty days ago'))],
-    );
+    // Write the OLDER session LAST, so ordering by updated_at would pick it —
+    // the whole point is that starts_at decides, which is why it is
+    // denormalized onto the document (§3.4).
+    await makeProtocol(client, 'amtest-middle', 10, note('ten days ago'), 'approved');
+    await makeProtocol(client, 'amtest-older', 30, note('thirty days ago'), 'approved');
 
     const ctx = await (await get(`/review/protocols/${protocolId}/context`)).json();
     expect(ctx.prior.protocol.note.concerns).toEqual(['ten days ago']);

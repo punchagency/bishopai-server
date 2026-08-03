@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logError } from '../observability/logger';
 import { recordAudit } from '../audit/log';
 import { listUpcomingReminders } from '../reminders/upcoming';
+import { isDocId } from '../db/ids.js';
 
 // The queue of client-facing emails the cadences will send, plus the one action
 // Nicole needs over them: stop this one from going out. Read the module comment
@@ -14,15 +15,21 @@ import { listUpcomingReminders } from '../reminders/upcoming';
 // may still want to send the order herself) — only the automated email stops.
 export const remindersRouter = Router();
 
-const isUuid = (id: string) => z.uuid().safeParse(id).success;
+// Path ids are Firestore document ids, not uuids — the port mints deterministic
+// ones (`appt_…`, `client_…`, `${clientId}__${nameKey}`). Gating on uuid shape
+// here would 404 every PB-synced record; see isDocId.
+const isUuid = isDocId;
 
 const KINDS = { refill: 'refill', reengagement: 'reengagement' } as const;
 type Kind = keyof typeof KINDS;
 
-// Per-kind cancellation: which table holds the flag, and how to describe it.
-const TARGETS: Record<Kind, { table: 'refills' | 'leads'; column: string; entity: 'refill' | 'lead'; label: string }> = {
-  refill: { table: 'refills', column: 'reminders_cancelled_at', entity: 'refill', label: 'Refill reminders' },
-  reengagement: { table: 'leads', column: 'cadence_cancelled_at', entity: 'lead', label: 'Re-engagement emails' },
+// Per-kind cancellation: which collection holds the flag, and how to describe it.
+const TARGETS: Record<
+  Kind,
+  { collection: 'refills' | 'leads'; field: 'reminders_cancelled_at' | 'cadence_cancelled_at'; entity: 'refill' | 'lead'; label: string }
+> = {
+  refill: { collection: 'refills', field: 'reminders_cancelled_at', entity: 'refill', label: 'Refill reminders' },
+  reengagement: { collection: 'leads', field: 'cadence_cancelled_at', entity: 'lead', label: 'Re-engagement emails' },
 };
 
 // ---------------------------------------------------------------------------
@@ -54,14 +61,23 @@ function setCancelled(cancel: boolean) {
     if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
 
     try {
-      // Table/column come from the TARGETS map above, never from the request.
-      const r = await pool.query(
-        `UPDATE ${target.table} SET ${target.column} = ${cancel ? 'now()' : 'NULL'}
-          WHERE id = $1
-      RETURNING id, ${target.column} AS cancelled_at`,
-        [req.params.id],
-      );
-      if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+      // Collection/field come from the TARGETS map above, never from the request.
+      const db = getDatabase();
+      const cancelledAt = cancel ? new Date().toISOString() : null;
+      const id = req.params.id;
+
+      // `UPDATE … WHERE id = $1` with `rowCount === 0` meaning "not found" — so
+      // the row has to be read first here, since a Firestore set(merge) on a
+      // missing document would happily create one.
+      if (target.collection === 'refills') {
+        const refill = await db.refills.findById(id);
+        if (!refill) return res.status(404).json({ error: 'not found' });
+        await db.refills.save({ ...refill, reminders_cancelled_at: cancelledAt });
+      } else {
+        const lead = await db.reengagement.findLeadById(id);
+        if (!lead) return res.status(404).json({ error: 'not found' });
+        await db.reengagement.saveLead({ ...lead, cadence_cancelled_at: cancelledAt });
+      }
 
       await recordAudit({
         entityType: target.entity,
@@ -70,7 +86,7 @@ function setCancelled(cancel: boolean) {
         actor: 'nicole',
         summary: `${target.label} ${cancel ? 'cancelled' : 'restored'}`,
       });
-      return res.json({ id: r.rows[0].id, kind, cancelled_at: r.rows[0].cancelled_at });
+      return res.json({ id, kind, cancelled_at: cancelledAt });
     } catch (err) {
       logError('reminders.cancel', 'reminder cancellation failed', err, { kind, id: req.params.id, cancel });
       return res.status(500).json({ error: 'internal error' });

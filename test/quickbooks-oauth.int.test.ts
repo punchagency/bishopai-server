@@ -1,36 +1,42 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { getQuickbooksAccessToken, _resetQuickbooksTokenCache } from '../src/integrations/quickbooks/oauth';
 
 // OAuth token manager: refresh grant (Basic-auth header, flat response),
 // in-process caching, and rotated-refresh persistence to integration_state.
-// DB-gated (persistence uses integration_state).
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-
-const suite = dbUp ? describe : describe.skip;
+// Emulator-gated (persistence uses integration_state).
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[quickbooks-oauth.int] Firestore emulator not running — skipping. Start: npm run firestore:emulator');
+}
 const REFRESH_KEY = 'quickbooks.refresh_token';
 
 suite('quickbooks OAuth token manager (integration)', () => {
   const saved = { ...process.env };
+  let db: IDatabase;
 
-  beforeAll(() => pool.query(`DELETE FROM integration_state WHERE key = $1`, [REFRESH_KEY]).then(() => {}));
-  beforeEach(() => {
+  beforeAll(() => {
+    db = installFirestore('quickbooks-oauth-int');
+  });
+  beforeEach(async () => {
+    await clearFirestore(db);
     _resetQuickbooksTokenCache();
     process.env.QB_CLIENT_ID = 'cid';
     process.env.QB_CLIENT_SECRET = 'csecret';
     process.env.QB_REFRESH_TOKEN = 'seed-refresh';
     process.env.QB_REALM_ID = 'realm-1';
   });
-  afterEach(async () => {
+  afterEach(() => {
     process.env = { ...saved };
-    await pool.query(`DELETE FROM integration_state WHERE key = $1`, [REFRESH_KEY]);
   });
-  afterAll(async () => {
-    await pool.end();
-  });
+  afterAll(() => uninstallFirestore());
 
   it('mints an access token via the refresh grant, with Basic auth, and caches it', async () => {
     let calls = 0;
@@ -55,8 +61,7 @@ suite('quickbooks OAuth token manager (integration)', () => {
     };
     await getQuickbooksAccessToken({ post: post1 });
 
-    const stored = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [REFRESH_KEY]);
-    expect(stored.rows[0].value).toBe('rotated-refresh');
+    expect(await db.state.get(REFRESH_KEY)).toBe('rotated-refresh');
 
     // New process (cache cleared) → next refresh uses the rotated token, not the seed.
     _resetQuickbooksTokenCache();

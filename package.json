@@ -2,7 +2,7 @@
   "name": "bishopai-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Innerlume Healing automation backend — correlation engine + checkout state machine",
+  "description": "Innerlume Healing automation backend \u2014 correlation engine + checkout state machine",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
@@ -10,7 +10,6 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "migrate": "tsx src/db/migrate.ts",
-    "migrate:prod": "node dist/db/migrate.js",
     "seed": "tsx src/db/seed.ts",
     "seed:journey": "tsx scripts/seed-demo-journey.mts",
     "demo:templates": "tsx scripts/demo-templates.mts",
@@ -40,7 +39,6 @@
     "firebase-functions": "^5.0.0",
     "groq-sdk": "^1.3.0",
     "node-cron": "^3.0.3",
-    "pg": "^8.12.0",
     "pizzip": "^3.2.0",
     "zod": "^4.4.3"
   },
@@ -48,7 +46,6 @@
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
     "@types/node-cron": "^3.0.11",
-    "@types/pg": "^8.11.6",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0",
     "vitest": "^4.1.9"

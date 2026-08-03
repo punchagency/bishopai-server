@@ -1,5 +1,4 @@
 import 'dotenv/config';
-import { pool } from './db/pool';
 import { createApp } from './app';
 import { startScheduler, stopScheduler } from './scheduler';
 import { checkFullscriptPbReadiness } from './integrations/pb';
@@ -32,7 +31,12 @@ server.on('error', async (err) => {
 // backend to hold. See docs: bee-access-model / electron-client.
 
 // --- Graceful shutdown --------------------------------------------------------
-// Single teardown path: stop ingest, drain HTTP, flush logs, close the DB pool.
+// Single teardown path: stop ingest, then drain HTTP. There is no connection
+// pool to close any more — the Firestore Admin SDK is stateless and
+// authenticates per request — and no log buffer to flush, since the logger
+// writes through (see observability/logger.ts). This path exists for the local
+// `npm run dev` process; under Cloud Functions there is no shutdown hook at all,
+// which is exactly why neither of those two steps may be load-bearing.
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000);
 let shuttingDown = false;
 
@@ -55,12 +59,6 @@ async function shutdown(signal: string): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       server.close((err) => (err ? reject(err) : resolve()));
     });
-
-    // 2. Flush buffered logs and stop the flush timer (before the pool closes).
-    await shutdownLogger();
-
-    // 3. Close the DB pool.
-    await pool.end();
 
     clearTimeout(forceExit);
     console.log('Shutdown complete.');

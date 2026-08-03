@@ -1,8 +1,15 @@
-import { describe, it, expect, afterEach, afterAll, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient, seedLead, seedRefill, seedSupplement } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { updateAuthConfig } from '../src/auth/service';
 import { nextRefillSendDate, doseSummary } from '../src/reminders/upcoming';
 import { runRefillReminders } from '../src/refills/remindersRunner';
@@ -66,54 +73,59 @@ describe('nextScheduledStep', () => {
 });
 
 // --- Integration ------------------------------------------------------------
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-const suite = dbUp ? describe : describe.skip;
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[reminders-upcoming.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
 suite('GET /reminders/upcoming + cancel', () => {
   let server: http.Server;
   let base = '';
-  const clientIds: string[] = [];
-  const leadIds: string[] = [];
+  let db: IDatabase;
 
-  const newClient = async (name: string, email: string | null) => {
-    const r = await pool.query<{ id: string }>(`INSERT INTO clients (name, email) VALUES ($1, $2) RETURNING id`, [name, email]);
-    clientIds.push(r.rows[0].id);
-    return r.rows[0].id;
-  };
+  const dayOffset = (days: number) =>
+    new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
+
+  const newClient = (name: string, email: string | null) =>
+    seedClient(db, { name, email: email ?? '' }).then((c) => c.id);
 
   /** A supplement + its projected refill, due `dueInDays` from today. */
   const newRefill = async (clientId: string, name: string, dose: string, qty: number, dueInDays: number) => {
-    const s = await pool.query<{ id: string }>(
-      `INSERT INTO supplements (client_id, name, dose, qty, start_date, source)
-            VALUES ($1, $2, $3, $4, current_date - $5::int, 'notes') RETURNING id`,
-      [clientId, name, dose, qty, Math.max(0, qty - dueInDays)],
-    );
-    const r = await pool.query<{ id: string }>(
-      `INSERT INTO refills (client_id, supplement_id, due_date, status)
-            VALUES ($1, $2, current_date + $3::int, 'pending') RETURNING id`,
-      [clientId, s.rows[0].id, dueInDays],
-    );
-    return r.rows[0].id;
+    const supplement = await seedSupplement(db, {
+      client_id: clientId,
+      name,
+      dose,
+      qty,
+      start_date: dayOffset(-Math.max(0, qty - dueInDays)),
+      source: 'notes',
+    });
+    const refill = await seedRefill(db, {
+      client_id: clientId,
+      supplement_id: supplement.id,
+      supplement_name: name,
+      dose,
+      due_date: dayOffset(dueInDays),
+      status: 'pending',
+    });
+    return refill.id;
   };
 
   beforeAll(async () => {
+    db = installFirestore('reminders-upcoming-int');
     await updateAuthConfig({ enabled: false });
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   });
 
-  afterEach(async () => {
-    for (const id of clientIds.splice(0)) await pool.query(`DELETE FROM clients WHERE id = $1`, [id]);
-    for (const id of leadIds.splice(0)) await pool.query(`DELETE FROM leads WHERE id = $1`, [id]);
+  beforeEach(async () => {
+    await clearFirestore(db);
   });
 
   afterAll(async () => {
     await new Promise<void>((r) => server.close(() => r()));
-    await pool.end();
+    uninstallFirestore();
   });
 
   const upcoming = async (days = 30) => {
@@ -167,9 +179,9 @@ suite('GET /reminders/upcoming + cancel', () => {
 
     // The cadence itself must respect it — otherwise the queue lies.
     await runRefillReminders();
-    const row = (await pool.query(`SELECT reminder_stage, status FROM refills WHERE id = $1`, [refillId])).rows[0];
-    expect(row.reminder_stage).toBe(0);
-    expect(row.status).toBe('pending'); // still running low; only the email stopped
+    const row = await db.refills.findById(refillId);
+    expect(row!.reminder_stage).toBe(0);
+    expect(row!.status).toBe('pending'); // still running low; only the email stopped
   });
 
   it('restores a cancelled cadence where it left off', async () => {
@@ -184,25 +196,23 @@ suite('GET /reminders/upcoming + cancel', () => {
   });
 
   it('lists a WF3 re-engagement step and cancels it by lead id', async () => {
-    const lead = await pool.query<{ id: string }>(
-      `INSERT INTO leads (source, email, status, created_at) VALUES ('web', $1, 'new', now()) RETURNING id`,
-      ['lead.upcoming@test.com'],
-    );
-    leadIds.push(lead.rows[0].id);
+    const lead = await seedLead(db, { source: 'web', email: 'lead.upcoming@test.com', status: 'new' });
 
-    const listed = (await upcoming()).reminders.find((r) => r.source_id === lead.rows[0].id);
+    const listed = (await upcoming()).reminders.find((r) => r.source_id === lead.id);
     expect(listed?.kind).toBe('reengagement');
     expect(listed?.detail).toBe('Re-engagement · welcome note');
 
-    const res = await fetch(`${base}/reminders/reengagement/${lead.rows[0].id}/cancel`, { method: 'POST' });
+    const res = await fetch(`${base}/reminders/reengagement/${lead.id}/cancel`, { method: 'POST' });
     expect(res.status).toBe(200);
-    expect((await upcoming()).reminders.some((r) => r.source_id === lead.rows[0].id)).toBe(false);
+    expect((await upcoming()).reminders.some((r) => r.source_id === lead.id)).toBe(false);
   });
 
-  it('rejects an unknown kind and a non-uuid id', async () => {
+  it('rejects an unknown kind and an id that matches nothing', async () => {
     const bogus = await fetch(`${base}/reminders/newsletter/00000000-0000-0000-0000-000000000000/cancel`, { method: 'POST' });
     expect(bogus.status).toBe(404);
-    const badId = await fetch(`${base}/reminders/refill/not-a-uuid/cancel`, { method: 'POST' });
-    expect(badId.status).toBe(404);
+    // Ids are document ids now, not uuids (see isDocId) - so this 404s because
+    // no such refill exists, which is the behaviour that actually matters.
+    const missing = await fetch(`${base}/reminders/refill/no-such-refill/cancel`, { method: 'POST' });
+    expect(missing.status).toBe(404);
   });
 });

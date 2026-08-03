@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logError } from '../observability/logger';
 import { recentActivity } from '../audit/log';
 
@@ -10,31 +10,39 @@ export const dashboardRouter = Router();
 
 dashboardRouter.get('/overview', async (_req, res) => {
   try {
-    const [stats, auditRows, upcoming] = await Promise.all([
-      pool.query(
-        `SELECT
-           (SELECT count(*) FROM appointments a
-             WHERE EXISTS (SELECT 1 FROM appointment_sheets s
-                            WHERE s.appointment_id = a.id AND s.status IN ('draft','in_review'))
-                OR EXISTS (SELECT 1 FROM protocols p
-                            WHERE p.appointment_id = a.id AND p.status IN ('draft','in_review'))) AS awaiting_review,
-           (SELECT count(*) FROM conversations WHERE appointment_id IS NULL)              AS unmatched,
-           (SELECT count(*) FROM appointments  WHERE starts_at > now())                   AS upcoming,
-           (SELECT count(*) FROM approvals     WHERE approved_at::date = now()::date)     AS approved_today,
-           (SELECT count(*) FROM refills
-             WHERE status IN ('pending','notified','snoozed'))                            AS refills_due,
-           (SELECT count(*) FROM leads   WHERE status IN ('new','contacted','nurturing')) AS leads_active,
-           (SELECT count(*) FROM checkout WHERE status NOT IN ('CLOSED','CHARGE_FAILED')) AS checkouts_awaiting`,
-      ),
+    const db = getDatabase();
+    const now = new Date();
+    const nowIso = now.toISOString();
+    // `approved_at::date = now()::date` was a LOCAL-day comparison in pg. Kept
+    // as a half-open range from local midnight so the tile still means "today",
+    // not "the last 24 hours".
+    const midnight = new Date(now);
+    midnight.setHours(0, 0, 0, 0);
+    const sinceIso = midnight.toISOString();
+
+    // Seven count() aggregations — each reads zero documents, where the pg
+    // version scanned seven tables. They are independent, so they go in
+    // parallel alongside the activity feed and the upcoming list.
+    const [
+      awaitingReview,
+      unmatched,
+      upcomingCount,
+      approvedToday,
+      refillsDue,
+      leadsActive,
+      checkoutsAwaiting,
+      auditRows,
+      upcoming,
+    ] = await Promise.all([
+      db.sessionNotes.countAwaitingReview(),
+      db.conversations.countUnmatched(),
+      db.appointments.countUpcoming(nowIso),
+      db.sessionNotes.countApprovalsSince(sinceIso),
+      db.refills.countByStatuses(['pending', 'notified', 'snoozed']),
+      db.reengagement.countLeadsByStatuses(['new', 'contacted', 'nurturing']),
+      db.checkouts.countAwaiting(),
       recentActivity(12),
-      pool.query(
-        `SELECT a.starts_at, a.status, c.name AS client_name
-           FROM appointments a
-      LEFT JOIN clients c ON c.id = a.client_id
-          WHERE a.starts_at > now()
-       ORDER BY a.starts_at ASC
-          LIMIT 8`,
-      ),
+      db.appointments.listUpcoming(nowIso, 8),
     ]);
 
     const activity = auditRows.map((r) => ({
@@ -44,9 +52,22 @@ dashboardRouter.get('/overview', async (_req, res) => {
     }));
 
     res.json({
-      stats: stats.rows[0],
+      stats: {
+        awaiting_review: awaitingReview,
+        unmatched,
+        upcoming: upcomingCount,
+        approved_today: approvedToday,
+        refills_due: refillsDue,
+        leads_active: leadsActive,
+        checkouts_awaiting: checkoutsAwaiting,
+      },
       recent_activity: activity,
-      upcoming: upcoming.rows,
+      // `LEFT JOIN clients` becomes the denormalized client_name (§3.4).
+      upcoming: upcoming.map((a) => ({
+        starts_at: a.starts_at,
+        status: a.status,
+        client_name: a.client_name ?? null,
+      })),
     });
   } catch (err) {
     logError('dashboard.overview', 'overview query failed', err);

@@ -61,15 +61,21 @@ export class MockClientsRepository implements IClientsRepository {
     const localId = this.pbIndex.get(pbIndexDocId(pbId));
     return localId ? (this.clients.get(localId) ?? null) : null;
   }
-  async upsertByPbId(pbId: string, fields: { name: string }): Promise<Client> {
+  async upsertByPbId(pbId: string, fields: { name: string; email?: string | null }): Promise<Client> {
     const key = pbIndexDocId(pbId);
     const now = new Date().toISOString();
     const existingId = this.pbIndex.get(key);
     const existing = existingId ? this.clients.get(existingId) : undefined;
     if (existing) {
-      // Name only — a PB session embed carries nothing else, and writing the
-      // whole record would clear the email and Drive ids other paths filled in.
-      const updated = { ...existing, name: fields.name, updated_at: now };
+      // Name, plus the email only when one was supplied — a PB session embed
+      // carries nothing else, and writing the whole record would clear the
+      // email and Drive ids other paths filled in.
+      const updated = {
+        ...existing,
+        name: fields.name,
+        email: fields.email ? fields.email.toLowerCase() : existing.email,
+        updated_at: now,
+      };
       this.clients.set(updated.id, updated);
       return updated;
     }
@@ -77,7 +83,7 @@ export class MockClientsRepository implements IClientsRepository {
     const client: Client = {
       id,
       name: fields.name,
-      email: '',
+      email: fields.email ? fields.email.toLowerCase() : '',
       pb_id: pbId,
       created_at: now,
       updated_at: now,
@@ -160,6 +166,15 @@ export class MockAppointmentsRepository implements IAppointmentsRepository {
       .sort((a, b) => b.starts_at.localeCompare(a.starts_at))
       .slice(0, limit);
   }
+  async countUpcoming(nowIso: string): Promise<number> {
+    return Array.from(this.appointments.values()).filter((a) => a.starts_at > nowIso).length;
+  }
+  async listUpcoming(nowIso: string, limit: number): Promise<Appointment[]> {
+    return Array.from(this.appointments.values())
+      .filter((a) => a.starts_at > nowIso)
+      .sort((a, b) => a.starts_at.localeCompare(b.starts_at))
+      .slice(0, limit);
+  }
   async listBetween(fromIso: string, toIso: string): Promise<Appointment[]> {
     return Array.from(this.appointments.values())
       .filter((a) => a.starts_at >= fromIso && a.starts_at < toIso)
@@ -213,6 +228,11 @@ export class MockConversationsRepository implements IConversationsRepository {
   }
   async listAll(): Promise<Conversation[]> {
     return Array.from(this.conversations.values());
+  }
+  async countUnmatched(): Promise<number> {
+    return Array.from(this.conversations.values()).filter(
+      (c) => c.correlation_status === 'unmatched',
+    ).length;
   }
   async save(conversation: Conversation): Promise<Conversation> {
     this.conversations.set(conversation.id, conversation);
@@ -378,10 +398,29 @@ export class MockSessionNotesRepository implements ISessionNotesRepository {
       .filter((a) => a.appointment_id === appointmentId)
       .sort((a, b) => b.created_at.localeCompare(a.created_at));
   }
+  async deleteApproval(id: string): Promise<void> {
+    this.approvals = this.approvals.filter((a) => a.id !== id);
+  }
   async listRevisions(sourceTable: NoteTable, sourceId: string): Promise<NoteRevision[]> {
     return this.revisions
       .filter((r) => r.source_table === sourceTable && r.source_id === sourceId)
       .sort((a, b) => b.revision - a.revision);
+  }
+
+  async countAwaitingReview(): Promise<number> {
+    // Mirrors the Firestore aggregation: the larger of the two pending counts,
+    // so a session holding both a sheet and a protocol is counted once.
+    const pending: DocStatus[] = ['draft', 'in_review'];
+    const sheets = Array.from(this.sheets.values()).filter((s) =>
+      pending.includes(s.status),
+    ).length;
+    const protocols = Array.from(this.protocols.values()).filter((p) =>
+      pending.includes(p.status),
+    ).length;
+    return Math.max(sheets, protocols);
+  }
+  async countApprovalsSince(sinceIso: string): Promise<number> {
+    return this.approvals.filter((a) => (a.approved_at ?? '') >= sinceIso).length;
   }
 
   async savePbProtocol(protocol: PbProtocol): Promise<PbProtocol> {
@@ -614,6 +653,11 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
   async listByClient(clientId: string): Promise<Checkout[]> {
     return Array.from(this.checkouts.values()).filter((c) => c.client_id === clientId);
   }
+  async countAwaiting(): Promise<number> {
+    return Array.from(this.checkouts.values()).filter(
+      (c) => c.status !== 'CLOSED' && c.status !== 'CHARGE_FAILED',
+    ).length;
+  }
   async save(checkout: Checkout): Promise<Checkout> {
     this.checkouts.set(checkout.id, checkout);
     return checkout;
@@ -746,6 +790,30 @@ export class MockCheckoutsRepository implements ICheckoutsRepository {
   async listPendingReconciliations(): Promise<PaymentReconciliation[]> {
     return Array.from(this.reconciliations.values()).filter((r) => r.status === 'PENDING');
   }
+  async listReconciliations(status?: string | null): Promise<PaymentReconciliation[]> {
+    return Array.from(this.reconciliations.values())
+      .filter((r) => !status || r.status === status)
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }
+  async retryReconciliation(id: string): Promise<PaymentReconciliation | null> {
+    const row = this.reconciliations.get(id);
+    if (!row) return null;
+    if (row.status !== 'FAILED' && row.status !== 'NEEDS_REVIEW') return null;
+    const now = new Date().toISOString();
+    const next: PaymentReconciliation = {
+      ...row,
+      status: 'PENDING',
+      attempts: 0,
+      next_attempt_at: now,
+      updated_at: now,
+    };
+    this.reconciliations.set(id, next);
+    return next;
+  }
+  async deleteCheckout(id: string): Promise<void> {
+    this.reconciliations.delete(id);
+    this.checkouts.delete(id);
+  }
   async saveQboMap(map: ClientQboMap): Promise<ClientQboMap> {
     this.qboMaps.set(map.client_id, map);
     return map;
@@ -812,11 +880,28 @@ export class MockRefillsRepository implements IRefillsRepository {
       .sort((a, b) => a.due_date.localeCompare(b.due_date));
     return limit ? rows.slice(0, limit) : rows;
   }
+  async listByStatuses(statuses: RefillStatus[]): Promise<Refill[]> {
+    if (statuses.length === 0) return [];
+    return Array.from(this.refills.values())
+      .filter((r) => statuses.includes(r.status))
+      .sort((a, b) => (a.due_date ?? '').localeCompare(b.due_date ?? ''));
+  }
+  async countByStatuses(statuses: RefillStatus[]): Promise<number> {
+    if (statuses.length === 0) return 0;
+    return Array.from(this.refills.values()).filter((r) => statuses.includes(r.status)).length;
+  }
+  async findSupplementById(id: string): Promise<Supplement | null> {
+    return this.supplements.get(id) ?? null;
+  }
   async listByStatus(status: RefillStatus): Promise<Refill[]> {
     return Array.from(this.refills.values()).filter((r) => r.status === status);
   }
   async findById(id: string): Promise<Refill | null> {
     return this.refills.get(id) ?? null;
+  }
+  async deleteRefill(id: string): Promise<void> {
+    this.orders = this.orders.filter((o) => o.refill_id !== id);
+    this.refills.delete(id);
   }
   async findRefillBySupplement(supplementId: string): Promise<Refill | null> {
     for (const r of this.refills.values()) {
@@ -857,6 +942,10 @@ export class MockReengagementRepository implements IReengagementRepository {
     }
     return null;
   }
+  async countLeadsByStatuses(statuses: string[]): Promise<number> {
+    if (statuses.length === 0) return 0;
+    return Array.from(this.leads.values()).filter((l) => statuses.includes(l.status)).length;
+  }
   async listLeadsByStatus(status: string): Promise<Lead[]> {
     return Array.from(this.leads.values()).filter((l) => l.status === status);
   }
@@ -868,6 +957,33 @@ export class MockReengagementRepository implements IReengagementRepository {
   async saveLead(lead: Lead): Promise<Lead> {
     this.leads.set(lead.id, lead);
     return lead;
+  }
+  async claimLeadForBooking(
+    leadId: string,
+  ): Promise<{ lead: Lead; previousStatus: string } | null> {
+    const stored = this.leads.get(leadId);
+    if (!stored) return null;
+    if (stored.status === 'closed' || stored.status === 'booked') return null;
+    const next: Lead = { ...stored, status: 'booked', updated_at: new Date().toISOString() };
+    this.leads.set(leadId, next);
+    return { lead: next, previousStatus: stored.status };
+  }
+  async releaseLeadBookingClaim(leadId: string, previousStatus: string): Promise<void> {
+    const stored = this.leads.get(leadId);
+    if (!stored || stored.status !== 'booked') return;
+    this.leads.set(leadId, {
+      ...stored,
+      status: previousStatus,
+      updated_at: new Date().toISOString(),
+    });
+  }
+  async markLeadReplied(leadId: string, activity: LeadActivity): Promise<Lead | null> {
+    const stored = this.leads.get(leadId);
+    if (!stored) return null;
+    const next: Lead = { ...stored, status: 'replied', updated_at: new Date().toISOString() };
+    this.leads.set(leadId, next);
+    this.activities.push(activity);
+    return next;
   }
   async logActivity(activity: LeadActivity): Promise<LeadActivity> {
     this.activities.push(activity);
@@ -883,6 +999,31 @@ export class MockReengagementRepository implements IReengagementRepository {
       .filter((a) => a.occurred_at >= since)
       .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at))
       .slice(0, limit);
+  }
+  async listActivityFeed(limit: number): Promise<LeadActivity[]> {
+    return this.activities
+      .slice()
+      .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at))
+      .slice(0, limit);
+  }
+  async summarizeActivity(
+    leadIds: string[],
+  ): Promise<Map<string, { count: number; last_activity: string | null }>> {
+    const out = new Map<string, { count: number; last_activity: string | null }>();
+    for (const leadId of leadIds) {
+      const mine = this.activities.filter((a) => a.lead_id === leadId);
+      const last = mine.reduce<string | null>(
+        (acc, a) => (acc === null || a.occurred_at > acc ? a.occurred_at : acc),
+        null,
+      );
+      out.set(leadId, { count: mine.length, last_activity: last });
+    }
+    return out;
+  }
+  async deleteLead(id: string): Promise<void> {
+    this.activities = this.activities.filter((a) => a.lead_id !== id);
+    this.messages = this.messages.filter((m) => m.lead_id !== id);
+    this.leads.delete(id);
   }
   async logMessage(message: MessageRecord): Promise<MessageRecord> {
     // Same `messages_one_recipient` check the Firestore adapter applies — a mock

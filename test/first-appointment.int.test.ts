@@ -1,17 +1,22 @@
-import { describe, it, expect, afterAll, beforeAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient, seedAppointment } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { enrollFirstAppointmentClients } from '../src/reengagement/firstAppointment';
 import { runReengagementForLead } from '../src/reengagement/runner';
 
-// Integration: WF3 first-appointment conversion — identify one-and-done clients
-// and enroll them. Skips when DB is down. 'ftest-' pb_id namespace avoids the
-// 'it-%' bulk cleanup in correlation.int.test.ts.
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-
-const suite = dbUp ? describe : describe.skip;
+// Integration: WF3 first-appointment conversion - identify one-and-done clients
+// and enroll them. Emulator-gated.
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[first-appointment.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
 const ONE = 'one-ftest@example.test'; // eligible: exactly one session, 30d ago, no rebooking
 const TWO = 'two-ftest@example.test'; // ineligible: two sessions (maintenance territory)
@@ -19,33 +24,30 @@ const REBOOKED = 'rebooked-ftest@example.test'; // ineligible: one session but h
 const FRESH = 'fresh-ftest@example.test'; // ineligible: session was yesterday (within the wait window)
 
 suite('first-appointment conversion (integration)', () => {
-  const emails = [ONE, TWO, REBOOKED, FRESH];
-  const cleanup = async () => {
-    await pool.query(`DELETE FROM leads WHERE lower(email) = ANY($1)`, [emails]).catch(() => {});
-    await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'ftest-%'`).catch(() => {});
-    await pool.query(`DELETE FROM clients WHERE pb_id LIKE 'ftest-%'`).catch(() => {});
-  };
+  let db: IDatabase;
+
+  beforeAll(() => {
+    db = installFirestore('first-appointment-int');
+  });
+  afterAll(() => uninstallFirestore());
+  beforeEach(async () => {
+    await clearFirestore(db);
+  });
 
   async function client(sfx: string, email: string): Promise<string> {
-    const r = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id, email) VALUES ($1, $2, $3) RETURNING id`,
-      [`F ${sfx}`, `ftest-client-${sfx}`, email],
-    );
-    return r.rows[0].id;
+    const c = await seedClient(db, { name: `F ${sfx}`, pb_id: `ftest-client-${sfx}`, email });
+    return c.id;
   }
   async function appt(clientId: string, sfx: string, daysFromNow: number, status: string): Promise<void> {
-    await pool.query(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-            VALUES ($1, $2, now() + ($3 || ' days')::interval, now() + ($3 || ' days')::interval + interval '1 hour', $4)`,
-      [clientId, `ftest-appt-${sfx}`, String(daysFromNow), status],
-    );
+    const startsAt = new Date(Date.now() + daysFromNow * 86_400_000).toISOString();
+    await seedAppointment(db, {
+      client_id: clientId,
+      pb_id: `ftest-appt-${sfx}`,
+      starts_at: startsAt,
+      ends_at: new Date(Date.parse(startsAt) + 3_600_000).toISOString(),
+      status,
+    });
   }
-
-  beforeAll(cleanup);
-  afterAll(async () => {
-    await cleanup();
-    await pool.end();
-  });
 
   it('enrolls only one-and-done clients; excludes 2-session, rebooked, and too-fresh; idempotent', async () => {
     const oneId = await client('one', ONE);
@@ -53,7 +55,7 @@ suite('first-appointment conversion (integration)', () => {
 
     const twoId = await client('two', TWO);
     await appt(twoId, 'two-1', -60, 'completed');
-    await appt(twoId, 'two-2', -30, 'completed'); // two sessions → not first-appt
+    await appt(twoId, 'two-2', -30, 'completed'); // two sessions -> not first-appt
 
     const rebookedId = await client('rebooked', REBOOKED);
     await appt(rebookedId, 'rebooked-1', -30, 'completed');
@@ -65,39 +67,24 @@ suite('first-appointment conversion (integration)', () => {
     const r1 = await enrollFirstAppointmentClients();
     expect(r1.enrolled).toBeGreaterThanOrEqual(1);
 
-    const rows = await pool.query<{ email: string; status: string; source: string }>(
-      `SELECT email, status, source FROM leads WHERE lower(email) = ANY($1)`,
-      [emails],
-    );
-    const byEmail = new Map(rows.rows.map((x) => [x.email, x]));
-    expect(byEmail.get(ONE)).toMatchObject({ status: 'first_appointment', source: 'first_appointment' });
-    expect(byEmail.has(TWO)).toBe(false);
-    expect(byEmail.has(REBOOKED)).toBe(false);
-    expect(byEmail.has(FRESH)).toBe(false);
+    const leadFor = async (email: string) => (await db.reengagement.listLeadsByEmail(email))[0] ?? null;
+    expect(await leadFor(ONE)).toMatchObject({ status: 'first_appointment', source: 'first_appointment' });
+    expect(await leadFor(TWO)).toBeNull();
+    expect(await leadFor(REBOOKED)).toBeNull();
+    expect(await leadFor(FRESH)).toBeNull();
 
     // The cadence sends the 7-day nudge at day 8, then the 14-day incentive.
-    const lead = await pool.query<{ id: string }>(`SELECT id FROM leads WHERE lower(email) = lower($1)`, [ONE]);
-    const leadId = lead.rows[0].id;
+    const leadId = (await leadFor(ONE))!.id;
     expect(await runReengagementForLead(leadId, new Date(Date.now() + 8 * 86_400_000))).toBe('sent');
     expect(await runReengagementForLead(leadId, new Date(Date.now() + 15 * 86_400_000))).toBe('sent');
-    const sent = await pool.query<{ sequence_state: { sent?: string[] }; status: string }>(
-      `SELECT sequence_state, status FROM leads WHERE id = $1`,
-      [leadId],
-    );
-    expect(sent.rows[0].sequence_state.sent).toEqual(
+    const sent = await db.reengagement.findLeadById(leadId);
+    expect(sent!.sequence_state.sent).toEqual(
       expect.arrayContaining(['first_appt_7d', 'first_appt_14d']),
     );
-    expect(sent.rows[0].status).toBe('first_appointment'); // stays on track
+    expect(sent!.status).toBe('first_appointment'); // stays on track
 
     // Idempotent: re-running enrolls nobody new.
     await enrollFirstAppointmentClients();
-    const n = await pool.query<{ n: number }>(
-      `SELECT count(*)::int n FROM leads WHERE lower(email) = lower($1)`,
-      [ONE],
-    );
-    expect(n.rows[0].n).toBe(1);
-    // Heavy: 8 inserts + an enroll + two cadence passes + an idempotency check.
-    // In isolation it runs in ~3s, but sharing Postgres with the parallel suite
-    // it can brush the default 5s. A wider ceiling keeps it from flaking there.
+    expect(await db.reengagement.listLeadsByEmail(ONE)).toHaveLength(1);
   }, 15_000);
 });

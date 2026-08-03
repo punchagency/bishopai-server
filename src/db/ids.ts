@@ -102,3 +102,27 @@ export function encodeIdSegment(raw: string): string {
   const safe = raw.replace(/%/g, '%25').replace(/\//g, '%2F');
   return safe === '.' || safe === '..' ? `${safe}%2E` : safe;
 }
+
+/**
+ * Is this string usable as a document id we'd accept off the wire?
+ *
+ * The routes used to gate every `:id` path param with a UUID check, because pg
+ * would raise on an invalid `::uuid` cast. Under Firestore that check became
+ * actively wrong: the deterministic ids this module mints are NOT uuids
+ * (`appt_…`, `client_…`, `${clientId}__${nameKey}`, a Bee id, a PB id), so a
+ * uuid gate 404s every PB-synced appointment's checkout — including the approve
+ * route, which is the one action Nicole has to be able to take.
+ *
+ * So the gate becomes Firestore's own document-id rule, which is what actually
+ * has to hold: non-empty, at most 1500 bytes, no '/', and not '.' or '..'.
+ * Control characters are refused too, since nothing we mint contains one and
+ * they only ever arrive from a malformed request.
+ */
+export function isDocId(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  if (value.length === 0 || Buffer.byteLength(value, 'utf8') > 1500) return false;
+  if (value === '.' || value === '..') return false;
+  if (value.includes('/')) return false;
+  // eslint-disable-next-line no-control-regex
+  return !/[\u0000-\u001f\u007f]/.test(value);
+}

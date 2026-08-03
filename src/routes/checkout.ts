@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { pool } from '../db/pool';
+import { getDatabase } from '../db/index.js';
 import { logError } from '../observability/logger';
 import { approveAndCharge, closeCheckout, detectCheckout, resetFailedCharge } from '../checkout/machine';
 import { reconcileCheckout } from '../checkout/reconcile';
@@ -8,6 +8,7 @@ import { syncCustomerMappings } from '../checkout/customerSync';
 import { setQboCustomerId } from '../checkout/customerMap';
 import { isQuickbooksConfigured } from '../integrations/quickbooks';
 import { recordAudit } from '../audit/log';
+import { isDocId } from '../db/ids.js';
 
 // WF2 dashboard surface: post-session charges awaiting approval, and the unified
 // confirmation. Nicole has two actions — approve the charge, confirm the close —
@@ -15,20 +16,46 @@ import { recordAudit } from '../audit/log';
 // (mounted in server.ts). Charges are dry-run until QuickBooks is configured.
 export const checkoutRouter = Router();
 
-const isUuid = (id: string) => z.uuid().safeParse(id).success;
+// Path ids are Firestore document ids, not uuids — the port mints deterministic
+// ones (`appt_…`, `client_…`, `${clientId}__${nameKey}`). Gating on uuid shape
+// here would 404 every PB-synced record; see isDocId.
+const isUuid = isDocId;
 
 // GET /checkout — checkouts with their frozen summary + status.
 checkoutRouter.get('/', async (_req, res) => {
   try {
-    const r = await pool.query(
-      `SELECT ch.id, ch.status, ch.summary_snapshot, ch.qb_txn_id, ch.updated_at,
-              c.name AS client_name, a.starts_at
-         FROM checkout ch
-    LEFT JOIN clients c ON c.id = ch.client_id
-    LEFT JOIN appointments a ON a.id = ch.appointment_id
-     ORDER BY ch.updated_at DESC`,
-    );
-    res.json({ quickbooks_configured: isQuickbooksConfigured(), checkouts: r.rows });
+    const db = getDatabase();
+    const all = await db.checkouts.listAll();
+    const rows = all.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
+    // Two LEFT JOINs become parallel gets by known ref (§3.4) — one per distinct
+    // client and appointment, deduped so a client with several checkouts is
+    // fetched once.
+    const clientIds = [...new Set(rows.map((c) => c.client_id).filter((id): id is string => !!id))];
+    const appointmentIds = [
+      ...new Set(rows.map((c) => c.appointment_id).filter((id): id is string => !!id)),
+    ];
+    const [clients, appointments] = await Promise.all([
+      Promise.all(clientIds.map(async (id) => [id, await db.clients.findById(id)] as const)),
+      Promise.all(
+        appointmentIds.map(async (id) => [id, await db.appointments.findById(id)] as const),
+      ),
+    ]);
+    const clientById = new Map(clients);
+    const appointmentById = new Map(appointments);
+
+    const checkouts = rows.map((ch) => ({
+      id: ch.id,
+      status: ch.status,
+      summary_snapshot: ch.summary_snapshot ?? null,
+      qb_txn_id: ch.qb_txn_id ?? null,
+      updated_at: ch.updated_at,
+      client_name: ch.client_id ? (clientById.get(ch.client_id)?.name ?? null) : null,
+      starts_at: ch.appointment_id
+        ? (appointmentById.get(ch.appointment_id)?.starts_at ?? null)
+        : null,
+    }));
+    res.json({ quickbooks_configured: isQuickbooksConfigured(), checkouts });
   } catch (err) {
     logError('checkout.list', 'list failed', err);
     res.status(500).json({ error: 'internal error' });
@@ -116,18 +143,50 @@ checkoutRouter.post('/:id/retry-charge', async (req, res) => {
 checkoutRouter.get('/reconciliations', async (req, res) => {
   const status = typeof req.query.status === 'string' ? req.query.status : null;
   try {
-    const r = await pool.query(
-      `SELECT pr.id, pr.checkout_id, pr.status, pr.amount_cents, pr.currency, pr.invoice_id,
-              pr.customer_id, pr.provider_txn_id, pr.accounting_payment_id, pr.attempts,
-              pr.last_error, pr.next_attempt_at, pr.updated_at, c.name AS client_name
-         FROM payment_reconciliation pr
-    LEFT JOIN checkout ch ON ch.id = pr.checkout_id
-    LEFT JOIN clients c ON c.id = ch.client_id
-        WHERE ($1::text IS NULL OR pr.status = $1)
-     ORDER BY pr.updated_at DESC`,
-      [status],
+    const db = getDatabase();
+    const rows = await db.checkouts.listReconciliations(status);
+
+    // `LEFT JOIN checkout … LEFT JOIN clients` — the reconciliation's document
+    // id IS the checkout id, so the first hop is a direct get rather than a
+    // query, and the second is one get per distinct client.
+    const checkouts = new Map(
+      await Promise.all(
+        [...new Set(rows.map((r) => r.checkout_id))].map(
+          async (id) => [id, await db.checkouts.findById(id)] as const,
+        ),
+      ),
     );
-    res.json({ quickbooks_configured: isQuickbooksConfigured(), reconciliations: r.rows });
+    const clientIds = [
+      ...new Set(
+        rows
+          .map((r) => checkouts.get(r.checkout_id)?.client_id)
+          .filter((id): id is string => !!id),
+      ),
+    ];
+    const clientById = new Map(
+      await Promise.all(clientIds.map(async (id) => [id, await db.clients.findById(id)] as const)),
+    );
+
+    const reconciliations = rows.map((r) => {
+      const clientId = checkouts.get(r.checkout_id)?.client_id ?? null;
+      return {
+        id: r.id,
+        checkout_id: r.checkout_id,
+        status: r.status,
+        amount_cents: r.amount_cents,
+        currency: r.currency,
+        invoice_id: r.invoice_id ?? null,
+        customer_id: r.customer_id ?? null,
+        provider_txn_id: r.provider_txn_id ?? null,
+        accounting_payment_id: r.accounting_payment_id ?? null,
+        attempts: r.attempts,
+        last_error: r.last_error ?? null,
+        next_attempt_at: r.next_attempt_at,
+        updated_at: r.updated_at,
+        client_name: clientId ? (clientById.get(clientId)?.name ?? null) : null,
+      };
+    });
+    res.json({ quickbooks_configured: isQuickbooksConfigured(), reconciliations });
   } catch (err) {
     logError('checkout.reconciliations', 'list failed', err);
     res.status(500).json({ error: 'internal error' });
@@ -139,15 +198,17 @@ checkoutRouter.get('/reconciliations', async (req, res) => {
 checkoutRouter.post('/reconciliations/:id/retry', async (req, res) => {
   if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   try {
-    const upd = await pool.query(
-      `UPDATE payment_reconciliation SET status = 'PENDING', next_attempt_at = now(), attempts = 0
-        WHERE id = $1 AND status IN ('FAILED', 'NEEDS_REVIEW') RETURNING checkout_id`,
-      [req.params.id],
-    );
-    if (upd.rowCount === 0) return res.status(409).json({ error: 'not retryable in current status' });
-    await reconcileCheckout(upd.rows[0].checkout_id);
-    const r = await pool.query(`SELECT status, last_error, accounting_payment_id FROM payment_reconciliation WHERE id = $1`, [req.params.id]);
-    return res.json(r.rows[0]);
+    const db = getDatabase();
+    const reset = await db.checkouts.retryReconciliation(req.params.id);
+    if (!reset) return res.status(409).json({ error: 'not retryable in current status' });
+    await reconcileCheckout(reset.checkout_id);
+    // Re-read: reconcileCheckout is what moved it on from PENDING.
+    const after = await db.checkouts.findReconciliationByCheckout(reset.checkout_id);
+    return res.json({
+      status: after?.status ?? null,
+      last_error: after?.last_error ?? null,
+      accounting_payment_id: after?.accounting_payment_id ?? null,
+    });
   } catch (err) {
     logError('checkout.reconciliations', 'retry failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
@@ -159,13 +220,33 @@ checkoutRouter.post('/reconciliations/:id/retry', async (req, res) => {
 // GET /checkout/customer-map — every client with its mapping (unmapped first).
 checkoutRouter.get('/customer-map', async (_req, res) => {
   try {
-    const r = await pool.query(
-      `SELECT c.id AS client_id, c.name AS client_name, c.email, m.qbo_customer_id, m.updated_at
-         FROM clients c
-    LEFT JOIN client_qbo_map m ON m.client_id = c.id
-     ORDER BY (m.qbo_customer_id IS NULL) DESC, c.name`,
-    );
-    res.json({ quickbooks_configured: isQuickbooksConfigured(), clients: r.rows });
+    const db = getDatabase();
+    // Both collections whole, then joined in memory: the mapping table has one
+    // row per client at most, so this is two reads of the same small set rather
+    // than a per-client lookup.
+    const [clients, maps] = await Promise.all([db.clients.listAll(), db.checkouts.listQboMaps()]);
+    const mapByClient = new Map(maps.map((m) => [m.client_id, m]));
+
+    const rows = clients
+      .map((c) => {
+        const map = mapByClient.get(c.id);
+        return {
+          client_id: c.id,
+          client_name: c.name,
+          email: c.email ?? null,
+          qbo_customer_id: map?.qbo_customer_id ?? null,
+          updated_at: map?.updated_at ?? null,
+        };
+      })
+      // `ORDER BY (m.qbo_customer_id IS NULL) DESC, c.name` — unmapped first,
+      // because those are the ones needing Nicole's attention.
+      .sort((a, b) => {
+        const aUnmapped = a.qbo_customer_id === null;
+        const bUnmapped = b.qbo_customer_id === null;
+        if (aUnmapped !== bUnmapped) return aUnmapped ? -1 : 1;
+        return a.client_name.localeCompare(b.client_name);
+      });
+    res.json({ quickbooks_configured: isQuickbooksConfigured(), clients: rows });
   } catch (err) {
     logError('checkout.customer_map', 'list failed', err);
     res.status(500).json({ error: 'internal error' });
@@ -193,8 +274,8 @@ checkoutRouter.put('/customer-map/:clientId', async (req, res) => {
   const parsed = mapSchema.safeParse(req.body ?? {});
   if (!parsed.success) return res.status(400).json({ error: 'invalid payload' });
   try {
-    const exists = await pool.query(`SELECT 1 FROM clients WHERE id = $1`, [req.params.clientId]);
-    if (exists.rowCount === 0) return res.status(404).json({ error: 'client not found' });
+    const exists = await getDatabase().clients.findById(req.params.clientId);
+    if (!exists) return res.status(404).json({ error: 'client not found' });
     await setQboCustomerId(req.params.clientId, parsed.data.qbo_customer_id);
     await recordAudit({ entityType: 'customer_map', entityId: req.params.clientId, action: 'customer_map.set', actor: 'nicole', summary: `Mapped client to QuickBooks customer #${parsed.data.qbo_customer_id}`, metadata: { qbo_customer_id: parsed.data.qbo_customer_id } });
     return res.json({ client_id: req.params.clientId, qbo_customer_id: parsed.data.qbo_customer_id });
@@ -208,7 +289,7 @@ checkoutRouter.put('/customer-map/:clientId', async (req, res) => {
 checkoutRouter.delete('/customer-map/:clientId', async (req, res) => {
   if (!isUuid(req.params.clientId)) return res.status(404).json({ error: 'not found' });
   try {
-    await pool.query(`DELETE FROM client_qbo_map WHERE client_id = $1`, [req.params.clientId]);
+    await getDatabase().checkouts.deleteQboMap(req.params.clientId);
     await recordAudit({ entityType: 'customer_map', entityId: req.params.clientId, action: 'customer_map.cleared', actor: 'nicole', summary: 'Removed the QuickBooks customer mapping' });
     return res.json({ ok: true });
   } catch (err) {

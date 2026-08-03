@@ -21,7 +21,10 @@
 import 'dotenv/config';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
-import { pool } from '../src/db/pool.js';
+import { randomUUID } from 'node:crypto';
+import { getDatabase } from '../src/db/index.js';
+import { supplementDocId } from '../src/db/ids.js';
+import { normalizeSupplementName } from '../src/session/supplementName.js';
 import { ingestConversation } from '../src/conversations/ingest.js';
 import { processConversation } from '../src/session/process.js';
 import { llmConfig } from '../src/llm/config.js';
@@ -57,9 +60,25 @@ const SUPPLEMENTS = [
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function clearDemo(): Promise<void> {
-  await pool.query(`DELETE FROM conversations WHERE bee_id = 'otter-demo-1'`);
-  await pool.query(`DELETE FROM appointments  WHERE pb_id  LIKE 'otter-demo-%'`);
-  await pool.query(`DELETE FROM clients       WHERE name   = $1`, [CLIENT_NAME]);
+  // No FK cascades any more (§7 of firebaseplan.md), so each collection is
+  // cleared explicitly. Local demo script, tiny data set — a scan is fine here.
+  const db = getDatabase();
+  const conv = await db.conversations.findById('otter-demo-1');
+  if (conv) {
+    if (conv.appointment_id) await db.conversations.releaseAppointment(conv.appointment_id);
+    await db.conversations.delete(conv.id);
+  }
+  for (const appt of await db.appointments.listAll()) {
+    if (!appt.pb_id?.startsWith('otter-demo-')) continue;
+    await db.sessionNotes.deleteSessionDocs(appt.id);
+    await db.appointments.delete(appt.id);
+  }
+  for (const client of (await db.clients.listAll()).filter((c) => c.name === CLIENT_NAME)) {
+    for (const supp of await db.refills.listSupplementsByClient(client.id)) {
+      await db.refills.deleteSupplement(client.id, supp.name_key);
+    }
+    await db.clients.delete(client.id);
+  }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -73,35 +92,54 @@ async function main(): Promise<void> {
   console.log('🗑   Cleared previous demo rows');
 
   // 1. Client
-  const { rows: [{ id: clientId }] } = await pool.query<{ id: string }>(
-    `INSERT INTO clients (name, email) VALUES ($1, $2) RETURNING id`,
-    [CLIENT_NAME, CLIENT_EMAIL],
-  );
+  const db = getDatabase();
+  const stamp = new Date().toISOString();
+  const clientId = randomUUID();
+  await db.clients.save({
+    id: clientId,
+    name: CLIENT_NAME,
+    email: CLIENT_EMAIL,
+    created_at: stamp,
+    updated_at: stamp,
+  });
   console.log(`👤  Client created: ${CLIENT_NAME} (${clientId})`);
 
   // 2. Past appointment (completed)
-  const { rows: [{ id: apptId }] } = await pool.query<{ id: string }>(
-    `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-     VALUES ($1, 'otter-demo-past', $2, $3, 'completed') RETURNING id`,
-    [clientId, SESSION_START, SESSION_END],
-  );
+  const { appointment: past } = await db.appointments.upsertByPbId('otter-demo-past', {
+    client_id: clientId,
+    client_name: CLIENT_NAME,
+    starts_at: SESSION_START,
+    ends_at: SESSION_END,
+    status: 'completed',
+  });
+  const apptId = past.id;
   console.log(`📅  Past appointment created (${SESSION_START.slice(0, 10)})`);
 
   // 3. Return / upcoming appointment
-  await pool.query(
-    `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-     VALUES ($1, 'otter-demo-return', $2, $3, 'confirmed')`,
-    [clientId, RETURN_START, RETURN_END],
-  );
+  await db.appointments.upsertByPbId('otter-demo-return', {
+    client_id: clientId,
+    client_name: CLIENT_NAME,
+    starts_at: RETURN_START,
+    ends_at: RETURN_END,
+    status: 'confirmed',
+  });
   console.log(`📅  Return appointment created (${RETURN_START.slice(0, 10)})`);
 
   // 4. Supplements
   for (const s of SUPPLEMENTS) {
-    await pool.query(
-      `INSERT INTO supplements (client_id, name, dose, qty, start_date, source)
-       VALUES ($1, $2, $3, $4, $5, 'notes')`,
-      [clientId, s.name, s.dose, s.qty, new Date(now - 3 * DAY).toISOString().slice(0, 10)],
-    );
+    const nameKey = normalizeSupplementName(s.name) || s.name.trim().toLowerCase();
+    await db.refills.saveSupplement({
+      id: supplementDocId(clientId, nameKey),
+      client_id: clientId,
+      name: s.name,
+      name_key: nameKey,
+      dose: s.dose,
+      qty: s.qty,
+      start_date: new Date(now - 3 * DAY).toISOString().slice(0, 10),
+      source: 'notes',
+      created_at: stamp,
+      updated_at: stamp,
+    });
   }
   console.log(`💊  ${SUPPLEMENTS.length} supplements added`);
 
@@ -121,36 +159,35 @@ async function main(): Promise<void> {
     console.log('✅  Extraction complete — draft sheet + protocol are in the Review Queue');
   } else {
     // If correlation didn't auto-match, manually link it.
-    await pool.query(
-      `UPDATE conversations
-          SET appointment_id = $1, client_id = $2, correlation_status = 'manual'
-        WHERE id = $3`,
-      [apptId, clientId, conversationId],
-    );
+    await db.conversations.claimAppointment({
+      id: apptId,
+      conversation_id: conversationId,
+      claimed_at: new Date().toISOString(),
+    });
+    const stray = await db.conversations.findById(conversationId);
+    await db.conversations.save({
+      ...stray!,
+      appointment_id: apptId,
+      client_id: clientId,
+      correlation_status: 'manual',
+    });
     await processConversation(conversationId);
     console.log('✅  Manually matched + extraction complete — draft sheet + protocol in Review Queue');
   }
 
-  // 6. Summary
-  const counts = await pool.query(`
-    SELECT
-      (SELECT count(*) FROM appointment_sheets WHERE client_id = $1) AS sheets,
-      (SELECT count(*) FROM protocols          WHERE client_id = $1) AS protocols,
-      (SELECT count(*) FROM supplements        WHERE client_id = $1) AS supplements
-  `, [clientId]);
-
-  const c = counts.rows[0];
+  // 6. Summary — the session docs are read by ref off the appointment, which is
+  // what the three-table count becomes now that the id IS the appointment id.
+  const docs = await db.sessionNotes.findSessionDocs(apptId);
+  const supplements = await db.refills.listSupplementsByClient(clientId);
   console.log(`
 ─────────────────────────────────────────
   Client ID  : ${clientId}
-  Sheets     : ${c.sheets}  (status: draft → open Review Queue to approve)
-  Protocols  : ${c.protocols}
-  Supplements: ${c.supplements}
+  Sheets     : ${docs.sheet ? 1 : 0}  (status: draft → open Review Queue to approve)
+  Protocols  : ${docs.protocol ? 1 : 0}
+  Supplements: ${supplements.length}
   Return visit: ${RETURN_START.slice(0, 10)} (click "Prep brief" in Schedule)
 ─────────────────────────────────────────
   `);
-
-  await pool.end();
 }
 
 main().catch((err) => {

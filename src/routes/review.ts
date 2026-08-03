@@ -11,6 +11,7 @@ import { fetchCurrentSupplements, previewSupplementMerge } from '../session/supp
 import { fetchRevisions } from '../session/revisions';
 import { scoreNameMatch, nameSignalRank, overlapSeconds } from '../correlation/nameMatch';
 import { recordAudit } from '../audit/log';
+import { isDocId } from '../db/ids.js';
 import {
   listSessions,
   getSession,
@@ -54,7 +55,10 @@ const amendSchema = z.object({
  * document id is its bee_id (§3.1), which is an external identifier and not a
  * uuid. Leaving the guard on would have 404'd every real recording.
  */
-const isUuid = (id: string) => z.uuid().safeParse(id).success;
+// Path ids are Firestore document ids, not uuids — the port mints deterministic
+// ones (`appt_…`, `client_…`, `${clientId}__${nameKey}`). Gating on uuid shape
+// here would 404 every PB-synced record; see isDocId.
+const isUuid = isDocId;
 
 function fmtDate(v: unknown): string {
   if (!v) return 'n/a';

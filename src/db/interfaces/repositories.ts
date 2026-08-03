@@ -48,7 +48,7 @@ export interface IClientsRepository {
    * which is what stops two concurrent poll ticks creating two client records
    * for one person — a duplicate that would then split their chart in half.
    */
-  upsertByPbId(pbId: string, fields: { name: string }): Promise<Client>;
+  upsertByPbId(pbId: string, fields: { name: string; email?: string | null }): Promise<Client>;
 
   delete(id: string): Promise<void>;
   clearAll(): Promise<void>;
@@ -60,6 +60,10 @@ export interface IAppointmentsRepository {
   listAll(): Promise<Appointment[]>;
   /** Newest first, capped — the working window every listing scans. */
   listRecent(limit: number): Promise<Appointment[]>;
+  /** Bookings still ahead of `nowIso`. A count() aggregation — reads no documents. */
+  countUpcoming(nowIso: string): Promise<number>;
+  /** The next `limit` bookings after `nowIso`, soonest first. */
+  listUpcoming(nowIso: string, limit: number): Promise<Appointment[]>;
   /** Appointments starting inside a window, chronological. */
   listBetween(fromIso: string, toIso: string): Promise<Appointment[]>;
   findByPbId(pbId: string): Promise<Appointment | null>;
@@ -121,6 +125,9 @@ export interface IConversationsRepository {
   listExhaustedExtractions(maxAttempts: number): Promise<Conversation[]>;
   /** `failed` rows whose backoff has elapsed and which are actually processable. */
   listDueExtractions(now: string, maxAttempts: number, limit: number): Promise<Conversation[]>;
+
+  /** Recordings still waiting for a human to place. */
+  countUnmatched(): Promise<number>;
 
   claimAppointment(claim: AppointmentClaim): Promise<boolean>;
   /** Release an appointment claim — an unmatch hands the slot back. */
@@ -190,6 +197,16 @@ export interface ISessionNotesRepository {
 
   saveApproval(approval: Approval): Promise<Approval>;
   listApprovals(appointmentId: string): Promise<Approval[]>;
+  /**
+   * Remove an approval by id.
+   *
+   * Approvals are a sign-off record, so nothing operator-facing deletes one —
+   * this exists for teardown (the demo seed, tests). It matters because approval
+   * ids are DETERMINISTIC (`approval_${checkoutId}_${attempt}`): an approval
+   * left behind by a previous run makes the next approve of the same checkout
+   * fail on ALREADY_EXISTS rather than proceed.
+   */
+  deleteApproval(id: string): Promise<void>;
 
   /** History behind one live row, newest superseded version first. */
   listRevisions(sourceTable: NoteTable, sourceId: string): Promise<NoteRevision[]>;
@@ -201,6 +218,11 @@ export interface ISessionNotesRepository {
    */
   savePbProtocol(protocol: PbProtocol): Promise<PbProtocol>;
   listPbProtocolsByClient(clientId: string): Promise<PbProtocol[]>;
+
+  /** Sessions with at least one document not yet approved. */
+  countAwaitingReview(): Promise<number>;
+  /** Approvals filed at or after `sinceIso` — the "approved today" tile. */
+  countApprovalsSince(sinceIso: string): Promise<number>;
 
   /** Both halves of a session, by known ref — never a scan. */
   findSessionDocs(appointmentId: string): Promise<SessionDocs>;
@@ -285,6 +307,8 @@ export interface ICheckoutsRepository {
   listAll(): Promise<Checkout[]>;
   /** One client's checkouts. Small by construction — a client has a few visits. */
   listByClient(clientId: string): Promise<Checkout[]>;
+  /** Checkouts still needing attention — anything not settled or cleanly failed. */
+  countAwaiting(): Promise<number>;
   save(checkout: Checkout): Promise<Checkout>;
 
   /**
@@ -363,6 +387,16 @@ export interface ICheckoutsRepository {
   saveReconciliation(rec: PaymentReconciliation): Promise<PaymentReconciliation>;
   findReconciliationByCheckout(checkoutId: string): Promise<PaymentReconciliation | null>;
   listPendingReconciliations(): Promise<PaymentReconciliation[]>;
+  /** The whole ledger, newest first; optionally one status (the review queue). */
+  listReconciliations(status?: string | null): Promise<PaymentReconciliation[]>;
+  /**
+   * FAILED/NEEDS_REVIEW → PENDING with the backoff cleared, so Nicole's "retry
+   * now" actually re-drives the row. A compare-and-set, not a blind update: a
+   * row that has since RECORDED must not be dragged back into the queue and
+   * recorded a second time. Returns the reset row, or null if it wasn't in a
+   * retryable status.
+   */
+  retryReconciliation(id: string): Promise<PaymentReconciliation | null>;
   /** Rows due for a reconciliation attempt: backoff elapsed, or lease expired. */
   listDueReconciliations(now: string, leaseCutoff: string): Promise<PaymentReconciliation[]>;
   /** Claim PENDING/FAILED → RECORDING atomically so two workers can't both record. */
@@ -372,6 +406,12 @@ export interface ICheckoutsRepository {
   findQboMapByClient(clientId: string): Promise<ClientQboMap | null>;
   listQboMaps(): Promise<ClientQboMap[]>;
   deleteQboMap(clientId: string): Promise<void>;
+  /**
+   * Remove a checkout with its reconciliation row. Money-path data — this exists
+   * for teardown (the demo seed, tests), NOT for any operator-facing flow: a
+   * charged checkout is a financial record and nothing in the app deletes one.
+   */
+  deleteCheckout(id: string): Promise<void>;
   
   clearAll(): Promise<void>;
 }
@@ -395,8 +435,22 @@ export interface IRefillsRepository {
   listDue(onOrBefore: string, limit?: number): Promise<Refill[]>;
   /** One status's refills — the cadence and digest both scan `pending`. */
   listByStatus(status: RefillStatus): Promise<Refill[]>;
+  /** Several statuses at once, soonest due first — the digest's open set. */
+  listByStatuses(statuses: RefillStatus[]): Promise<Refill[]>;
+  /** How many refills sit in any of these statuses. */
+  countByStatuses(statuses: RefillStatus[]): Promise<number>;
+  /** By document id (`${client_id}__${name_key}`) — the refill's supplement_id. */
+  findSupplementById(id: string): Promise<Supplement | null>;
   findById(id: string): Promise<Refill | null>;
   findRefillBySupplement(supplementId: string): Promise<Refill | null>;
+  /**
+   * Remove a refill and the orders raised against it.
+   *
+   * `refill_orders.refill_id REFERENCES refills ON DELETE CASCADE` is gone with
+   * Postgres (§7), so the cascade is written by hand here rather than left to
+   * each caller to remember.
+   */
+  deleteRefill(id: string): Promise<void>;
   clearAll(): Promise<void>;
 }
 
@@ -406,6 +460,8 @@ export interface IReengagementRepository {
   listActiveLeads(): Promise<Lead[]>;
   /** Leads in one status, e.g. the 'booked' claims the reconcile sweep checks. */
   listLeadsByStatus(status: string): Promise<Lead[]>;
+  /** How many leads sit in any of these statuses. */
+  countLeadsByStatuses(statuses: string[]): Promise<number>;
   findLeadById(id: string): Promise<Lead | null>;
   findLeadByEmail(email: string): Promise<Lead | null>;
   /**
@@ -417,10 +473,41 @@ export interface IReengagementRepository {
    */
   listLeadsByEmail(email: string): Promise<Lead[]>;
   saveLead(lead: Lead): Promise<Lead>;
+  /**
+   * A lead replied: flip the status and file the 'reply' activity together, or
+   * neither. This was a pg `BEGIN … COMMIT` around the two statements, because
+   * a status of 'replied' with no activity row loses the reply itself, and an
+   * activity row against a lead still in a cadence means the automation keeps
+   * emailing someone who already answered. Returns null when the lead is gone.
+   */
+  markLeadReplied(leadId: string, activity: LeadActivity): Promise<Lead | null>;
+  /**
+   * Compare-and-set the lead to 'booked' — the optimistic claim the public
+   * click-to-book flow takes BEFORE calling Practice Better, so no lock is held
+   * across a network call. A concurrent submit for the same lead loses the race
+   * and gets null, which is the whole point: two clicks must not create two
+   * sessions. Returns the status it held before, so a failed booking can put it
+   * back exactly where it was.
+   */
+  claimLeadForBooking(leadId: string): Promise<{ lead: Lead; previousStatus: string } | null>;
+  /** Undo the claim above, but only while we still own it (`status = 'booked'`). */
+  releaseLeadBookingClaim(leadId: string, previousStatus: string): Promise<void>;
   logActivity(activity: LeadActivity): Promise<LeadActivity>;
   listActivities(leadId: string): Promise<LeadActivity[]>;
   /** Activity across all leads since a cutoff, newest first — the engagement view. */
   listRecentActivity(since: string, limit?: number): Promise<LeadActivity[]>;
+  /** The newest `limit` activity rows regardless of age — the live feed. */
+  listActivityFeed(limit: number): Promise<LeadActivity[]>;
+  /**
+   * Per-lead activity count and latest timestamp.
+   *
+   * Replaces the two correlated subqueries on the leads listing. A count()
+   * aggregation plus a `limit(1)` read per lead costs one document read each,
+   * where loading every activity row to count them in JS would be unbounded.
+   */
+  summarizeActivity(
+    leadIds: string[],
+  ): Promise<Map<string, { count: number; last_activity: string | null }>>;
 
   /**
    * Record a sent message. Throws when it is addressed to both a client and a
@@ -429,6 +516,11 @@ export interface IReengagementRepository {
    */
   logMessage(message: MessageRecord): Promise<MessageRecord>;
   listMessagesForLead(leadId: string): Promise<MessageRecord[]>;
+  /**
+   * Remove a lead with its activity and messages — the hand-written replacement
+   * for the two `ON DELETE CASCADE` FKs that pointed at `leads` (§7).
+   */
+  deleteLead(id: string): Promise<void>;
   clearAll(): Promise<void>;
 }
 

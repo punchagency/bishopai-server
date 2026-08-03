@@ -1,5 +1,12 @@
-import { describe, it, expect, afterEach, afterAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClientWithAppointment, seedSessionDocs, seedSupplement } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { recordCheckoutOutcome } from '../src/checkout/docWriteback';
 import { renderAppointmentSheet } from '../src/session/render';
 
@@ -24,47 +31,40 @@ describe('renderAppointmentSheet billing (pure)', () => {
   });
 });
 
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-const suite = dbUp ? describe : describe.skip;
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[checkout-docs.int] Firestore emulator not running — skipping. Start: npm run firestore:emulator');
+}
 
 suite('recordCheckoutOutcome (integration)', () => {
-  const clientIds: string[] = [];
-  afterEach(async () => {
-    for (const id of clientIds.splice(0)) {
-      // appointments.client_id is ON DELETE SET NULL, so dropping the client alone
-      // would strand its appointments as orphans that show up as "(unknown)" in the
-      // cockpit. Delete them first — appointment_sheets cascade off the appointment.
-      await pool.query(`DELETE FROM appointments WHERE client_id = $1`, [id]);
-      await pool.query(`DELETE FROM clients WHERE id = $1`, [id]);
-    }
+  let db: IDatabase;
+
+  beforeAll(() => {
+    db = installFirestore('checkout-docs-int');
   });
-  afterAll(async () => {
-    await pool.end();
+  afterAll(() => uninstallFirestore());
+  beforeEach(async () => {
+    await clearFirestore(db);
   });
 
   it('stamps billing on the sheet and refreshes protocol supplements', async () => {
-    const client = (await pool.query<{ id: string }>(`INSERT INTO clients (name) VALUES ('Docs Test') RETURNING id`)).rows[0].id;
-    clientIds.push(client);
-    const appt = (
-      await pool.query<{ id: string }>(
-        `INSERT INTO appointments (client_id, starts_at, ends_at, status) VALUES ($1, now(), now() + interval '1 hour', 'completed') RETURNING id`,
-        [client],
-      )
-    ).rows[0].id;
-    await pool.query(`INSERT INTO appointment_sheets (appointment_id, client_id, content_json) VALUES ($1, $2, '{}'::jsonb)`, [appt, client]);
-    await pool.query(`INSERT INTO protocols (appointment_id, client_id, content_json) VALUES ($1, $2, '{}'::jsonb)`, [appt, client]);
-    await pool.query(`INSERT INTO supplements (client_id, name, dose, qty) VALUES ($1, 'Magnesium', '2 caps', 60), ($1, 'Zinc', NULL, 30)`, [client]);
+    const { client, appointment } = await seedClientWithAppointment(db, {
+      client: { name: 'Docs Test' },
+      appointment: { status: 'completed' },
+    });
+    await seedSessionDocs(db, { client, appointment });
+    await seedSupplement(db, { client_id: client.id, name: 'Magnesium', dose: '2 caps', qty: 60 });
+    await seedSupplement(db, { client_id: client.id, name: 'Zinc', dose: null, qty: 30 });
 
-    await recordCheckoutOutcome(appt, { status: 'paid', amountCents: 17500, currency: 'USD', qbTxnId: 'EMU1', qbInvoiceId: 'inv-9' });
+    await recordCheckoutOutcome(appointment.id, { status: 'paid', amountCents: 17500, currency: 'USD', qbTxnId: 'EMU1', qbInvoiceId: 'inv-9' });
 
-    const sheet = (await pool.query(`SELECT content_json FROM appointment_sheets WHERE appointment_id = $1`, [appt])).rows[0].content_json;
-    expect(sheet.billing).toMatchObject({ status: 'paid', amount_cents: 17500, qb_txn_id: 'EMU1', qb_invoice_id: 'inv-9' });
+    const sheet = await db.sessionNotes.findSheetByAppointment(appointment.id);
+    expect(sheet!.content_json.billing).toMatchObject({ status: 'paid', amount_cents: 17500, qb_txn_id: 'EMU1', qb_invoice_id: 'inv-9' });
 
-    const proto = (await pool.query(`SELECT content_json FROM protocols WHERE appointment_id = $1`, [appt])).rows[0].content_json;
-    expect(proto.supplements.map((s: { name: string }) => s.name).sort()).toEqual(['Magnesium', 'Zinc']);
-    expect(proto.supplements.find((s: { name: string }) => s.name === 'Magnesium')).toMatchObject({ dose: '2 caps', quantity: 60, change: 'continue' });
+    const proto = await db.sessionNotes.findProtocolByAppointment(appointment.id);
+    const supplements = proto!.content_json.supplements as Array<{ name: string; dose: string | null; quantity: number | null; change: string }>;
+    expect(supplements.map((s) => s.name).sort()).toEqual(['Magnesium', 'Zinc']);
+    expect(supplements.find((s) => s.name === 'Magnesium')).toMatchObject({ dose: '2 caps', quantity: 60, change: 'continue' });
   });
 });

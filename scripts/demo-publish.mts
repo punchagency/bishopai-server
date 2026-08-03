@@ -6,7 +6,6 @@
  * note, so it works whether the protocol is draft or approved.
  */
 import 'dotenv/config';
-import { pool } from '../src/db/pool.js';
 import { publishClientTemplates } from '../src/session/publishTemplates.js';
 import { isDriveConfigured } from '../src/integrations/drive/index.js';
 
@@ -27,7 +26,6 @@ async function main() {
       console.log('FAILED:', err instanceof Error ? err.message : String(err));
     }
   }
-  await pool.end();
 }
 
 main().catch((err) => {

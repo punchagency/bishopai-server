@@ -1,16 +1,22 @@
-import { describe, it, expect, afterAll, beforeAll } from 'vitest';
-import { pool } from '../src/db/pool';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedLead } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { pollInbox } from '../src/reengagement/inboxPoller';
 import type { InboundMessage } from '../src/integrations/outlook';
 
-// Integration: WF3 Outlook inbox poller (reply detection). DB-gated; skips when
-// Postgres is down. Injects a fake message fetcher so no Graph creds are needed.
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
-
-const suite = dbUp ? describe : describe.skip;
+// Integration: WF3 Outlook inbox poller (reply detection). Emulator-gated;
+// injects a fake message fetcher so no Graph creds are needed.
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[inbox-poller.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
+}
 
 const CURSOR_KEY = 'outlook.inbox.cursor';
 const LEAD_EMAIL = 'inbox-reply-it@example.test';
@@ -26,25 +32,30 @@ const msg = (from: string, subject: string, receivedDateTime: string): InboundMe
   receivedDateTime,
 });
 
-suite('inbox poller — reply detection + guarded intake (integration)', () => {
+// These cases build on each other (the cursor advances across them), so this
+// suite seeds ONCE in beforeAll rather than wiping between tests.
+suite('inbox poller - reply detection + guarded intake (integration)', () => {
   let leadId = '';
-  const cleanup = async () => {
-    await pool.query(`DELETE FROM leads WHERE lower(email) = ANY($1)`, [ALL_EMAILS]).catch(() => {});
-    await pool.query(`DELETE FROM integration_state WHERE key = $1`, [CURSOR_KEY]).catch(() => {});
-  };
+  let db: IDatabase;
 
   beforeAll(async () => {
-    await cleanup();
-    const r = await pool.query<{ id: string }>(
-      `INSERT INTO leads (source, email, status, sequence_state) VALUES ('website', $1, 'contacted', '{"sent":["welcome"]}') RETURNING id`,
-      [LEAD_EMAIL],
-    );
-    leadId = r.rows[0].id;
+    db = installFirestore('inbox-poller-int');
+    await clearFirestore(db);
+    const lead = await seedLead(db, {
+      source: 'website',
+      email: LEAD_EMAIL,
+      status: 'contacted',
+      sequence_state: { sent: ['welcome'] },
+    });
+    leadId = lead.id;
+    void ALL_EMAILS;
   });
-  afterAll(async () => {
-    await cleanup();
-    await pool.end();
-  });
+  afterAll(() => uninstallFirestore());
+
+  const leadByEmail = async (email: string) =>
+    (await db.reengagement.listLeadsByEmail(email))[0] ?? null;
+  const replyCount = async (id: string) =>
+    (await db.reengagement.listActivities(id)).filter((a) => a.type === 'reply').length;
 
   it('first run initializes the cursor and processes nothing', async () => {
     // Even if the fetcher would return old mail, first run must not sweep it.
@@ -52,11 +63,8 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     const res = await pollInbox({ fetchMessages, now: () => new Date('2026-07-06T12:00:00Z') });
     expect(res).toEqual({ checked: 0, replied: 0, newLeads: 0 });
 
-    const cur = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [CURSOR_KEY]);
-    expect(cur.rows[0].value).toBe('2026-07-06T12:00:00.000Z');
-
-    const lead = await pool.query<{ status: string }>(`SELECT status FROM leads WHERE id = $1`, [leadId]);
-    expect(lead.rows[0].status).toBe('contacted'); // untouched
+    expect(await db.state.get(CURSOR_KEY)).toBe('2026-07-06T12:00:00.000Z');
+    expect((await db.reengagement.findLeadById(leadId))!.status).toBe('contacted'); // untouched
   });
 
   it('detects a reply, creates a lead from a clean unknown sender, and skips automated mail', async () => {
@@ -73,33 +81,24 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     expect(res).toEqual({ checked: 4, replied: 1, newLeads: 1 });
 
     // Reply: cadence stopped + activity recorded.
-    const lead = await pool.query<{ status: string }>(`SELECT status FROM leads WHERE id = $1`, [leadId]);
-    expect(lead.rows[0].status).toBe('replied');
-    const replyAct = await pool.query<{ detail: string }>(
-      `SELECT detail FROM lead_activity WHERE lead_id = $1 AND type = 'reply'`,
-      [leadId],
-    );
-    expect(replyAct.rowCount).toBe(1);
-    expect(replyAct.rows[0].detail).toContain('Re: your consult');
+    expect((await db.reengagement.findLeadById(leadId))!.status).toBe('replied');
+    const replyActs = (await db.reengagement.listActivities(leadId)).filter((a) => a.type === 'reply');
+    expect(replyActs).toHaveLength(1);
+    expect(replyActs[0].detail).toContain('Re: your consult');
 
     // Intake: new lead created from the clean sender + automated first response.
-    const created = await pool.query<{ status: string; source: string; sequence_state: { sent?: string[] } }>(
-      `SELECT status, source, sequence_state FROM leads WHERE lower(email) = lower($1)`,
-      [NEW_SENDER],
-    );
-    expect(created.rowCount).toBe(1);
-    expect(created.rows[0].source).toBe('outlook');
-    expect(created.rows[0].status).toBe('contacted'); // welcome sent
-    expect(created.rows[0].sequence_state.sent).toContain('welcome');
+    const created = await leadByEmail(NEW_SENDER);
+    expect(created).not.toBeNull();
+    expect(created!.source).toBe('outlook');
+    expect(created!.status).toBe('contacted'); // welcome sent
+    expect(created!.sequence_state.sent).toContain('welcome');
 
     // Guards: no lead created for the no-reply or auto-reply senders.
     for (const skipped of [NOREPLY, OOO]) {
-      const r = await pool.query(`SELECT 1 FROM leads WHERE lower(email) = lower($1)`, [skipped]);
-      expect(r.rowCount, skipped).toBe(0);
+      expect(await leadByEmail(skipped), skipped).toBeNull();
     }
 
-    const cur = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [CURSOR_KEY]);
-    expect(cur.rows[0].value).toBe('2026-07-06T13:50:00Z'); // max received in the batch
+    expect(await db.state.get(CURSOR_KEY)).toBe('2026-07-06T13:50:00Z'); // max received in the batch
   });
 
   it('polls multiple mailboxes with independent cursors and a shared self-guard', async () => {
@@ -108,8 +107,8 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     const c1 = `${CURSOR_KEY}:${BOX1.toLowerCase()}`;
     const c2 = `${CURSOR_KEY}:${BOX2.toLowerCase()}`;
     const STRANGER = 'multi-stranger-it@example.test';
-    await pool.query(`DELETE FROM integration_state WHERE key = ANY($1)`, [[c1, c2]]);
-    await pool.query(`DELETE FROM leads WHERE lower(email) = $1`, [STRANGER]);
+    await db.state.delete(c1);
+    await db.state.delete(c2);
 
     // First run per mailbox: initialize both cursors, sweep nothing.
     const init = await pollInbox({
@@ -119,8 +118,7 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     });
     expect(init).toEqual({ checked: 0, replied: 0, newLeads: 0 });
     for (const k of [c1, c2]) {
-      const cur = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [k]);
-      expect(cur.rows[0].value).toBe('2026-07-08T09:00:00.000Z');
+      expect(await db.state.get(k)).toBe('2026-07-08T09:00:00.000Z');
     }
 
     // Second run: each inbox returns its own mail. A message "from" BOX2 landing
@@ -139,19 +137,18 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     expect(res.newLeads).toBe(1); // one lead for the stranger, not two
     expect(res.checked).toBe(3);
 
-    const created = await pool.query(`SELECT 1 FROM leads WHERE lower(email) = lower($1)`, [STRANGER]);
-    expect(created.rowCount).toBe(1);
-    const self = await pool.query(`SELECT 1 FROM leads WHERE lower(email) = lower($1)`, [BOX2]);
-    expect(self.rowCount, 'our own mailbox must never become a lead').toBe(0);
+    expect(await db.reengagement.listLeadsByEmail(STRANGER)).toHaveLength(1);
+    expect(await leadByEmail(BOX2), 'our own mailbox must never become a lead').toBeNull();
 
     // Cursors advanced independently to each inbox's high-water mark.
-    const cur1 = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [c1]);
-    const cur2 = await pool.query<{ value: string }>(`SELECT value FROM integration_state WHERE key = $1`, [c2]);
-    expect(cur1.rows[0].value).toBe('2026-07-08T10:05:00Z');
-    expect(cur2.rows[0].value).toBe('2026-07-08T11:00:00Z');
+    expect(await db.state.get(c1)).toBe('2026-07-08T10:05:00Z');
+    expect(await db.state.get(c2)).toBe('2026-07-08T11:00:00Z');
 
-    await pool.query(`DELETE FROM leads WHERE lower(email) = $1`, [STRANGER]);
-    await pool.query(`DELETE FROM integration_state WHERE key = ANY($1)`, [[c1, c2]]);
+    for (const lead of await db.reengagement.listLeadsByEmail(STRANGER)) {
+      await db.reengagement.deleteLead(lead.id);
+    }
+    await db.state.delete(c1);
+    await db.state.delete(c2);
   });
 
   it('is idempotent — re-delivered mail from settled leads does nothing', async () => {
@@ -161,18 +158,9 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     ];
     const res = await pollInbox({ fetchMessages });
     expect(res.newLeads).toBe(0); // no duplicate lead / welcome
-    // The re-contacting new sender is now an active lead → treated as a reply.
-    const act = await pool.query<{ n: number }>(
-      `SELECT count(*)::int n FROM lead_activity la JOIN leads l ON l.id = la.lead_id
-        WHERE lower(l.email) = lower($1) AND la.type = 'reply'`,
-      [NEW_SENDER],
-    );
-    expect(act.rows[0].n).toBe(1);
+    // The re-contacting new sender is now an active lead -> treated as a reply.
+    expect(await replyCount((await leadByEmail(NEW_SENDER))!.id)).toBe(1);
     // The already-replied original lead gets no duplicate reply activity.
-    const orig = await pool.query<{ n: number }>(
-      `SELECT count(*)::int n FROM lead_activity WHERE lead_id = $1 AND type = 'reply'`,
-      [leadId],
-    );
-    expect(orig.rows[0].n).toBe(1);
+    expect(await replyCount(leadId)).toBe(1);
   });
 });

@@ -1,6 +1,7 @@
 import { fetchInboxMessages, getOutlookConnection, type InboundMessage } from '../integrations/outlook';
 import { getState, setState } from '../db/state';
-import { pool } from '../db/pool';
+import { randomUUID } from 'node:crypto';
+import { getDatabase } from '../db/index.js';
 import { logEvent, logError } from '../observability/logger';
 import { ingestLead } from './intake';
 import { runReengagementForLead } from './runner';
@@ -109,16 +110,23 @@ export async function pollInbox(opts: PollInboxOptions = {}): Promise<InboxPollR
   let newLeads = 0;
   try {
     const senderEmails = [...latestBySender.keys()];
-    const { rows } = await pool.query<{ id: string; email: string; status: string }>(
-      `SELECT id, lower(email) AS email, status FROM leads WHERE lower(email) = ANY($1::text[])`,
-      [senderEmails],
-    );
+    // `lower(email) = ANY(...)` becomes one indexed lookup per sender. Addresses
+    // are stored lowercased on write, which is what replaces `lower()` — see
+    // listLeadsByEmail. Plural on purpose: one address can have several leads
+    // over time, and the caller distinguishes an active one from a settled one.
+    const db = getDatabase();
     const leadsByEmail = new Map<string, { id: string; status: string }[]>();
-    for (const r of rows) {
-      const list = leadsByEmail.get(r.email) ?? [];
-      list.push({ id: r.id, status: r.status });
-      leadsByEmail.set(r.email, list);
-    }
+    await Promise.all(
+      senderEmails.map(async (email) => {
+        const leads = await db.reengagement.listLeadsByEmail(email);
+        if (leads.length) {
+          leadsByEmail.set(
+            email,
+            leads.map((l) => ({ id: l.id, status: l.status })),
+          );
+        }
+      }),
+    );
 
     for (const [email, msg] of latestBySender) {
       const leads = leadsByEmail.get(email) ?? [];
@@ -183,18 +191,25 @@ export async function pollInbox(opts: PollInboxOptions = {}): Promise<InboxPollR
 /** Mark one active lead replied + record the reply activity, atomically. */
 async function markReplied(leadId: string, msg: InboundMessage): Promise<boolean> {
   const detail = `inbox reply: ${msg.subject || '(no subject)'}`.slice(0, 500);
-  const db = await pool.connect();
+  const now = new Date().toISOString();
   try {
-    await db.query('BEGIN');
-    await db.query(`UPDATE leads SET status = 'replied', last_touch = now() WHERE id = $1`, [leadId]);
-    await db.query(`INSERT INTO lead_activity (lead_id, type, detail) VALUES ($1, 'reply', $2)`, [leadId, detail]);
-    await db.query('COMMIT');
+    const lead = await getDatabase().reengagement.markLeadReplied(leadId, {
+      id: randomUUID(),
+      lead_id: leadId,
+      type: 'reply',
+      path: null,
+      detail,
+      occurred_at: now,
+      created_at: now,
+    });
+    if (!lead) return false;
+    // `last_touch = now()` rode along with the status change in pg. It is not
+    // part of the atomic pair (the cadence only reads it to space sends), so it
+    // is written after rather than widening the transaction.
+    await getDatabase().reengagement.saveLead({ ...lead, last_touch: now });
     return true;
   } catch (err) {
-    await db.query('ROLLBACK');
     logError('inbox.poll', 'failed to mark lead replied', err, { lead_id: leadId });
     return false;
-  } finally {
-    db.release();
   }
 }

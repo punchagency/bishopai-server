@@ -18,7 +18,8 @@ import 'dotenv/config';
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { pool } from '../src/db/pool.js';
+import { randomUUID } from 'node:crypto';
+import { getDatabase } from '../src/db/index.js';
 import { ingestConversation } from '../src/conversations/ingest.js';
 import { processConversation } from '../src/session/process.js';
 import { publishClientTemplates } from '../src/session/publishTemplates.js';
@@ -54,15 +55,20 @@ const CLIENTS: TranscriptClient[] = [
 const DAY = 86_400_000;
 
 async function clearDemo(clientName: string): Promise<void> {
-  await pool.query(
-    `DELETE FROM conversations WHERE client_id IN (SELECT id FROM clients WHERE name = $1)`,
-    [clientName],
-  );
-  await pool.query(
-    `DELETE FROM appointments WHERE client_id IN (SELECT id FROM clients WHERE name = $1)`,
-    [clientName],
-  );
-  await pool.query(`DELETE FROM clients WHERE name = $1`, [clientName]);
+  // Written out because there are no FK cascades any more (§7 of firebaseplan.md).
+  const db = getDatabase();
+  for (const client of (await db.clients.listAll()).filter((c) => c.name === clientName)) {
+    for (const conv of await db.conversations.listAll()) {
+      if (conv.client_id !== client.id) continue;
+      if (conv.appointment_id) await db.conversations.releaseAppointment(conv.appointment_id);
+      await db.conversations.delete(conv.id);
+    }
+    for (const appt of await db.appointments.listByClient(client.id)) {
+      await db.sessionNotes.deleteSessionDocs(appt.id);
+      await db.appointments.delete(appt.id);
+    }
+    await db.clients.delete(client.id);
+  }
 }
 
 async function seedOne(c: TranscriptClient, index: number): Promise<void> {
@@ -77,16 +83,25 @@ async function seedOne(c: TranscriptClient, index: number): Promise<void> {
   const start = new Date(Date.now() - sessionsAgo * DAY);
   const end = new Date(start.getTime() + 45 * 60_000);
 
-  const { rows: [{ id: clientId }] } = await pool.query<{ id: string }>(
-    `INSERT INTO clients (name, email) VALUES ($1, $2) RETURNING id`,
-    [c.clientName, c.email],
-  );
+  const db = getDatabase();
+  const stamp = new Date().toISOString();
+  const clientId = randomUUID();
+  await db.clients.save({
+    id: clientId,
+    name: c.clientName,
+    email: c.email,
+    created_at: stamp,
+    updated_at: stamp,
+  });
 
-  const { rows: [{ id: appointmentId }] } = await pool.query<{ id: string }>(
-    `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-     VALUES ($1, $2, $3, $4, 'completed') RETURNING id`,
-    [clientId, `demo-otter-${clientId}`, start.toISOString(), end.toISOString()],
-  );
+  const { appointment } = await db.appointments.upsertByPbId(`demo-otter-${clientId}`, {
+    client_id: clientId,
+    client_name: c.clientName,
+    starts_at: start.toISOString(),
+    ends_at: end.toISOString(),
+    status: 'completed',
+  });
+  const appointmentId = appointment.id;
 
   const { conversationId, correlation } = await ingestConversation({
     bee_id: `demo-otter-${clientId}`,
@@ -96,28 +111,34 @@ async function seedOne(c: TranscriptClient, index: number): Promise<void> {
   });
 
   if (correlation.status !== 'matched') {
-    await pool.query(
-      `UPDATE conversations SET appointment_id = $1, client_id = $2, correlation_status = 'manual' WHERE id = $3`,
-      [appointmentId, clientId, conversationId],
-    );
+    await db.conversations.claimAppointment({
+      id: appointmentId,
+      conversation_id: conversationId,
+      claimed_at: new Date().toISOString(),
+    });
+    const stray = await db.conversations.findById(conversationId);
+    await db.conversations.save({
+      ...stray!,
+      appointment_id: appointmentId,
+      client_id: clientId,
+      correlation_status: 'manual',
+    });
   }
 
   console.log('Extracting session note (LLM call)…');
   await processConversation(conversationId);
 
-  const { rows: protocolRows } = await pool.query<{ id: string; content_json: unknown }>(
-    `SELECT id, content_json FROM protocols WHERE appointment_id = $1`,
-    [appointmentId],
-  );
-  if (protocolRows.length === 0) {
+  const protocol = await db.sessionNotes.findProtocolByAppointment(appointmentId);
+  if (!protocol) {
     console.log('No protocol was created (extraction may have failed) — skipping publish.');
     return;
   }
-  const protocolId = protocolRows[0].id;
-  console.log('Extracted note:', JSON.stringify(protocolRows[0].content_json, null, 2));
+  const protocolId = protocol.id;
+  console.log('Extracted note:', JSON.stringify(protocol.content_json, null, 2));
 
-  await pool.query(`UPDATE appointment_sheets SET status = 'approved' WHERE appointment_id = $1`, [appointmentId]);
-  await pool.query(`UPDATE protocols SET status = 'approved' WHERE id = $1`, [protocolId]);
+  const sheet = await db.sessionNotes.findSheetByAppointment(appointmentId);
+  if (sheet) await db.sessionNotes.saveSheet({ ...sheet, status: 'approved' });
+  await db.sessionNotes.saveProtocol({ ...protocol, status: 'approved' });
 
   console.log('Publishing client templates (real Drive + local demo folder)…');
   try {
@@ -133,11 +154,30 @@ async function seedOne(c: TranscriptClient, index: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  console.log(`Seeding ${CLIENTS.length} Otter.ai transcripts as demo clients (LLM: ${llmConfig.provider})…`);
-  for (let i = 0; i < CLIENTS.length; i++) {
-    await seedOne(CLIENTS[i], i);
+  // Optional substring filters, so a single client can be re-run after a
+  // transient extraction failure. Re-running all three is not free: on Groq's
+  // free tier a full pass is a meaningful slice of the 100k daily token budget,
+  // and the two that already extracted cleanly would be redone for nothing.
+  // Each client is cleared and rebuilt independently, so this stays idempotent.
+  //
+  //   node --import tsx scripts/seed-otter-transcripts.mts "Client 3"
+  const filters = process.argv.slice(2);
+  const selected = CLIENTS.map((c, i) => ({ c, i })).filter(
+    ({ c }) => filters.length === 0 || filters.some((f) => c.clientName.includes(f)),
+  );
+  if (selected.length === 0) {
+    console.error(`No transcript matched ${JSON.stringify(filters)}. Known clients:`);
+    for (const c of CLIENTS) console.error(`  ${c.clientName}`);
+    process.exit(1);
   }
-  await pool.end();
+
+  console.log(`Seeding ${selected.length} Otter.ai transcript(s) as demo clients (LLM: ${llmConfig.provider})…`);
+  // The original index is passed through, not the position in the filtered list,
+  // so a client keeps the same session date whether it is seeded alone or with
+  // the others — otherwise a re-run would silently move its appointment.
+  for (const { c, i } of selected) {
+    await seedOne(c, i);
+  }
   console.log('\nDone.');
 }
 

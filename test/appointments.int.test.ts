@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
-import { pool } from '../src/db/pool';
+import { randomUUID } from 'node:crypto';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedLead } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { deriveAvailableSlots, isSlotOfferable, type OfficeHours, type UpcomingSession } from '../src/routes/appointments';
 
 const mockListSessions = vi.fn();
@@ -20,11 +28,9 @@ vi.mock('../src/integrations/pb/reads', () => ({
 // - The HTTP endpoint is tested via the real Express app mounted on an
 //   ephemeral port (same pattern as routes.integration.test.ts).
 
-let dbUp = true;
-try {
-  await pool.query('SELECT 1');
-} catch {
-  dbUp = false;
+const up = await emulatorUp();
+if (!up) {
+  console.log('[appointments.int] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
 }
 
 // Default OfficeHours used for unit tests (UTC avoids any server-TZ surprises)
@@ -175,16 +181,18 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app';
 
-describe.skipIf(!dbUp)('appointments route (integration)', () => {
+describe.skipIf(!up)('appointments route (integration)', () => {
   let server: http.Server;
   let base = '';
-  // office_hours is a single global row; tests here mutate it. Capture it up
+  let db: IDatabase;
+  // office_hours is a single state key; tests here mutate it. Capture it up
   // front and put it back at the end so a customized config can't leak into
-  // other suites sharing this database.
+  // other tests in this file.
   let originalOfficeHours: OfficeHours | null = null;
 
   beforeAll(async () => {
-    await pool.query('INSERT INTO auth_config (id, enabled) VALUES (true, false) ON CONFLICT DO NOTHING');
+    db = installFirestore('appointments-int');
+    await clearFirestore(db);
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -200,6 +208,7 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
       }).catch(() => {});
     }
     await new Promise<void>((r) => server.close(() => r()));
+    uninstallFirestore();
   });
 
   const get = (path: string) => fetch(`${base}${path}`);
@@ -291,17 +300,29 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
      * cockpit renders as an "(unknown)" session. Matching on client_id (rather than a
      * pb_id prefix) also catches appointments whose id pattern we don't control.
      */
+    // Booking a lead provisions a client + an appointment; both go, along with
+    // the lead and its activity. There are no FK cascades any more (§7), so the
+    // teardown is written out rather than implied by deleting the client.
     const clearBookingFixtures = async (): Promise<void> => {
-      await pool.query(
-        `DELETE FROM appointments
-          WHERE pb_id LIKE 'pb-session-%'
-             OR pb_id LIKE 'dry-session-%'
-             OR client_id IN (SELECT id FROM clients WHERE email = 'test-lead@example.com')`,
-      );
-      await pool.query(`DELETE FROM lead_activity WHERE lead_id = $1`, [testLeadId]);
-      await pool.query(`DELETE FROM leads WHERE id = $1`, [testLeadId]);
-      await pool.query(`DELETE FROM clients WHERE email = 'test-lead@example.com'`);
+      for (const appt of await db.appointments.listAll()) {
+        if (appt.pb_id?.startsWith('pb-session-') || appt.pb_id?.startsWith('dry-session-')) {
+          await db.appointments.delete(appt.id);
+        }
+      }
+      for (const lead of await db.reengagement.listLeadsByEmail('test-lead@example.com')) {
+        await db.reengagement.deleteLead(lead.id);
+      }
+      const client = await db.clients.findByEmail('test-lead@example.com');
+      if (client) await db.clients.delete(client.id);
     };
+
+    const activeLead = () =>
+      seedLead(db, {
+        id: testLeadId,
+        source: 'website',
+        email: 'test-lead@example.com',
+        status: 'new',
+      });
 
     // Own the office-hours config for this suite rather than inheriting whatever
     // an earlier test left in the global row. Mon–Fri 09:00–17:00 makes the
@@ -334,10 +355,7 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
     });
 
     it('GET /webhooks/appointments/book rejects a hostile / non-date slot without reflecting it', async () => {
-      await pool.query(
-        `INSERT INTO leads (id, source, email, status) VALUES ($1, 'website', 'test-lead@example.com', 'new')`,
-        [testLeadId]
-      );
+      await activeLead();
       const hostile = '"><script>alert(1)</script>';
       const res = await fetch(`${base}/webhooks/appointments/book?leadId=${testLeadId}&slot=${encodeURIComponent(hostile)}`);
       expect(res.status).toBe(400);
@@ -346,10 +364,7 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
     });
 
     it('GET /webhooks/appointments/book renders confirmation page for active lead', async () => {
-      await pool.query(
-        `INSERT INTO leads (id, source, email, status) VALUES ($1, 'website', 'test-lead@example.com', 'new')`,
-        [testLeadId]
-      );
+      await activeLead();
       const res = await fetch(`${base}/webhooks/appointments/book?leadId=${testLeadId}&slot=${testSlot}`);
       expect(res.status).toBe(200);
       const text = await res.text();
@@ -367,14 +382,17 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
       process.env.PB_CLIENT_ID = 'test-id';
       process.env.PB_CLIENT_SECRET = 'test-secret';
       // Setup active lead and activity with name
-      await pool.query(
-        `INSERT INTO leads (id, source, email, status) VALUES ($1, 'website', 'test-lead@example.com', 'new')`,
-        [testLeadId]
-      );
-      await pool.query(
-        `INSERT INTO lead_activity (lead_id, type, detail) VALUES ($1, 'form_submit', 'name: James Bond')`,
-        [testLeadId]
-      );
+      await activeLead();
+      const submittedAt = new Date().toISOString();
+      await db.reengagement.logActivity({
+        id: randomUUID(),
+        lead_id: testLeadId,
+        type: 'form_submit',
+        path: null,
+        detail: 'name: James Bond',
+        occurred_at: submittedAt,
+        created_at: submittedAt,
+      });
 
       // Mock PB responses
       mockCreateClientRecord.mockResolvedValue({ id: 'pb-client-james' });
@@ -395,28 +413,24 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
       expect(text).toContain('Booking Confirmed!');
 
       // Check lead is marked booked
-      const leadCheck = await pool.query(`SELECT status FROM leads WHERE id = $1`, [testLeadId]);
-      expect(leadCheck.rows[0].status).toBe('booked');
+      expect((await db.reengagement.findLeadById(testLeadId))!.status).toBe('booked');
 
       // Check local client created
-      const clientCheck = await pool.query(`SELECT * FROM clients WHERE email = 'test-lead@example.com'`);
-      expect(clientCheck.rowCount).toBe(1);
-      expect(clientCheck.rows[0].pb_id).toBe('pb-client-james');
-      expect(clientCheck.rows[0].name).toBe('James Bond');
+      const client = await db.clients.findByEmail('test-lead@example.com');
+      expect(client).not.toBeNull();
+      expect(client!.pb_id).toBe('pb-client-james');
+      expect(client!.name).toBe('James Bond');
 
-      // Check local appointment created
-      const apptCheck = await pool.query(`SELECT * FROM appointments WHERE pb_id = 'pb-session-james'`);
-      expect(apptCheck.rowCount).toBe(1);
-      expect(new Date(apptCheck.rows[0].starts_at).toISOString()).toBe(testSlot);
-      expect(apptCheck.rows[0].status).toBe('confirmed');
+      // Check local appointment created, findable through the pb index
+      const appt = await db.appointments.findByPbId('pb-session-james');
+      expect(appt).not.toBeNull();
+      expect(new Date(appt!.starts_at).toISOString()).toBe(testSlot);
+      expect(appt!.status).toBe('confirmed');
     });
 
     it('POST books locally with a dry-run id when PB is not configured', async () => {
       // No PB creds set → dry-run path (no PB calls).
-      await pool.query(
-        `INSERT INTO leads (id, source, email, status) VALUES ($1, 'website', 'test-lead@example.com', 'new')`,
-        [testLeadId]
-      );
+      await activeLead();
 
       const res = await fetch(`${base}/webhooks/appointments/book`, {
         method: 'POST',
@@ -432,12 +446,11 @@ describe.skipIf(!dbUp)('appointments route (integration)', () => {
       expect(mockCreateClientRecord).not.toHaveBeenCalled();
 
       // Lead booked + a local appointment recorded with a synthetic id.
-      const leadCheck = await pool.query(`SELECT status FROM leads WHERE id = $1`, [testLeadId]);
-      expect(leadCheck.rows[0].status).toBe('booked');
-      const apptCheck = await pool.query(
-        `SELECT pb_id FROM appointments WHERE pb_id LIKE 'dry-session-%' ORDER BY created_at DESC LIMIT 1`,
+      expect((await db.reengagement.findLeadById(testLeadId))!.status).toBe('booked');
+      const dryRun = (await db.appointments.listAll()).filter((a) =>
+        a.pb_id?.startsWith('dry-session-'),
       );
-      expect(apptCheck.rowCount).toBe(1);
+      expect(dryRun).toHaveLength(1);
     });
   });
 });

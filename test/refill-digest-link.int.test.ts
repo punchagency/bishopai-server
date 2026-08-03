@@ -1,19 +1,27 @@
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { randomUUID } from 'node:crypto';
 import { createApp } from '../src/app';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import { seedClient, seedRefill, seedSupplement } from './fixtures';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { updateAuthConfig } from '../src/auth/service';
 
 // Integration: the refill digest surfaces the persisted Fullscript invitation
-// link (via the lateral join to the latest sent refill_order), so it survives a
-// reload — not just the transient send response. DB-gated.
-const dbUp = await pool
-  .query('SELECT 1')
-  .then(() => true)
-  .catch(() => false);
+// link (the latest 'sent' refill_order for the refill), so it survives a reload
+// — not just the transient send response. Emulator-gated.
+const up = await emulatorUp();
+const suite = up ? describe : describe.skip;
+if (!up) {
+  console.log('[refill-digest-link.int] Firestore emulator not running — skipping. Start: npm run firestore:emulator');
+}
 
-const suite = dbUp ? describe : describe.skip;
 const PB = 'dtest-client';
 const LINK = 'https://api-us-snd.fullscript.io/users/universal/magic_link?redirect_path=xyz';
 
@@ -21,32 +29,45 @@ suite('refill digest — persisted Fullscript link (integration)', () => {
   let server: http.Server;
   let base = '';
   let refillId = '';
-
-  const cleanup = async () => {
-    await pool.query(`DELETE FROM refill_orders WHERE client_id IN (SELECT id FROM clients WHERE pb_id = $1)`, [PB]).catch(() => {});
-    await pool.query(`DELETE FROM clients WHERE pb_id = $1`, [PB]).catch(() => {}); // cascades supplements/refills
-  };
+  let db: IDatabase;
 
   beforeAll(async () => {
+    db = installFirestore('refill-digest-link-int');
+    await clearFirestore(db);
     await updateAuthConfig({ enabled: false });
-    await cleanup();
-    const c = await pool.query<{ id: string }>(`INSERT INTO clients (name, pb_id, email) VALUES ('D Test', $1, 'd@test') RETURNING id`, [PB]);
-    const clientId = c.rows[0].id;
-    const s = await pool.query<{ id: string }>(
-      `INSERT INTO supplements (client_id, name, dose, qty, source) VALUES ($1, 'Magnesium', '2 caps nightly', 60, 'notes') RETURNING id`,
-      [clientId],
-    );
-    const rf = await pool.query<{ id: string }>(
-      `INSERT INTO refills (client_id, supplement_id, due_date, status) VALUES ($1, $2, current_date - 1, 'notified') RETURNING id`,
-      [clientId, s.rows[0].id],
-    );
-    refillId = rf.rows[0].id;
+
+    const client = await seedClient(db, { name: 'D Test', pb_id: PB, email: 'd@test' });
+    const supplement = await seedSupplement(db, {
+      client_id: client.id,
+      name: 'Magnesium',
+      dose: '2 caps nightly',
+      qty: 60,
+    });
+    const refill = await seedRefill(db, {
+      client_id: client.id,
+      client_name: client.name,
+      supplement_id: supplement.id,
+      supplement_name: supplement.name,
+      // Yesterday — overdue, so it is definitely in the open digest.
+      due_date: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10),
+      status: 'notified',
+    });
+    refillId = refill.id;
+
     // A prior successful send persisted the plan link on the refill_order.
-    await pool.query(
-      `INSERT INTO refill_orders (batch_id, client_id, refill_id, supplement_name, status, fullscript_order_id, invitation_url, sent_at)
-            VALUES (gen_random_uuid(), $1, $2, 'Magnesium', 'sent', 'tp_123', $3, now())`,
-      [clientId, refillId, LINK],
-    );
+    const now = new Date().toISOString();
+    await db.refills.saveOrder({
+      id: randomUUID(),
+      batch_id: randomUUID(),
+      client_id: client.id,
+      refill_id: refillId,
+      supplement_name: 'Magnesium',
+      status: 'sent',
+      fullscript_order_id: 'tp_123',
+      invitation_url: LINK,
+      sent_at: now,
+      created_at: now,
+    });
 
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
@@ -54,9 +75,9 @@ suite('refill digest — persisted Fullscript link (integration)', () => {
   });
 
   afterAll(async () => {
-    await cleanup();
+    await clearFirestore(db);
     await new Promise<void>((r) => server.close(() => r()));
-    await pool.end();
+    uninstallFirestore();
   });
 
   it('returns the persisted invitation_url + plan id on a fresh digest read', async () => {

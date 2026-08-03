@@ -24,7 +24,8 @@
  *   PUBLISH=1 npm run seed:journey    # also publish docs (needs Drive creds)
  */
 import 'dotenv/config';
-import { pool } from '../src/db/pool.js';
+import { randomUUID } from 'node:crypto';
+import { getDatabase } from '../src/db/index.js';
 import { ingestConversation } from '../src/conversations/ingest.js';
 import { processConversation } from '../src/session/process.js';
 import { publishClientTemplates } from '../src/session/publishTemplates.js';
@@ -246,20 +247,32 @@ Min-Tran, one tab before bed, for the sleep and the stress load. Recheck in four
   },
 ];
 
+/**
+ * Remove a previous run's client and everything hanging off it.
+ *
+ * There are no FK cascades any more (§7 of firebaseplan.md), so each dependent
+ * collection is cleared by hand. The demo set is tiny and this is a local
+ * script, so listing and filtering in memory is the right trade.
+ */
 async function clearDemo(): Promise<void> {
-  await pool.query(
-    `DELETE FROM conversations WHERE client_id IN (SELECT id FROM clients WHERE name = $1)`,
-    [CLIENT_NAME],
-  );
-  await pool.query(
-    `DELETE FROM supplements WHERE client_id IN (SELECT id FROM clients WHERE name = $1)`,
-    [CLIENT_NAME],
-  );
-  await pool.query(
-    `DELETE FROM appointments WHERE client_id IN (SELECT id FROM clients WHERE name = $1)`,
-    [CLIENT_NAME],
-  );
-  await pool.query(`DELETE FROM clients WHERE name = $1`, [CLIENT_NAME]);
+  const db = getDatabase();
+  const mine = (await db.clients.listAll()).filter((c) => c.name === CLIENT_NAME);
+
+  for (const client of mine) {
+    for (const conv of await db.conversations.listAll()) {
+      if (conv.client_id !== client.id) continue;
+      if (conv.appointment_id) await db.conversations.releaseAppointment(conv.appointment_id);
+      await db.conversations.delete(conv.id);
+    }
+    for (const supp of await db.refills.listSupplementsByClient(client.id)) {
+      await db.refills.deleteSupplement(client.id, supp.name_key);
+    }
+    for (const appt of await db.appointments.listByClient(client.id)) {
+      await db.sessionNotes.deleteSessionDocs(appt.id);
+      await db.appointments.delete(appt.id);
+    }
+    await db.clients.delete(client.id);
+  }
 }
 
 async function seedSession(
@@ -270,11 +283,20 @@ async function seedSession(
   const start = new Date(Date.now() - s.daysAgo * DAY);
   const end = new Date(start.getTime() + 45 * 60_000);
 
-  const { rows: [{ id: appointmentId }] } = await pool.query<{ id: string }>(
-    `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-     VALUES ($1, $2, $3, $4, 'completed') RETURNING id`,
-    [clientId, `demo-journey-${clientId}-${index}`, start.toISOString(), end.toISOString()],
+  const db = getDatabase();
+  const client = (await db.clients.findById(clientId))!;
+  // Through the pb-id upsert so the claim document exists alongside it.
+  const { appointment } = await db.appointments.upsertByPbId(
+    `demo-journey-${clientId}-${index}`,
+    {
+      client_id: clientId,
+      client_name: client.name,
+      starts_at: start.toISOString(),
+      ends_at: end.toISOString(),
+      status: 'completed',
+    },
   );
+  const appointmentId = appointment.id;
 
   const { conversationId, correlation } = await ingestConversation({
     bee_id: `demo-journey-${clientId}-${index}`,
@@ -284,24 +306,30 @@ async function seedSession(
   });
 
   if (correlation.status !== 'matched') {
-    await pool.query(
-      `UPDATE conversations SET appointment_id = $1, client_id = $2, correlation_status = 'manual'
-        WHERE id = $3`,
-      [appointmentId, clientId, conversationId],
-    );
+    // Claim first, then point the recording at the appointment — the same order
+    // the review route uses, so one recording per appointment still holds.
+    await db.conversations.claimAppointment({
+      id: appointmentId,
+      conversation_id: conversationId,
+      claimed_at: new Date().toISOString(),
+    });
+    const conv = await db.conversations.findById(conversationId);
+    await db.conversations.save({
+      ...conv!,
+      appointment_id: appointmentId,
+      client_id: clientId,
+      correlation_status: 'manual',
+    });
   }
 
   await processConversation(conversationId);
 
-  const { rows: protocolRows } = await pool.query<{ id: string; content_json: unknown }>(
-    `SELECT id, content_json FROM protocols WHERE appointment_id = $1`,
-    [appointmentId],
-  );
-  if (protocolRows.length === 0) {
+  const protocol = await db.sessionNotes.findProtocolByAppointment(appointmentId);
+  if (!protocol) {
     console.log(`  ! no protocol produced for "${s.label}" — extraction may have failed`);
     return;
   }
-  const protocolId = protocolRows[0].id;
+  const protocolId = protocol.id;
 
   if (s.draft) {
     console.log(`  · ${s.label} — left as DRAFT (this is the one in the review queue)`);
@@ -311,26 +339,18 @@ async function seedSession(
   // Past sessions are approved, so they count as prior context: the brief and the
   // Flow Sheet comparison both deliberately ignore drafts ("a draft isn't yet
   // Nicole's word"), so seeding them as drafts would leave the panels empty.
-  await pool.query(
-    `UPDATE appointment_sheets SET status = 'approved' WHERE appointment_id = $1`,
-    [appointmentId],
-  );
-  await pool.query(`UPDATE protocols SET status = 'approved' WHERE id = $1`, [protocolId]);
+  const sheet = await db.sessionNotes.findSheetByAppointment(appointmentId);
+  if (sheet) await db.sessionNotes.saveSheet({ ...sheet, status: 'approved' });
+  await db.sessionNotes.saveProtocol({ ...protocol, status: 'approved' });
 
-  // Approving normally runs this inside the approve transaction; do it here so
-  // the running supplement plan accumulates the way it would in real use.
-  const db = await pool.connect();
-  try {
-    const r = await syncClientSupplements(
-      db,
-      clientId,
-      start.toISOString().slice(0, 10),
-      protocolRows[0].content_json,
-    );
-    console.log(`  ✓ ${s.label} — approved (${r.upserted} supplement(s) up, ${r.removed} stopped)`);
-  } finally {
-    db.release();
-  }
+  // Approving normally runs this as part of the approve flow; do it here so the
+  // running supplement plan accumulates the way it would in real use.
+  const r = await syncClientSupplements(
+    clientId,
+    start.toISOString().slice(0, 10),
+    protocol.content_json,
+  );
+  console.log(`  ✓ ${s.label} — approved (${r.upserted} supplement(s) up, ${r.removed} stopped)`);
 
   if (process.env.PUBLISH === '1') {
     try {
@@ -346,10 +366,15 @@ async function main(): Promise<void> {
   console.log(`Seeding "${CLIENT_NAME}" — ${SESSIONS.length} sessions (LLM: ${llmConfig.provider})`);
   await clearDemo();
 
-  const { rows: [{ id: clientId }] } = await pool.query<{ id: string }>(
-    `INSERT INTO clients (name, email) VALUES ($1, $2) RETURNING id`,
-    [CLIENT_NAME, CLIENT_EMAIL],
-  );
+  const now = new Date().toISOString();
+  const clientId = randomUUID();
+  await getDatabase().clients.save({
+    id: clientId,
+    name: CLIENT_NAME,
+    email: CLIENT_EMAIL,
+    created_at: now,
+    updated_at: now,
+  });
 
   // Oldest first, so the supplement plan accumulates in the right order.
   const ordered = [...SESSIONS].sort((a, b) => b.daysAgo - a.daysAgo);
@@ -357,7 +382,6 @@ async function main(): Promise<void> {
     await seedSession(clientId, ordered[i], i);
   }
 
-  await pool.end();
   console.log('\nDone. Open the Review Queue — the newest session is waiting there.');
 }
 

@@ -2,25 +2,32 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app';
-import { pool } from '../src/db/pool';
+import {
+  emulatorUp,
+  installFirestore,
+  uninstallFirestore,
+  clearFirestore,
+} from './firestore';
+import type { IDatabase } from '../src/db/interfaces/repositories';
 import { updateAuthConfig } from '../src/auth/service';
 
-// Integration tests: the real Express app + real Postgres, over an ephemeral
-// port. DB-gated — skipped when Postgres isn't reachable (like the other
-// DB-dependent suites), so `vitest run` still passes with no database.
-let dbUp = true;
-try {
-  await pool.query('SELECT 1');
-} catch {
-  dbUp = false;
+// Integration tests: the real Express app + the Firestore emulator, over an
+// ephemeral port. Emulator-gated, so `vitest run` still passes without one.
+const up = await emulatorUp();
+if (!up) {
+  console.log('[routes.integration] Firestore emulator not running - skipping. Start: npm run firestore:emulator');
 }
 
-describe.skipIf(!dbUp)('routes (integration)', () => {
+describe.skipIf(!up)('routes (integration)', () => {
   let server: http.Server;
   let base = '';
+  let db: IDatabase;
 
   beforeAll(async () => {
-    await pool.query('INSERT INTO auth_config (id, enabled) VALUES (true, false) ON CONFLICT DO NOTHING;');
+    db = installFirestore('routes-integration');
+    await clearFirestore(db);
+    // auth_config is a single document keyed on its own id, so seeding it is
+    // just the write the service already makes - no INSERT ... ON CONFLICT.
     await updateAuthConfig({ enabled: false }); // known state: login off
     server = http.createServer(createApp());
     await new Promise<void>((r) => server.listen(0, r));
@@ -30,6 +37,7 @@ describe.skipIf(!dbUp)('routes (integration)', () => {
   afterAll(async () => {
     await updateAuthConfig({ enabled: false }); // leave login off for the demo
     await new Promise<void>((r) => server.close(() => r()));
+    uninstallFirestore();
   });
 
   const get = (path: string, token?: string) =>

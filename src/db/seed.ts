@@ -5,7 +5,10 @@
 //
 //   npm run seed
 import 'dotenv/config';
-import { pool } from './pool';
+import { randomUUID } from 'node:crypto';
+import { getDatabase } from './index.js';
+import { supplementDocId } from './ids.js';
+import { normalizeSupplementName } from '../session/supplementName';
 import { llmConfig } from '../llm/config';
 import { ingestConversation } from '../conversations/ingest';
 import { processConversation } from '../session/process';
@@ -121,57 +124,145 @@ const CLIENTS: SeedClient[] = [
   },
 ];
 
+/**
+ * Remove everything a prior seed run created, so re-running is safe.
+ *
+ * Two things changed in the port. There are no `ON DELETE CASCADE` FKs any more
+ * (§7), so every dependent collection is cleared explicitly rather than falling
+ * out of deleting the client. And `LIKE 'seed-%'` has no Firestore equivalent
+ * (§3.5): the seed set is small and dev-only, so this lists each collection once
+ * and matches in memory. That is the one place a full scan is the right answer —
+ * it is a local script, not a request path.
+ */
 async function clearSeed(): Promise<void> {
-  // FKs cascade from clients → appointments/supplements/refills/protocols/etc.
-  await pool.query(`DELETE FROM audit_log WHERE entity_id LIKE 'seed-%' OR summary LIKE '%Seed %'`);
-  await pool.query(
-    `DELETE FROM refill_orders WHERE client_id IN (SELECT id FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %')`,
+  const db = getDatabase();
+  const seedEmails = new Set(CLIENTS.map((c) => c.email));
+  const isSeedName = (name: string) => name.startsWith('Seed ') || name.startsWith('SMOKE ');
+
+  const clients = (await db.clients.listAll()).filter((c) => isSeedName(c.name));
+  const clientIds = new Set(clients.map((c) => c.id));
+
+  const appointments = (await db.appointments.listAll()).filter(
+    (a) => a.pb_id?.startsWith('seed-appt-') || (a.client_id && clientIds.has(a.client_id)),
   );
-  await pool.query(`DELETE FROM conversations WHERE bee_id LIKE 'seed-%'`);
-  await pool.query(`DELETE FROM checkout WHERE pb_appointment_id LIKE 'seed-appt-%'`);
-  await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'seed-appt-%'`);
-  await pool.query(`DELETE FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %'`);
+  const appointmentIds = new Set(appointments.map((a) => a.id));
+
+  // Conversations first: unmatching one releases its appointment claim, and the
+  // claim document would otherwise outlive the appointment and block a re-seed.
+  const conversations = (await db.conversations.listAll()).filter((c) =>
+    c.id.startsWith('seed-'),
+  );
+  for (const conv of conversations) {
+    if (conv.appointment_id) await db.conversations.releaseAppointment(conv.appointment_id);
+    await db.conversations.delete(conv.id);
+  }
+
+  for (const appointment of appointments) {
+    // Approvals go too. Their ids are deterministic
+    // (`approval_${checkoutId}_${attempt}`), so one left behind by a previous
+    // run makes the next approve of the same checkout fail on ALREADY_EXISTS
+    // instead of proceeding — a re-seed that silently produces no charge.
+    for (const approval of await db.sessionNotes.listApprovals(appointment.id)) {
+      await db.sessionNotes.deleteApproval(approval.id);
+    }
+    await db.sessionNotes.deleteSessionDocs(appointment.id);
+    await db.appointments.delete(appointment.id);
+  }
+
+  // Checkouts are keyed on the appointment id, so they go with the appointments.
+  const checkouts = (await db.checkouts.listAll()).filter(
+    (c) => c.appointment_id && appointmentIds.has(c.appointment_id),
+  );
+  for (const checkout of checkouts) {
+    for (const approval of await db.checkouts.listApprovalsByCheckout(checkout.id, 100)) {
+      await db.sessionNotes.deleteApproval(approval.id);
+    }
+    await db.checkouts.deleteCheckout(checkout.id);
+  }
+
+  for (const refill of (await db.refills.listAll()).filter((r) => clientIds.has(r.client_id))) {
+    await db.refills.deleteRefill(refill.id);
+  }
+  for (const clientId of clientIds) {
+    for (const supp of await db.refills.listSupplementsByClient(clientId)) {
+      await db.refills.deleteSupplement(clientId, supp.name_key);
+    }
+    for (const task of await db.tasks.listByClient(clientId)) {
+      await db.tasks.delete(task.id);
+    }
+  }
+
+  for (const client of clients) await db.clients.delete(client.id);
+
   // Seed leads, plus any re-engagement leads (maintenance / cancellation) that a
-  // prior seed run generated for a seed client email. Cascades lead_activity + messages.
-  await pool.query(`DELETE FROM leads WHERE source = 'seed' OR email = ANY($1)`, [
-    CLIENTS.map((c) => c.email),
-  ]);
+  // prior seed run generated for a seed client email.
+  const leads = (await db.reengagement.listLeads()).filter(
+    (l) => l.source === 'seed' || (l.email && seedEmails.has(l.email)),
+  );
+  for (const lead of leads) await db.reengagement.deleteLead(lead.id);
+
+  // audit_logs is append-only by contract, so a re-seed adds to the trail rather
+  // than rewriting it. That is the correct behaviour for an audit log — the
+  // entries are true, they just describe an earlier run.
 }
 
 async function main(): Promise<void> {
   console.log(`Seeding demo data (LLM provider: ${llmConfig.provider})…`);
   await clearSeed();
 
+  const db = getDatabase();
   let matched = 0;
   for (const c of CLIENTS) {
-    const clientId = (
-      await pool.query<{ id: string }>(`INSERT INTO clients (name, email) VALUES ($1, $2) RETURNING id`, [c.name, c.email])
-    ).rows[0].id;
+    const now = new Date().toISOString();
+    const clientId = randomUUID();
+    await db.clients.save({
+      id: clientId,
+      name: c.name,
+      email: c.email,
+      created_at: now,
+      updated_at: now,
+    });
 
     // Appointment (1h window).
     const apptStart = c.appointmentOffset;
     const apptEnd = apptStart + 60 * 60 * 1000;
-    // pb_id tagged 'seed-…' so clearSeed can remove appointments across re-runs
-    // (they don't cascade from clients — client_id is ON DELETE SET NULL).
-    await pool.query(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status) VALUES ($1,$2,$3,$4,$5)`,
-      [clientId, `seed-appt-${clientId}`, iso(apptStart), iso(apptEnd), apptStart < 0 ? 'completed' : 'confirmed'],
-    );
+    // pb_id tagged 'seed-…' so clearSeed can find these across re-runs. Written
+    // through upsertByPbId so the pb-index claim document is created with them —
+    // otherwise a later PB sync for the same id would mint a second appointment.
+    await db.appointments.upsertByPbId(`seed-appt-${clientId}`, {
+      client_id: clientId,
+      client_name: c.name,
+      starts_at: iso(apptStart),
+      ends_at: iso(apptEnd),
+      status: apptStart < 0 ? 'completed' : 'confirmed',
+    });
 
     // The booked return visit — what the prep brief is prepared for.
     if (c.returnOffset !== undefined) {
-      await pool.query(
-        `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status) VALUES ($1,$2,$3,$4,'confirmed')`,
-        [clientId, `seed-appt-return-${clientId}`, iso(c.returnOffset), iso(c.returnOffset + 60 * 60 * 1000)],
-      );
+      await db.appointments.upsertByPbId(`seed-appt-return-${clientId}`, {
+        client_id: clientId,
+        client_name: c.name,
+        starts_at: iso(c.returnOffset),
+        ends_at: iso(c.returnOffset + 60 * 60 * 1000),
+        status: 'confirmed',
+      });
     }
 
     // Supplements (drive refill projection).
     for (const s of c.supplements) {
-      await pool.query(
-        `INSERT INTO supplements (client_id, name, dose, qty, start_date, source) VALUES ($1,$2,$3,$4,$5,'notes')`,
-        [clientId, s.name, s.dose, s.qty, dateOnly(s.startOffset)],
-      );
+      const nameKey = normalizeSupplementName(s.name) || s.name.trim().toLowerCase();
+      await db.refills.saveSupplement({
+        id: supplementDocId(clientId, nameKey),
+        client_id: clientId,
+        name: s.name,
+        name_key: nameKey,
+        dose: s.dose,
+        qty: s.qty,
+        start_date: dateOnly(s.startOffset),
+        source: 'notes',
+        created_at: now,
+        updated_at: now,
+      });
     }
 
     // Past appointments get a Bee conversation overlapping the window → matched
@@ -194,40 +285,36 @@ async function main(): Promise<void> {
   // prep brief the moment the app opens — a brief only reads from APPROVED notes, and
   // without this every brief would be empty until someone clicks Approve. Maya and Lena
   // stay in the review queue: they're the two the demo actually approves.
-  const david = await pool.query<{
-    sheet_id: string;
-    client_id: string;
-    appointment_id: string;
-    starts_at: string;
-    content_json: SessionNote;
-  }>(
-    `SELECT s.id AS sheet_id, s.client_id, s.appointment_id, a.starts_at, s.content_json
-       FROM appointment_sheets s
-       JOIN clients c ON c.id = s.client_id
-       JOIN appointments a ON a.id = s.appointment_id
-      WHERE c.name = 'Seed David Osei'`,
-  );
-  if (david.rowCount) {
-    const d = david.rows[0];
-    await pool.query(`UPDATE appointment_sheets SET status = 'approved' WHERE id = $1`, [d.sheet_id]);
-    await createTasksFromNote({
-      clientId: d.client_id,
-      appointmentId: d.appointment_id,
-      sessionDate: new Date(d.starts_at),
-      note: d.content_json,
-    });
+  const seededClients = await db.clients.listAll();
+  const david = seededClients.find((c) => c.name === 'Seed David Osei') ?? null;
+  if (david) {
+    // The three-way join becomes: the client's appointments (indexed), then that
+    // appointment's sheet by known ref.
+    for (const appointment of await db.appointments.listByClient(david.id)) {
+      const sheet = await db.sessionNotes.findSheetByAppointment(appointment.id);
+      if (!sheet) continue;
+      await db.sessionNotes.saveSheet({ ...sheet, status: 'approved' });
+      await createTasksFromNote({
+        clientId: david.id,
+        appointmentId: appointment.id,
+        sessionDate: new Date(appointment.starts_at),
+        note: sheet.content_json as SessionNote,
+      });
+    }
   }
 
   // Give the quiet client a second, older completed session so it reads as an
   // established maintenance-phase client (2+ sessions) rather than a one-visit
   // first-appointment case.
-  const quiet = await pool.query<{ id: string }>(`SELECT id FROM clients WHERE name = 'Seed Quiet Client'`);
-  if (quiet.rowCount) {
-    await pool.query(
-      `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-            VALUES ($1, 'seed-appt-quiet-2', now() - interval '200 days', now() - interval '200 days' + interval '1 hour', 'completed')`,
-      [quiet.rows[0].id],
-    );
+  const quiet = seededClients.find((c) => c.name === 'Seed Quiet Client') ?? null;
+  if (quiet) {
+    await db.appointments.upsertByPbId('seed-appt-quiet-2', {
+      client_id: quiet.id,
+      client_name: quiet.name,
+      starts_at: iso(-200 * DAY),
+      ends_at: iso(-200 * DAY + 60 * 60 * 1000),
+      status: 'completed',
+    });
   }
 
   // --- WF3 leads + site activity (Engagement view) --------------------------
@@ -251,25 +338,32 @@ async function main(): Promise<void> {
       activity: [ { type: 'page_view', path: '/', agoHours: 24 * 160 } ] },
   ];
   for (const l of LEADS) {
-    const leadId = (
-      await pool.query<{ id: string }>(
-        `INSERT INTO leads (source, email, status, sequence_state, last_touch, created_at)
-              VALUES ('seed', $1, $2, $3, $4, $5) RETURNING id`,
-        [
-          l.email,
-          l.status,
-          JSON.stringify({ sent: l.sent }),
-          // last_touch trails the lead's age so a long-cold lead can deactivate.
-          l.sent.length ? iso(-Math.max(1, l.ageDays - 2) * DAY) : null,
-          iso(-l.ageDays * DAY),
-        ],
-      )
-    ).rows[0].id;
+    const leadId = randomUUID();
+    const createdAt = iso(-l.ageDays * DAY);
+    await db.reengagement.saveLead({
+      id: leadId,
+      source: 'seed',
+      // Addresses are stored lowercased — that is what replaces `lower(email)`
+      // in the lookups, so the seed has to honour it too.
+      email: l.email.toLowerCase(),
+      status: l.status,
+      sequence_state: { sent: l.sent },
+      // last_touch trails the lead's age so a long-cold lead can deactivate.
+      last_touch: l.sent.length ? iso(-Math.max(1, l.ageDays - 2) * DAY) : null,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
     for (const a of l.activity) {
-      await pool.query(
-        `INSERT INTO lead_activity (lead_id, type, path, detail, occurred_at) VALUES ($1,$2,$3,$4,$5)`,
-        [leadId, a.type, a.path ?? null, a.detail ?? null, iso(-a.agoHours * 3600 * 1000)],
-      );
+      const occurredAt = iso(-a.agoHours * 3600 * 1000);
+      await db.reengagement.logActivity({
+        id: randomUUID(),
+        lead_id: leadId,
+        type: a.type,
+        path: a.path ?? null,
+        detail: a.detail ?? null,
+        occurred_at: occurredAt,
+        created_at: occurredAt,
+      });
     }
   }
 
@@ -277,12 +371,20 @@ async function main(): Promise<void> {
   // Detect a checkout for each completed (past) appointment; take one all the
   // way through the dry-run charge so the view shows both an awaiting-approval
   // and a closed example.
-  const pastAppts = await pool.query<{ id: string }>(
-    `SELECT a.id FROM appointments a JOIN clients c ON c.id = a.client_id
-      WHERE c.name LIKE 'Seed %' AND a.starts_at < now() ORDER BY a.starts_at`,
-  );
+  const nowIso = new Date().toISOString();
+  const pastAppts = (
+    await Promise.all(
+      seededClients
+        .filter((c) => c.name.startsWith('Seed '))
+        .map((c) => db.appointments.listByClient(c.id)),
+    )
+  )
+    .flat()
+    .filter((a) => a.starts_at < nowIso)
+    .sort((a, b) => a.starts_at.localeCompare(b.starts_at));
+
   let firstCheckoutId: string | null = null;
-  for (const { id } of pastAppts.rows) {
+  for (const { id } of pastAppts) {
     const d = await detectCheckout(id);
     if (d && !firstCheckoutId) firstCheckoutId = d.checkoutId;
   }
@@ -317,18 +419,27 @@ async function main(): Promise<void> {
   const firstAppointment = await enrollFirstAppointmentClients();
   const maintenance = await enrollMaintenanceClients();
 
-  const counts = await pool.query(`
-    SELECT
-      (SELECT count(*) FROM clients            WHERE name LIKE 'Seed %')            AS clients,
-      (SELECT count(*) FROM appointment_sheets WHERE status IN ('draft','in_review')) AS sheets,
-      (SELECT count(*) FROM protocols          WHERE status IN ('draft','in_review')) AS protocols,
-      (SELECT count(*) FROM refills            WHERE due_date IS NOT NULL)          AS refills,
-      (SELECT count(*) FROM conversations      WHERE appointment_id IS NULL)        AS unmatched,
-      (SELECT count(*) FROM leads              WHERE source = 'seed')               AS leads,
-      (SELECT count(*) FROM checkout           WHERE pb_appointment_id LIKE 'seed-appt-%') AS checkouts
-  `);
-  console.log('Seed complete:', { matched, projection, firstAppointment, maintenance, ...counts.rows[0] });
-  await pool.end();
+  // The seven-subquery summary. Two of these are real count() aggregations; the
+  // rest read the small seeded set back, which is the honest way to report what
+  // this script actually created rather than what the whole store holds.
+  const [awaitingReview, unmatchedCount, allRefills, allLeads, allCheckouts, allClients] =
+    await Promise.all([
+      db.sessionNotes.countAwaitingReview(),
+      db.conversations.countUnmatched(),
+      db.refills.listAll(),
+      db.reengagement.listLeads(),
+      db.checkouts.listAll(),
+      db.clients.listAll(),
+    ]);
+  const counts = {
+    clients: allClients.filter((c) => c.name.startsWith('Seed ')).length,
+    awaiting_review: awaitingReview,
+    refills: allRefills.filter((r) => !!r.due_date).length,
+    unmatched: unmatchedCount,
+    leads: allLeads.filter((l) => l.source === 'seed').length,
+    checkouts: allCheckouts.filter((c) => c.pb_appointment_id?.startsWith('seed-appt-')).length,
+  };
+  console.log('Seed complete:', { matched, projection, firstAppointment, maintenance, ...counts });
 }
 
 main().catch((err) => {
