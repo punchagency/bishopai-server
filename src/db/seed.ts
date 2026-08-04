@@ -127,7 +127,7 @@ async function clearSeed(): Promise<void> {
   await pool.query(
     `DELETE FROM refill_orders WHERE client_id IN (SELECT id FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %')`,
   );
-  await pool.query(`DELETE FROM conversations WHERE bee_id LIKE 'seed-%'`);
+  await pool.query(`DELETE FROM conversations WHERE source_id LIKE 'seed-%'`);
   await pool.query(`DELETE FROM checkout WHERE pb_appointment_id LIKE 'seed-appt-%'`);
   await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'seed-appt-%'`);
   await pool.query(`DELETE FROM clients WHERE name LIKE 'Seed %' OR name LIKE 'SMOKE %'`);
@@ -178,7 +178,7 @@ async function main(): Promise<void> {
     // → extraction (mock) → draft sheet + protocol land in the review queue.
     if (apptStart < 0 && c.transcript) {
       const { conversationId, correlation } = await ingestConversation({
-        bee_id: `seed-${clientId}`,
+        source_id: `seed-${clientId}`,
         starts_at: iso(apptStart + 5 * 60 * 1000),
         ends_at: iso(apptEnd - 5 * 60 * 1000),
         transcript: c.transcript,
@@ -293,7 +293,7 @@ async function main(): Promise<void> {
   // A full multi-turn transcript, well past the 240-char list preview, so the
   // detail pane visibly shows the whole recording rather than the same snippet.
   await ingestConversation({
-    bee_id: 'seed-unmatched-1',
+    source_id: 'seed-unmatched-1',
     starts_at: iso(-9 * DAY),
     ends_at: iso(-9 * DAY + 40 * 60 * 1000),
     transcript: [

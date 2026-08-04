@@ -161,7 +161,12 @@ webhooksRouter.post('/bee/conversation', requireWebhookSecret('BEE_WEBHOOK_SECRE
     return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
   }
   try {
-    const { conversationId, correlation } = await ingestConversation(parsed.data);
+    const { bee_id, ...rest } = parsed.data;
+    const { conversationId, correlation } = await ingestConversation({
+      ...rest,
+      source_id: bee_id,
+      source: 'bee',
+    });
     // Extraction runs off the request path so the webhook returns immediately.
     if (correlation.status === 'matched') {
       void processConversation(conversationId).catch((err) =>

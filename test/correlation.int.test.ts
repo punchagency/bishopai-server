@@ -14,7 +14,7 @@ const suite = dbUp ? describe : describe.skip;
 
 suite('correlation (integration, real Postgres)', () => {
   afterAll(async () => {
-    await pool.query(`DELETE FROM conversations WHERE bee_id LIKE 'it-%'`).catch(() => {});
+    await pool.query(`DELETE FROM conversations WHERE source_id LIKE 'it-%'`).catch(() => {});
     await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'it-%'`).catch(() => {});
     await pool.query(`DELETE FROM clients WHERE pb_id LIKE 'it-%'`).catch(() => {});
     await pool.end();
@@ -44,7 +44,7 @@ suite('correlation (integration, real Postgres)', () => {
       '2026-09-01T16:00:00Z',
     );
     const r = await ingestConversation({
-      bee_id: 'it-b1',
+      source_id: 'it-b1',
       starts_at: '2026-09-01T15:05:00Z',
       ends_at: '2026-09-01T15:50:00Z',
     });
@@ -56,7 +56,7 @@ suite('correlation (integration, real Postgres)', () => {
 
   it('holds a non-overlapping conversation as unmatched', async () => {
     const r = await ingestConversation({
-      bee_id: 'it-b2',
+      source_id: 'it-b2',
       starts_at: '2026-10-01T09:00:00Z',
       ends_at: '2026-10-01T10:00:00Z',
     });
@@ -67,7 +67,7 @@ suite('correlation (integration, real Postgres)', () => {
     await seedAppointment('it-a2', 'it-c2', '2026-11-01T15:00:00Z', '2026-11-01T16:00:00Z');
     await seedAppointment('it-a3', 'it-c2', '2026-11-01T15:30:00Z', '2026-11-01T16:30:00Z');
     const r = await ingestConversation({
-      bee_id: 'it-b3',
+      source_id: 'it-b3',
       starts_at: '2026-11-01T15:45:00Z',
       ends_at: '2026-11-01T15:50:00Z',
     });
@@ -84,7 +84,7 @@ suite('correlation (integration, real Postgres)', () => {
     await pool.query(`UPDATE appointments SET status = 'cancelled' WHERE pb_id = 'it-cancel'`);
     void clientId;
     const r = await ingestConversation({
-      bee_id: 'it-b-cancel',
+      source_id: 'it-b-cancel',
       starts_at: '2026-12-01T15:05:00Z',
       ends_at: '2026-12-01T15:50:00Z',
     });
@@ -95,7 +95,7 @@ suite('correlation (integration, real Postgres)', () => {
   it('sends a second overlapping recording to unmatched instead of overwriting the first', async () => {
     await seedAppointment('it-a-taken', 'it-c-taken', '2026-12-02T15:00:00Z', '2026-12-02T16:00:00Z');
     const first = await ingestConversation({
-      bee_id: 'it-b-taken-1',
+      source_id: 'it-b-taken-1',
       starts_at: '2026-12-02T15:00:00Z',
       ends_at: '2026-12-02T15:30:00Z',
     });
@@ -104,21 +104,21 @@ suite('correlation (integration, real Postgres)', () => {
     // A split recording's second chunk overlaps the same booking — but that
     // booking now carries a recording, so this one must NOT silently take it.
     const second = await ingestConversation({
-      bee_id: 'it-b-taken-2',
+      source_id: 'it-b-taken-2',
       starts_at: '2026-12-02T15:30:00Z',
       ends_at: '2026-12-02T15:55:00Z',
     });
     expect(second.correlation).toMatchObject({ status: 'unmatched', reason: 'no_candidates' });
   });
 
-  it('is idempotent on bee_id (re-ingest updates, no duplicate row)', async () => {
+  it('is idempotent on (source, source_id) (re-ingest updates, no duplicate row)', async () => {
     await ingestConversation({
-      bee_id: 'it-b1',
+      source_id: 'it-b1',
       starts_at: '2026-09-01T15:05:00Z',
       ends_at: '2026-09-01T15:50:00Z',
       transcript: 'added on re-ingest',
     });
-    const rows = await pool.query(`SELECT count(*)::int AS n FROM conversations WHERE bee_id = 'it-b1'`);
+    const rows = await pool.query(`SELECT count(*)::int AS n FROM conversations WHERE source_id = 'it-b1'`);
     expect(rows.rows[0].n).toBe(1);
   });
 });

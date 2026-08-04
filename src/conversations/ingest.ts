@@ -1,8 +1,13 @@
 import { pool } from '../db/pool';
 import { correlateConversation, type CorrelationResult } from '../correlation/correlate';
 
+/** Which recorder produced a conversation. Ids are namespaced per source. */
+export type ConversationSource = 'bee' | 'pocket';
+
 export interface ConversationInput {
-  bee_id: string;
+  /** The recorder's own id for this recording (Pocket: `rec_…`). */
+  source_id: string;
+  source?: ConversationSource; // defaults to 'pocket'
   starts_at: string; // ISO 8601
   ends_at: string; // ISO 8601
   transcript?: string | null;
@@ -14,10 +19,11 @@ export interface IngestResult {
 }
 
 /**
- * Single code path for landing a Bee conversation: correlate it to an
- * appointment, then upsert. Used by both the SSE consumer (production) and
- * the webhook stand-in (testing). Idempotent on bee_id so a replayed event
- * or reconnect can't duplicate a conversation.
+ * Single code path for landing a recording: correlate it to an appointment,
+ * then upsert. Used by both the Pocket webhook (production) and the poller
+ * backstop. Idempotent on (source, source_id) so a redelivered webhook, a
+ * poller pass over the same window, or a replayed event can't duplicate a
+ * conversation.
  */
 export async function ingestConversation(input: ConversationInput): Promise<IngestResult> {
   return ingestOnce(input, true);
@@ -37,13 +43,14 @@ async function ingestOnce(input: ConversationInput, retryOnTaken: boolean): Prom
       client_id: string | null;
     }>(
       `INSERT INTO conversations
-              (bee_id, starts_at, ends_at, transcript, appointment_id, client_id, correlation_status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (bee_id) DO UPDATE
+              (source_id, source, starts_at, ends_at, transcript, appointment_id, client_id, correlation_status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (source, source_id) DO UPDATE
             SET transcript = COALESCE(EXCLUDED.transcript, conversations.transcript)
          RETURNING id, appointment_id, client_id`,
       [
-        input.bee_id,
+        input.source_id,
+        input.source ?? 'pocket',
         input.starts_at,
         input.ends_at,
         input.transcript ?? null,

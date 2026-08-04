@@ -54,7 +54,7 @@ suite('session assignment (integration, real Postgres)', () => {
 
   async function makeConversation(transcript: string, s: string, e: string): Promise<string> {
     const r = await pool.query<{ id: string }>(
-      `INSERT INTO conversations (bee_id, starts_at, ends_at, transcript, correlation_status)
+      `INSERT INTO conversations (source_id, starts_at, ends_at, transcript, correlation_status)
        VALUES ($1, $2, $3, $4, 'unmatched') RETURNING id`,
       [`asgn-${Math.random().toString(36).slice(2)}`, s, e, transcript],
     );
@@ -72,7 +72,7 @@ suite('session assignment (integration, real Postgres)', () => {
   afterAll(async () => {
     await pool.query(
       `DELETE FROM conversations WHERE client_id IN
-         (SELECT id FROM clients WHERE pb_id LIKE 'asgn-%') OR bee_id LIKE 'asgn-%'`,
+         (SELECT id FROM clients WHERE pb_id LIKE 'asgn-%') OR source_id LIKE 'asgn-%'`,
     ).catch(() => {});
     for (const t of ['appointment_sheets', 'protocols', 'appointments']) {
       await pool

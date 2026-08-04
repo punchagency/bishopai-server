@@ -84,14 +84,14 @@ reviewRouter.get('/queue', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /review/unmatched — Bee conversations the correlator couldn't tie to an
+// GET /review/unmatched — recordings the correlator couldn't tie to an
 // appointment (no overlap, or ambiguous). These need Nicole to tag manually;
 // we never auto-guess the client. (§8 dashboard, §9 risk 3.)
 // ---------------------------------------------------------------------------
 reviewRouter.get('/unmatched', async (_req, res) => {
   try {
     const r = await pool.query(
-      `SELECT id, bee_id, starts_at, ends_at, correlation_status,
+      `SELECT id, source_id, source, starts_at, ends_at, correlation_status,
               left(coalesce(transcript, ''), 240) AS transcript_preview
          FROM conversations
         WHERE appointment_id IS NULL
@@ -115,7 +115,8 @@ reviewRouter.get('/unmatched/:id', async (req, res) => {
   try {
     const r = await pool.query<{
       id: string;
-      bee_id: string;
+      source_id: string;
+      source: string;
       starts_at: string;
       ends_at: string;
       correlation_status: string;
@@ -123,7 +124,7 @@ reviewRouter.get('/unmatched/:id', async (req, res) => {
       appointment_id: string | null;
       transcript: string | null;
     }>(
-      `SELECT id, bee_id, starts_at, ends_at, correlation_status,
+      `SELECT id, source_id, source, starts_at, ends_at, correlation_status,
               extraction_status, appointment_id, transcript
          FROM conversations
         WHERE id = $1`,
