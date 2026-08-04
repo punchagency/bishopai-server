@@ -14,6 +14,7 @@ import { appointmentsRouter } from './routes/appointments';
 import { tasksRouter } from './routes/tasks';
 import { clientsRouter } from './routes/clients';
 import { remindersRouter } from './routes/reminders';
+import { pocketRouter } from './routes/pocket';
 import { requireAuth } from './auth/middleware';
 
 // Build the Express app (routes + middleware) without listening. server.ts adds
@@ -57,6 +58,7 @@ export function createApp(): express.Express {
   app.use('/tasks', requireAuth, tasksRouter);
   app.use('/clients', requireAuth, clientsRouter);
   app.use('/audit', requireAuth, auditRouter);
+  app.use('/pocket', requireAuth, pocketRouter);
 
   return app;
 }
