@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import type { RequestHandler } from 'express';
 import { logWarn } from '../observability/logger';
+import {
+  verifyPocketSignature,
+  POCKET_SIGNATURE_HEADER,
+  POCKET_TIMESTAMP_HEADER,
+} from '../integrations/pocket/signature';
 
 /**
  * Guard an inbound webhook with a shared secret. The caller (the Electron Bee
@@ -97,6 +102,54 @@ export function requirePbSignature(envName: string): RequestHandler {
 
     if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
       logWarn('webhook.auth', 'rejected: invalid PB-Signature', { path: req.originalUrl });
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    next();
+  };
+}
+
+// Pocket signs deliveries with its own header pair:
+//   X-HeyPocket-Signature  hex HMAC-SHA256 of `${timestamp}.${rawBody}`
+//   X-HeyPocket-Timestamp  unix MILLISECONDS (note: PB uses seconds)
+// The comparison itself lives in integrations/pocket/signature.ts so the
+// poller/self-test can reuse it; this is just the Express seam.
+export function requirePocketSignature(envName: string): RequestHandler {
+  const secret = process.env[envName];
+
+  // Fails open with a one-time warning when unset, matching the guards above:
+  // the offline demo and `npm run seed` must work with zero credentials. The
+  // warning lands in system_events, so an unsigned production is visible.
+  if (!secret) {
+    let warned = false;
+    return (_req, _res, next) => {
+      if (!warned) {
+        warned = true;
+        logWarn('webhook.auth', 'Pocket signing secret not set — Pocket webhook is UNVERIFIED', { env: envName });
+      }
+      next();
+    };
+  }
+
+  return (req, res, next) => {
+    const raw = (req as { rawBody?: Buffer }).rawBody;
+    if (!raw) {
+      // Signing is over the exact bytes received; without them there is nothing
+      // to verify and re-serializing req.body would produce a different digest.
+      logWarn('webhook.auth', 'rejected: Pocket delivery had no raw body to verify', { path: req.originalUrl });
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+
+    const result = verifyPocketSignature({
+      secret,
+      signature: req.get(POCKET_SIGNATURE_HEADER),
+      timestamp: req.get(POCKET_TIMESTAMP_HEADER),
+      rawBody: raw,
+    });
+    if (!result.ok) {
+      logWarn('webhook.auth', 'rejected: invalid Pocket signature', {
+        reason: result.reason,
+        path: req.originalUrl,
+      });
       return res.status(401).json({ error: 'unauthorized' });
     }
     next();

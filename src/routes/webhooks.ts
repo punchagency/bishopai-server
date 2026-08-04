@@ -7,7 +7,9 @@ import { verifyBookingToken } from '../reengagement/bookingToken';
 import { ingestConversation } from '../conversations/ingest';
 import { processConversation } from '../session/process';
 import { logError, logEvent, logWarn } from '../observability/logger';
-import { requireWebhookSecret, requirePbSignature } from './webhookAuth';
+import { requireWebhookSecret, requirePbSignature, requirePocketSignature } from './webhookAuth';
+import { toConversationInput } from '../integrations/pocket/normalize';
+import { TRANSCRIPT_EVENTS, type PocketWebhookPayload } from '../integrations/pocket/types';
 import { classifyPbEvent, appointmentStatusFor } from '../integrations/pb/events';
 import { detectCheckout } from '../checkout/machine';
 import { ingestLead } from '../reengagement/intake';
@@ -176,6 +178,66 @@ webhooksRouter.post('/bee/conversation', requireWebhookSecret('BEE_WEBHOOK_SECRE
     res.status(200).json({ conversation_id: conversationId, correlation });
   } catch (err) {
     await logError('webhook.bee_conversation', 'ingest failed', err, { bee_id: parsed.data.bee_id });
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Pocket recording ingest — THE transcript ingress.
+//
+// Pocket POSTs here when a recording finishes processing. Verified with
+// HMAC-SHA256 over the raw body (X-HeyPocket-Signature / -Timestamp).
+//
+// Two things this deliberately does not do:
+//   • It doesn't 4xx on an event it can't use. Pocket retries 3× on non-2xx and
+//     the delivery guarantee is at-least-once, so returning an error for a
+//     `mind_map.completed` we'll never care about just buys us three copies of
+//     the same useless event. Unusable events are acknowledged and ignored.
+//   • It doesn't act on `recording.created`. That fires before transcription,
+//     so ingesting it would land a conversation with no transcript and burn its
+//     one shot at correlation against an empty body.
+// ---------------------------------------------------------------------------
+webhooksRouter.post('/pocket', requirePocketSignature('POCKET_WEBHOOK_SECRET'), async (req, res) => {
+  const payload = (req.body ?? {}) as PocketWebhookPayload;
+  const event = typeof payload.event === 'string' ? payload.event : 'unknown';
+  const recordingId = payload.recording?.id;
+
+  logEvent('info', 'webhook.pocket', 'Pocket webhook received', { event, recording_id: recordingId });
+
+  if (!TRANSCRIPT_EVENTS.has(event)) {
+    return res.status(200).json({ received: true, ignored: event });
+  }
+
+  // `recording.deleted` is in neither set — Pocket's own retention is the
+  // system of record for audio, but a transcript we've already extracted into a
+  // clinical note is Nicole's record, and a delete over there must not silently
+  // remove it from a client's chart.
+  const input = toConversationInput(payload);
+  if (!input) {
+    // Acknowledged, not retried: a payload with no id or no usable timestamp
+    // won't become valid on redelivery, and the poller will pick the recording
+    // up later if Pocket fills the fields in.
+    logWarn('webhook.pocket', 'unusable payload — no recording id or no time window', {
+      event,
+      recording_id: recordingId,
+    });
+    return res.status(200).json({ received: true, ignored: 'unusable_payload' });
+  }
+
+  try {
+    const { conversationId, correlation } = await ingestConversation(input);
+    // Extraction runs off the request path so the webhook returns inside
+    // Pocket's 30s delivery timeout.
+    if (correlation.status === 'matched') {
+      void processConversation(conversationId).catch((err) =>
+        logError('session.process', 'processing failed', err, { conversation_id: conversationId }),
+      );
+    }
+    res.status(200).json({ conversation_id: conversationId, correlation });
+  } catch (err) {
+    await logError('webhook.pocket', 'ingest failed', err, { recording_id: input.source_id });
+    // A 5xx here is the one case worth Pocket's retry: the payload was fine and
+    // our side failed, so a redelivery has a real chance of succeeding.
     res.status(500).json({ error: 'internal error' });
   }
 });

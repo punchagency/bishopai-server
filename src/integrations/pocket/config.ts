@@ -20,9 +20,10 @@ export interface PocketConfig {
 
 export interface PocketPollConfig {
   enabled: boolean;
-  intervalMs: number;
   /** How far back each sweep looks. Covers a webhook outage of up to this long. */
   lookbackDays: number;
+  /** Bounds a sweep so a bad `has_more` can't page forever. */
+  maxPages: number;
 }
 
 export const POCKET_DEFAULT_BASE_URL = 'https://public.heypocketai.com/api/v1';
@@ -61,8 +62,8 @@ export function pocketPollConfig(): PocketPollConfig {
     // failure mode of the opposite default is silence, which looks like the
     // product being broken.
     enabled: process.env.POCKET_POLL_ENABLED !== 'false' && isPocketConfigured(),
-    intervalMs: positiveInt(process.env.POCKET_POLL_INTERVAL_MS, 10 * 60_000),
     lookbackDays: positiveInt(process.env.POCKET_POLL_LOOKBACK_DAYS, 3),
+    maxPages: positiveInt(process.env.POCKET_POLL_MAX_PAGES, 20),
   };
 }
 
