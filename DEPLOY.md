@@ -26,7 +26,7 @@ handled automatically: `src/db/pool.ts` turns SSL on for any non-localhost URL
 heroku create innerlume-api
 heroku addons:create heroku-postgresql:essential-0     # sets DATABASE_URL
 heroku config:set \
-  BEE_WEBHOOK_SECRET=<random> PB_WEBHOOK_SECRET=<random> \
+  POCKET_API_KEY=pk_... POCKET_WEBHOOK_SECRET=<from Pocket> PB_WEBHOOK_SECRET=<random> \
   SCHEDULER_ENABLED=true
 git push heroku main            # build + `release: migrate:prod` + boot
 ```
@@ -49,7 +49,8 @@ git push heroku main            # build + `release: migrate:prod` + boot
 | Var | Why |
 | --- | --- |
 | `DATABASE_URL` | injected by the PG addon |
-| `BEE_WEBHOOK_SECRET` | must match the desktop app's `innerlume.config.json` |
+| `POCKET_API_KEY` | `pk_…` from the Pocket app — powers the polling backstop |
+| `POCKET_WEBHOOK_SECRET` | shown once when you create the Pocket webhook destination; point it at `https://<host>/webhooks/pocket` |
 | `PB_WEBHOOK_SECRET`, `PB_SIGNING_SECRET` | Practice Better webhooks |
 | `SCHEDULER_ENABLED=true` | run the WF3/WF4 cron jobs on the server |
 | integration keys | all optional — each stays **dry-run** until set (Google Drive, PB REST, Outlook, Fullscript, QuickBooks, LLM) |

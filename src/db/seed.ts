@@ -174,7 +174,7 @@ async function main(): Promise<void> {
       );
     }
 
-    // Past appointments get a Bee conversation overlapping the window → matched
+    // Past appointments get a recording overlapping the window → matched
     // → extraction (mock) → draft sheet + protocol land in the review queue.
     if (apptStart < 0 && c.transcript) {
       const { conversationId, correlation } = await ingestConversation({

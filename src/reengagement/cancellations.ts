@@ -2,7 +2,7 @@ import { pool } from '../db/pool';
 import { logEvent } from '../observability/logger';
 
 // WF3 linkage: a Practice Better cancellation should enroll the client into the
-// cancelled-appointment re-engagement cadence (7d/14d reschedule prompts). Bee↔PB
+// cancelled-appointment re-engagement cadence (7d/14d reschedule prompts). Recording↔PB
 // aside, this is the join from an `appointments` status change to a `leads` row
 // the cadence engine can act on — previously missing, so cancellations updated
 // only the appointment and the cadence could never fire.

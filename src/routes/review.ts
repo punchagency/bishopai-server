@@ -510,7 +510,7 @@ function unmatchOne(table: Table) {
       if (conv.rowCount === 0) {
         return res.status(404).json({
           error: 'no recording',
-          detail: 'This session has no Bee recording attached, so there is nothing to reassign.',
+          detail: 'This session has no recording attached, so there is nothing to reassign.',
         });
       }
       const out = await unmatchByConversation(conv.rows[0].id);
@@ -540,7 +540,7 @@ function getOne(table: Table) {
       // the pairing even while the other is still a draft.
       const apptId = r.rows[0].appointment_id;
       let canUnmatch = false;
-      let blocked: string | null = 'This session has no Bee recording attached.';
+      let blocked: string | null = 'This session has no recording attached.';
       if (apptId) {
         const [conv, approved] = await Promise.all([
           pool.query(`SELECT 1 FROM conversations WHERE appointment_id = $1 LIMIT 1`, [apptId]),
@@ -555,7 +555,7 @@ function getOne(table: Table) {
         if (approved.rowCount) {
           blocked = 'This session has been approved and its documents published. Amend it instead.';
         } else if (conv.rowCount === 0) {
-          blocked = 'This session has no Bee recording attached.';
+          blocked = 'This session has no recording attached.';
         } else {
           canUnmatch = true;
           blocked = null;

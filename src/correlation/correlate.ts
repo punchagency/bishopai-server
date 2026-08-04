@@ -5,7 +5,7 @@ export type CorrelationResult =
   | { status: 'unmatched'; reason: 'no_candidates' | 'ambiguous'; candidateCount: number };
 
 /**
- * The make-or-break join: match a Bee conversation to a PB appointment by
+ * The make-or-break join: match a recording to a PB appointment by
  * overlapping time window. Uses Postgres range overlap (&&) against the
  * appointments time index.
  *
@@ -22,7 +22,7 @@ export async function correlateConversation(
   //   walk-in), and matching their recording to the cancelled client's chart is
   //   exactly the wrong-person error auto-matching must never make;
   // - appointments that already carry a recording: a second overlapping chunk
-  //   (a split Bee recording) must go to a human, not silently overwrite the
+  //   (a split recording) must go to a human, not silently overwrite the
   //   first chunk's extracted note.
   const { rows } = await db.query<{ id: string; client_id: string | null }>(
     `SELECT id, client_id

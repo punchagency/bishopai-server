@@ -145,44 +145,6 @@ webhooksRouter.post('/pb/session', requirePbSignature('PB_SIGNING_SECRET'), asyn
 });
 
 // ---------------------------------------------------------------------------
-// Bee conversation ingest — insert the conversation and correlate it to an
-// appointment. This is the real ingress: the Electron app's Bee courier on
-// Nicole's machine runs the `bee` CLI and POSTs each new conversation here.
-// (Needs a shared-secret/signature check before go-live — open auth gap.)
-// ---------------------------------------------------------------------------
-const conversationSchema = z.object({
-  bee_id: z.string().min(1),
-  starts_at: z.string().datetime(),
-  ends_at: z.string().datetime(),
-  transcript: z.string().optional(),
-});
-
-webhooksRouter.post('/bee/conversation', requireWebhookSecret('BEE_WEBHOOK_SECRET'), async (req, res) => {
-  const parsed = conversationSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
-  }
-  try {
-    const { bee_id, ...rest } = parsed.data;
-    const { conversationId, correlation } = await ingestConversation({
-      ...rest,
-      source_id: bee_id,
-      source: 'bee',
-    });
-    // Extraction runs off the request path so the webhook returns immediately.
-    if (correlation.status === 'matched') {
-      void processConversation(conversationId).catch((err) =>
-        logError('session.process', 'processing failed', err, { conversation_id: conversationId }),
-      );
-    }
-    res.status(200).json({ conversation_id: conversationId, correlation });
-  } catch (err) {
-    await logError('webhook.bee_conversation', 'ingest failed', err, { bee_id: parsed.data.bee_id });
-    res.status(500).json({ error: 'internal error' });
-  }
-});
-
-// ---------------------------------------------------------------------------
 // Pocket recording ingest — THE transcript ingress.
 //
 // Pocket POSTs here when a recording finishes processing. Verified with

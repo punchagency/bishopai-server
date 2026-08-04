@@ -2,7 +2,7 @@
 
 Backend for the Innerlume Healing automation pilot: orchestration (PB native
 webhooks + an in-process scheduler + direct integration clients) plus the two
-hard custom pieces — the **Bee↔PB correlation engine** and the **checkout state
+hard custom pieces — the **recording↔PB correlation engine** and the **checkout state
 machine** — over a Postgres source of truth, serving Nicole's dashboard.
 
 Stack: TypeScript + Express + `pg` (raw SQL, no ORM) + Postgres.
@@ -24,13 +24,14 @@ migrations/            plain .sql files, applied in filename order
 src/
   db/pool.ts           pg Pool + query helper
   db/migrate.ts        migration runner (tracks applied files)
-  correlation/         the Bee↔PB join (time-window overlap, never auto-guesses)
+  correlation/         the recording↔PB join (time-window overlap, never auto-guesses)
   conversations/       shared conversation ingest (correlate + idempotent upsert)
   llm/                 Anthropic client + config (model swappable via ANTHROPIC_MODEL)
   session/             transcript -> structured SessionNote (extract) + Markdown renderer (render)
   routes/review.ts     review queue: list/edit/approve + /render (Sheet & Protocol Markdown)
   observability/       logger — writes errors/warns to console AND system_events
-  routes/              health, webhooks (PB booking, Bee conversation)
+  integrations/pocket/ Pocket API client, webhook signature, polling backstop
+  routes/              health, webhooks (PB booking, Pocket recording)
   server.ts            Express entrypoint
 ```
 
@@ -54,8 +55,9 @@ npm run test:watch
 
 ## Smoke test
 
-If `BEE_WEBHOOK_SECRET` / `PB_WEBHOOK_SECRET` are set, add `-H 'X-Webhook-Secret: <value>'`
-to these calls (they're unset in dev, so the calls below work as-is).
+If `PB_WEBHOOK_SECRET` is set, add `-H 'X-Webhook-Secret: <value>'` to the booking
+call (it's unset in dev, so the calls below work as-is). The Pocket call below is
+unsigned, which the webhook accepts while `POCKET_WEBHOOK_SECRET` is unset.
 
 ```bash
 # land an appointment
@@ -64,9 +66,12 @@ curl -sX POST localhost:3000/webhooks/pb/booking -H 'content-type: application/j
   "starts_at":"2026-07-01T15:00:00Z","ends_at":"2026-07-01T16:00:00Z"
 }'
 
-# a Bee conversation overlapping it -> should correlate as matched
-curl -sX POST localhost:3000/webhooks/bee/conversation -H 'content-type: application/json' -d '{
-  "bee_id":"bee-1","starts_at":"2026-07-01T15:05:00Z","ends_at":"2026-07-01T15:50:00Z"
+# a Pocket recording overlapping it -> should correlate as matched.
+# The window comes from createdAt + duration (seconds), as Pocket sends it.
+curl -sX POST localhost:3000/webhooks/pocket -H 'content-type: application/json' -d '{
+  "event":"summary.completed",
+  "recording":{"id":"rec_1","createdAt":"2026-07-01T15:05:00Z","duration":2700},
+  "transcript":[{"speaker":"Nicole","text":"How have you been sleeping?"}]
 }'
 ```
 
@@ -100,8 +105,9 @@ A matched conversation with a transcript is processed off the request path
   `/review/*/render` Markdown and write the Sheet + Protocol into the client's
   Drive folder via the Google Drive API (pending Google OAuth).
 - PB REST client (`src/integrations/pb/`) + register the webhook subscription.
-- Auth: Nicole login (still open). Inbound webhook shared-secret is done
-  (`requireWebhookSecret` on both webhooks via `BEE_WEBHOOK_SECRET` /
-  `PB_WEBHOOK_SECRET`; unset = accept + warn in dev, enforced when set).
+- Auth: Nicole login (still open). Inbound webhooks are guarded —
+  `requireWebhookSecret` (`PB_WEBHOOK_SECRET`, `LEAD_WEBHOOK_SECRET`, …) and
+  HMAC signatures for PB (`PB_SIGNING_SECRET`) and Pocket
+  (`POCKET_WEBHOOK_SECRET`); unset = accept + warn in dev, enforced when set.
 - Checkout state machine (WF2) once PB REST API access + QB Payments are confirmed.
 # bishopai-server

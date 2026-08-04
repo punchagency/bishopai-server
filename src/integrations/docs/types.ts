@@ -1,5 +1,5 @@
 // Shared shapes for filling Nicole's per-client doc templates after a session.
-// Field values originate from the Bee-transcript → extraction pipeline.
+// Field values originate from the transcript → extraction pipeline.
 //
 // Three doc types, three update models (see integrations/docs/index.ts):
 //   ROF            docx  — fill-once at intake (binary, docxtemplater)

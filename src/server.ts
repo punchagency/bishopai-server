@@ -25,11 +25,11 @@ server.on('error', async (err) => {
   process.exit(1);
 });
 
-// Bee ingest arrives over HTTP at POST /webhooks/bee/conversation. On Nicole's
-// machine the Electron app's Bee courier (main process) runs the `bee` CLI,
-// polls for new conversations, and forwards them here — Bee is E2E-encrypted and
-// only readable on her owner-authenticated device, so there is no stream for the
-// backend to hold. See docs: bee-access-model / electron-client.
+// Transcript ingest is entirely server-side: Pocket POSTs signed deliveries to
+// POST /webhooks/pocket, and the `pocket.poll` scheduler job sweeps the REST API
+// as a backstop. Nothing runs on Nicole's machine for a recording to land — the
+// Electron app is the dashboard only. (This replaced a Bee courier, which had to
+// run on her device because Bee's data was readable only there.)
 
 // --- Graceful shutdown --------------------------------------------------------
 // Single teardown path: stop ingest, drain HTTP, flush logs, close the DB pool.

@@ -8,8 +8,8 @@ import {
 } from '../integrations/pocket/signature';
 
 /**
- * Guard an inbound webhook with a shared secret. The caller (the Electron Bee
- * courier, or Zapier for PB bookings) sends the secret in either
+ * Guard an inbound webhook with a shared secret. The caller (e.g. the website
+ * lead-intake form, or Zapier for PB bookings) sends the secret in either
  * `X-Webhook-Secret` or `Authorization: Bearer <secret>`; we compare it in
  * constant time against the configured value.
  *

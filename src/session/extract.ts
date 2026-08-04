@@ -188,7 +188,7 @@ function chunkLabel(chunk: Chunk): PromptContext['chunk'] {
 }
 
 /**
- * Parse a Bee transcript into a structured session note.
+ * Parse a session transcript into a structured session note.
  *
  * Three focused stages rather than one call doing everything: narrative
  * summarisation and dictated-checklist transcription are different tasks with
