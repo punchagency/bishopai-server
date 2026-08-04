@@ -89,7 +89,7 @@ async function seedOne(c: TranscriptClient, index: number): Promise<void> {
   );
 
   const { conversationId, correlation } = await ingestConversation({
-    bee_id: `demo-otter-${clientId}`,
+    source_id: `demo-otter-${clientId}`,
     starts_at: new Date(start.getTime() + 2 * 60_000).toISOString(),
     ends_at: new Date(end.getTime() - 2 * 60_000).toISOString(),
     transcript,

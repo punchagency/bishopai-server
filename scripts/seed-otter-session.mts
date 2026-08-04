@@ -57,7 +57,7 @@ const SUPPLEMENTS = [
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function clearDemo(): Promise<void> {
-  await pool.query(`DELETE FROM conversations WHERE bee_id = 'otter-demo-1'`);
+  await pool.query(`DELETE FROM conversations WHERE source_id = 'otter-demo-1'`);
   await pool.query(`DELETE FROM appointments  WHERE pb_id  LIKE 'otter-demo-%'`);
   await pool.query(`DELETE FROM clients       WHERE name   = $1`, [CLIENT_NAME]);
 }
@@ -108,7 +108,7 @@ async function main(): Promise<void> {
   // 5. Ingest the Otter transcript as a conversation overlapping the appointment
   console.log('\n⏳  Ingesting transcript + running extraction (this calls the LLM)…\n');
   const { conversationId, correlation } = await ingestConversation({
-    bee_id:     'otter-demo-1',
+    source_id:  'otter-demo-1',
     starts_at:  new Date(new Date(SESSION_START).getTime() + 2 * 60_000).toISOString(),
     ends_at:    new Date(new Date(SESSION_END).getTime()   - 1 * 60_000).toISOString(),
     transcript,

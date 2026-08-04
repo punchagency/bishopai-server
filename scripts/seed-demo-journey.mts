@@ -277,7 +277,7 @@ async function seedSession(
   );
 
   const { conversationId, correlation } = await ingestConversation({
-    bee_id: `demo-journey-${clientId}-${index}`,
+    source_id: `demo-journey-${clientId}-${index}`,
     starts_at: new Date(start.getTime() + 2 * 60_000).toISOString(),
     ends_at: new Date(end.getTime() - 2 * 60_000).toISOString(),
     transcript: s.transcript,
