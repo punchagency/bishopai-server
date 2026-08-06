@@ -1,7 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import crypto from 'node:crypto';
 import type { Request, Response } from 'express';
-import { requireWebhookSecret, requirePbSignature, parsePbSignature } from './webhookAuth';
+import {
+  requireWebhookSecret,
+  requirePbSignature,
+  parsePbSignature,
+  requirePocketSignature,
+} from './webhookAuth';
+import { signPocketPayload } from '../integrations/pocket/signature';
 
 // Minimal Express req/res doubles: `get` reads a header, `status().json()` captures the response.
 function fakeReq(headers: Record<string, string> = {}): Request {
@@ -157,6 +163,98 @@ describe('requirePbSignature', () => {
     const next = vi.fn();
     const res = fakeRes();
     mw(pbReq(undefined, body), res, next);
+    expect(next).toHaveBeenCalledOnce();
+  });
+});
+
+describe('requirePocketSignature', () => {
+  const PK = 'whsec_pocket';
+  const body = Buffer.from(JSON.stringify({ event: 'summary.completed', recording: { id: 'rec_1' } }));
+
+  /** Pocket request double: raw body + the two X-HeyPocket-* headers. */
+  function pocketReq(headers: Record<string, string>, rawBody?: Buffer): Request {
+    const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+    return {
+      get: (name: string) => lower[name.toLowerCase()],
+      originalUrl: '/webhooks/pocket',
+      rawBody,
+    } as unknown as Request;
+  }
+
+  const signed = (ts: string, raw: Buffer = body) =>
+    pocketReq(
+      {
+        'x-heypocket-signature': signPocketPayload(PK, ts, raw.toString('utf8')),
+        'x-heypocket-timestamp': ts,
+      },
+      raw,
+    );
+
+  it('accepts a valid, fresh signature', () => {
+    process.env.POCKET_TEST = PK;
+    const mw = requirePocketSignature('POCKET_TEST');
+    const next = vi.fn();
+    const res = fakeRes();
+    mw(signed(String(Date.now())), res, next);
+    expect(next).toHaveBeenCalledOnce();
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('rejects a tampered body', () => {
+    process.env.POCKET_TEST = PK;
+    const mw = requirePocketSignature('POCKET_TEST');
+    const next = vi.fn();
+    const res = fakeRes();
+    const ts = String(Date.now());
+    // Signature computed over `body`, delivered with different bytes.
+    const req = pocketReq(
+      { 'x-heypocket-signature': signPocketPayload(PK, ts, body.toString('utf8')), 'x-heypocket-timestamp': ts },
+      Buffer.from('{"event":"summary.completed","recording":{"id":"HACKED"}}'),
+    );
+    mw(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('rejects a replayed delivery outside the tolerance', () => {
+    process.env.POCKET_TEST = PK;
+    const mw = requirePocketSignature('POCKET_TEST');
+    const next = vi.fn();
+    const res = fakeRes();
+    // Pocket's timestamp is MILLISECONDS, unlike PB's seconds.
+    mw(signed(String(Date.now() - 10 * 60_000)), res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('rejects a delivery whose raw body was never captured', () => {
+    // Signing is over the exact bytes; re-serializing req.body would digest
+    // differently, so "no raw body" is unverifiable rather than an error.
+    process.env.POCKET_TEST = PK;
+    const mw = requirePocketSignature('POCKET_TEST');
+    const next = vi.fn();
+    const res = fakeRes();
+    const ts = String(Date.now());
+    mw(
+      pocketReq({
+        'x-heypocket-signature': signPocketPayload(PK, ts, body.toString('utf8')),
+        'x-heypocket-timestamp': ts,
+      }),
+      res,
+      next,
+    );
+    expect(next).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('fails open when the secret is unset', () => {
+    // Matches the PB and shared-secret guards: the offline demo and
+    // `npm run seed` must work with zero credentials.
+    delete process.env.POCKET_TEST_UNSET;
+    const mw = requirePocketSignature('POCKET_TEST_UNSET');
+    const next = vi.fn();
+    const res = fakeRes();
+    mw(pocketReq({}, body), res, next);
     expect(next).toHaveBeenCalledOnce();
   });
 });
