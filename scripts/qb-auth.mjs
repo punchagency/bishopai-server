@@ -15,6 +15,11 @@
  * into .env. Nothing is written for you — these are credentials, you place them.
  */
 import 'dotenv/config';
+import { setDefaultResultOrder } from 'node:dns';
+
+// Prefer IPv4 — see the note in src/server.ts. Google publishes AAAA records
+// and an unroutable IPv6 turns every call here into an ETIMEDOUT.
+setDefaultResultOrder('ipv4first');
 
 const TOKEN_URL =
   process.env.QB_OAUTH_TOKEN_URL ?? 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';

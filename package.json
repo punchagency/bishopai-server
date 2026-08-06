@@ -20,6 +20,9 @@
     "test:watch": "vitest",
     "qb-auth": "node scripts/qb-auth.mjs",
     "check:google": "tsx scripts/check-google.mts",
+    "check:drive-write": "tsx scripts/check-drive-write.mts",
+    "check:flowsheet-write": "tsx scripts/check-flowsheet-write.mts",
+    "pb-webhook": "tsx scripts/register-pb-webhook.mts",
     "eval:extract": "tsx scripts/eval-extract.mts"
   },
   "engines": {

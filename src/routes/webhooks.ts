@@ -103,6 +103,16 @@ webhooksRouter.post('/pb/booking', requireWebhookSecret('PB_WEBHOOK_SECRET'), as
 // matching appointment (by pb_id). Session-complete drives WF2 checkout;
 // cancelled enrolls the client into the WF3 cancelled cadence (both off-path).
 // ---------------------------------------------------------------------------
+// Practice Better verification handshake GET request
+webhooksRouter.get('/pb/session', (req, res) => {
+  const challenge = req.query.challenge || req.query.verificationToken || req.query['hub.challenge'];
+  return res.status(200).json({
+    challenge: challenge ?? 'ok',
+    timestamp: Math.floor(Date.now() / 1000),
+    status: 'ok',
+  });
+});
+
 webhooksRouter.post('/pb/session', requirePbSignature('PB_SIGNING_SECRET'), async (req, res) => {
   const ev = classifyPbEvent(req.body);
   logEvent('info', 'webhook.pb_session', 'PB webhook received', {

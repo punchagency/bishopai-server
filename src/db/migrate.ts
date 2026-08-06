@@ -6,7 +6,7 @@ import { pool } from './pool';
 // Applied filenames are recorded so re-running is a no-op.
 const MIGRATIONS_DIR = path.join(__dirname, '..', '..', 'migrations');
 
-async function migrate(): Promise<void> {
+export async function runMigrations(): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query(`
@@ -47,11 +47,15 @@ async function migrate(): Promise<void> {
     console.log(count === 0 ? 'Already up to date.' : `Applied ${count} migration(s).`);
   } finally {
     client.release();
-    await pool.end();
   }
 }
 
-migrate().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  runMigrations()
+    .then(() => pool.end())
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}
+

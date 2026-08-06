@@ -7,6 +7,20 @@
 import 'dotenv/config';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { setDefaultResultOrder } from 'node:dns';
+
+// Prefer IPv4 for every outbound call this script makes.
+//
+// Google publishes both A and AAAA records. On a host with IPv6 advertised but
+// not routable, Node picks the AAAA and the token exchange dies with ETIMEDOUT
+// — AFTER the user has already consented, so the code is burnt and the whole
+// flow has to be repeated with no clue why.
+//
+// NODE_OPTIONS=--dns-result-order=ipv4first in `.env` does NOT fix this: the
+// node binary reads NODE_OPTIONS at launch, while dotenv loads `.env` from
+// inside the running process. Setting it here does work, and needs nothing of
+// whoever runs the script.
+setDefaultResultOrder('ipv4first');
 
 const PORT = Number(process.env.GOOGLE_AUTH_PORT ?? 4571);
 const REDIRECT = `http://localhost:${PORT}/oauth2callback`;

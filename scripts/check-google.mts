@@ -15,6 +15,11 @@
  * Usage: npm run check:google
  */
 import 'dotenv/config';
+import { setDefaultResultOrder } from 'node:dns';
+
+// Prefer IPv4 — see the note in src/server.ts. Google publishes AAAA records
+// and an unroutable IPv6 turns every call here into an ETIMEDOUT.
+setDefaultResultOrder('ipv4first');
 
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
