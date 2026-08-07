@@ -2,10 +2,10 @@ import { pool } from '../db/pool';
 import { correlateConversation, type CorrelationResult } from '../correlation/correlate';
 
 /** Which recorder produced a conversation. Ids are namespaced per source. */
-export type ConversationSource = 'bee' | 'pocket';
+export type ConversationSource = 'bee' | 'pocket' | 'manual';
 
 export interface ConversationInput {
-  /** The recorder's own id for this recording (Pocket: `rec_…`). */
+  /** The recorder's own id for this recording (Pocket: `rec_…`, manual: `manual:<sha256>`). */
   source_id: string;
   source?: ConversationSource; // defaults to 'pocket'
   starts_at: string; // ISO 8601

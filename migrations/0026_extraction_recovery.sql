@@ -53,13 +53,28 @@ ALTER TABLE supplements
 
 -- Backfill with the same rules as normalizeSupplementName(): lowercase, strip
 -- punctuation, collapse whitespace, drop a trailing pack size.
-UPDATE supplements
-   SET name_key = trim(regexp_replace(
-         regexp_replace(
-           regexp_replace(lower(name), '[-–(]?\s*\d+\s*(ct|count|caps?|capsules?|tabs?|tablets?|softgels?|servings?|oz|ml|g|mg|mcg|iu)\.?\s*\)?\s*$', '', 'g'),
-           '[^a-z0-9]+', ' ', 'g'),
-         '\s+', ' ', 'g'))
- WHERE name_key IS NULL;
+--
+-- Guarded: on some databases name_key already exists as a GENERATED column (an
+-- earlier lineage of these migrations defined it that way). There the value is
+-- computed automatically, so a manual UPDATE is both pointless and rejected by
+-- Postgres ("column can only be updated to DEFAULT"). Skipping the backfill when
+-- the column is generated lets this migration apply cleanly either way.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'supplements' AND column_name = 'name_key'
+       AND is_generated = 'ALWAYS'
+  ) THEN
+    UPDATE supplements
+       SET name_key = trim(regexp_replace(
+             regexp_replace(
+               regexp_replace(lower(name), '[-–(]?\s*\d+\s*(ct|count|caps?|capsules?|tabs?|tablets?|softgels?|servings?|oz|ml|g|mg|mcg|iu)\.?\s*\)?\s*$', '', 'g'),
+               '[^a-z0-9]+', ' ', 'g'),
+             '\s+', ' ', 'g'))
+     WHERE name_key IS NULL;
+  END IF;
+END $$;
 
 -- Collapse duplicates the normalization reveals: keep the newest row per
 -- (client, name_key) and delete the rest. "Newest" is start_date first (the
@@ -77,7 +92,17 @@ DELETE FROM supplements s USING ranked r
  WHERE s.id = r.id AND r.rn > 1;
 
 -- A blank key means the row has no usable name; leave it addressable by id only.
-UPDATE supplements SET name_key = lower(name) WHERE name_key IS NULL OR name_key = '';
+-- Guarded for the same generated-column reason as the backfill above.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'supplements' AND column_name = 'name_key'
+       AND is_generated = 'ALWAYS'
+  ) THEN
+    UPDATE supplements SET name_key = lower(name) WHERE name_key IS NULL OR name_key = '';
+  END IF;
+END $$;
 
 ALTER TABLE supplements ALTER COLUMN name_key SET NOT NULL;
 

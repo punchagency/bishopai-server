@@ -4,6 +4,8 @@ import { pool } from '../db/pool';
 import { logError, logEvent } from '../observability/logger';
 import { coerceSessionNote, renderAppointmentSheet, renderProtocol } from '../session/render';
 import { processConversation } from '../session/process';
+import { ingestConversation } from '../conversations/ingest';
+import { manualSourceId, normalizeManualTranscript } from '../conversations/manualImport';
 import { publishApproved } from '../session/publish';
 import { publishClientTemplates, republishAmended } from '../session/publishTemplates';
 import {
@@ -212,6 +214,67 @@ reviewRouter.get('/unmatched/:id/candidates', async (req, res) => {
     });
   } catch (err) {
     logError('review.candidates', 'candidate query failed', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// POST /review/import — hand a transcript in directly, without a recorder.
+//
+// A session captured elsewhere (an Otter.ai export, a recording Pocket missed)
+// has no automated way into the pipeline. This lands it as an ordinary
+// conversation from source 'manual', deduplicated by a content hash so pasting
+// the same text twice is a no-op. It reuses the one ingest code path, so it
+// correlates by time exactly like a Pocket recording: if `occurred_at` lands on
+// a booked appointment it auto-matches (and extraction fires); otherwise it sits
+// in the unmatched queue for Nicole to attach via /match or /assign-client — the
+// same follow-through as any recording the correlator couldn't place.
+const importSchema = z.object({
+  transcript: z.string().trim().min(1).max(200_000),
+  // When the session actually happened. Drives correlation, and — since a
+  // walk-in assignment builds the appointment from this window — becomes the
+  // clinical session date. Defaults to now for a "just happened" paste.
+  occurred_at: z.string().datetime().optional(),
+});
+reviewRouter.post('/import', async (req, res) => {
+  const parsed = importSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
+  }
+  try {
+    const transcript = normalizeManualTranscript(parsed.data.transcript);
+    const startsAt = parsed.data.occurred_at ? new Date(parsed.data.occurred_at) : new Date();
+    const endsAt = new Date(startsAt.getTime() + 60 * 60 * 1000); // synthetic 1h window
+
+    const { conversationId, correlation } = await ingestConversation({
+      source: 'manual',
+      source_id: manualSourceId(transcript),
+      starts_at: startsAt.toISOString(),
+      ends_at: endsAt.toISOString(),
+      transcript,
+    });
+
+    // Same off-request-path extraction as the webhook/match paths: only when the
+    // synthetic window happened to correlate to a real appointment.
+    if (correlation.status === 'matched') {
+      void processConversation(conversationId).catch((e) =>
+        logError('session.process', 'manual-import processing failed', e, { conversation_id: conversationId }),
+      );
+    }
+    logEvent('info', 'review.import', 'imported a transcript by hand', {
+      conversation_id: conversationId,
+      correlation: correlation.status,
+    });
+    await recordAudit({
+      entityType: 'conversation',
+      entityId: conversationId,
+      action: 'conversation.imported',
+      actor: 'nicole',
+      summary: 'Transcript imported by hand',
+      metadata: { correlation: correlation.status },
+    });
+    return res.status(201).json({ conversation_id: conversationId, correlation });
+  } catch (err) {
+    logError('review.import', 'manual import failed', err);
     return res.status(500).json({ error: 'internal error' });
   }
 });
