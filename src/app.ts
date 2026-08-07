@@ -37,7 +37,12 @@ export function createApp(): express.Express {
 
   // Capture the raw body so PB webhook signatures (HMAC over the exact bytes)
   // can be verified — express.json() otherwise discards it after parsing.
-  app.use(express.json({ verify: (req, _res, buf) => ((req as { rawBody?: Buffer }).rawBody = buf) }));
+  //
+  // The `limit` must stay comfortably above MAX_TRANSCRIPT_CHARS (200k chars,
+  // ~200KB, plus JSON escaping and any multi-byte characters). The default is
+  // only 100KB, which would 413 a long session transcript — from the manual
+  // import or a Pocket webhook — before it ever reached a handler.
+  app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => ((req as { rawBody?: Buffer }).rawBody = buf) }));
 
   app.use('/health', healthRouter);
   app.use('/webhooks', webhooksRouter); // inbound webhooks carry their own secret/signature

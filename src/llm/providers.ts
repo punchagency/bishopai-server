@@ -4,6 +4,7 @@ import { GoogleGenAI } from '@google/genai';
 import Groq from 'groq-sdk';
 import type { z } from 'zod';
 import { llmConfig } from './config';
+import { llmLimiter } from './rateLimiter';
 import {
   ProviderError,
   RateLimitError,
@@ -32,7 +33,14 @@ export interface StructuredResponse {
   raw: string | null;
 }
 
-export function generateStructured(req: StructuredRequest): Promise<StructuredResponse> {
+export async function generateStructured(req: StructuredRequest): Promise<StructuredResponse> {
+  // Pace under the provider's per-minute token budget before dispatching. Cost is
+  // the prompt (~4 chars/token) plus the requested output budget, which is what
+  // Groq's free tier bills against the TPM ceiling.
+  const estimatedCost =
+    Math.ceil((req.system.length + req.user.length) / 4) + (req.maxTokens ?? llmConfig.maxTokens);
+  await llmLimiter.acquire(estimatedCost);
+
   switch (llmConfig.provider) {
     case 'anthropic':
       return anthropicExtract(req);

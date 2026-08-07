@@ -87,4 +87,20 @@ suite('manual transcript import (integration, real Postgres)', () => {
     const r = await post('/review/import', { transcript: '   ' });
     expect(r.status).toBe(400);
   });
+
+  it('accepts a long transcript over the old 100KB body-parser default', async () => {
+    // ~150KB — larger than express.json()'s 100KB default (which would 413
+    // before the handler), still under MAX_TRANSCRIPT_CHARS. Regression guard
+    // for the body-limit/cap mismatch.
+    const big = 'Speaker 1 0:01\n' + 'the client reports better sleep this week. '.repeat(3500);
+    expect(big.length).toBeGreaterThan(120_000);
+    const r = await post('/review/import', { transcript: big, occurred_at: OCCURRED });
+    expect(r.status).toBe(201);
+  });
+
+  it('refuses a transcript over the character cap', async () => {
+    const tooBig = 'x'.repeat(200_001);
+    const r = await post('/review/import', { transcript: tooBig });
+    expect(r.status).toBe(400);
+  });
 });

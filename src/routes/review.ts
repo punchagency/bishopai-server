@@ -228,8 +228,14 @@ reviewRouter.get('/unmatched/:id/candidates', async (req, res) => {
 // a booked appointment it auto-matches (and extraction fires); otherwise it sits
 // in the unmatched queue for Nicole to attach via /match or /assign-client — the
 // same follow-through as any recording the correlator couldn't place.
+// Upper bound on a hand-imported transcript. Generous — a multi-hour session is
+// well under this — but bounded so a pathological paste can't be a memory/cost
+// DoS. Must stay below the express.json body limit in app.ts (see the note
+// there); the desktop ImportView mirrors this number to warn before upload.
+export const MAX_TRANSCRIPT_CHARS = 200_000;
+
 const importSchema = z.object({
-  transcript: z.string().trim().min(1).max(200_000),
+  transcript: z.string().trim().min(1).max(MAX_TRANSCRIPT_CHARS),
   // When the session actually happened. Drives correlation, and — since a
   // walk-in assignment builds the appointment from this window — becomes the
   // clinical session date. Defaults to now for a "just happened" paste.

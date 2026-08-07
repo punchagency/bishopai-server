@@ -19,6 +19,9 @@ dashboardRouter.get('/overview', async (_req, res) => {
                 OR EXISTS (SELECT 1 FROM protocols p
                             WHERE p.appointment_id = a.id AND p.status IN ('draft','in_review'))) AS awaiting_review,
            (SELECT count(*) FROM conversations WHERE appointment_id IS NULL)              AS unmatched,
+           (SELECT count(*) FROM conversations
+             WHERE appointment_id IS NOT NULL
+               AND extraction_status IN ('pending','processing','failed'))                AS processing,
            (SELECT count(*) FROM appointments  WHERE starts_at > now())                   AS upcoming,
            (SELECT count(*) FROM approvals     WHERE approved_at::date = now()::date)     AS approved_today,
            (SELECT count(*) FROM refills

@@ -30,8 +30,19 @@ function resolveProvider(): Provider {
   return 'mock';
 }
 
+const provider = resolveProvider();
+
 export const llmConfig = {
-  provider: resolveProvider(),
+  provider,
+  // Per-minute token budget the rate limiter (llm/rateLimiter.ts) paces LLM calls
+  // under, so the extraction fan-out queues instead of 429-bursting. Sized to the
+  // active provider: Groq's free tier is ~12k TPM (counting requested completion
+  // tokens), so default to 10k for headroom; other providers / paid tiers have
+  // far higher limits, so effectively don't throttle unless LLM_TOKENS_PER_MINUTE
+  // is set. Raise this the moment you move off the Groq free tier.
+  tokensPerMinute: Number(
+    process.env.LLM_TOKENS_PER_MINUTE ?? (provider === 'groq' ? 10_000 : 1_000_000),
+  ),
   // Output budget for the FIRST attempt. Deliberately modest: providers bill
   // requested completion tokens against rate limits (Groq's free tier counts
   // max_completion_tokens toward its 12k TPM, so a pessimistic 16k budget 413s
@@ -50,7 +61,12 @@ export const llmConfig = {
   // single call sees the whole session and reads better; above it, long-context
   // recall on "find every scattered callout" decays silently, which is worse
   // than the merge cost of chunking.
-  chunkThresholdTokens: Number(process.env.EXTRACTION_CHUNK_THRESHOLD_TOKENS ?? 6000),
+  //
+  // Tuned to the real workload: a typical 30-minute session is ~6k tokens, so
+  // 6000 left her normal visit straddling the boundary — chunking some sessions
+  // that would read better whole. 8000 keeps a normal (and up to ~40-minute)
+  // session single-pass; chunking now only kicks in for genuinely long outliers.
+  chunkThresholdTokens: Number(process.env.EXTRACTION_CHUNK_THRESHOLD_TOKENS ?? 8000),
   chunkTargetTokens: Number(process.env.EXTRACTION_CHUNK_TARGET_TOKENS ?? 3000),
   chunkOverlapTurns: Number(process.env.EXTRACTION_CHUNK_OVERLAP_TURNS ?? 2),
   /** Parallel chunk calls. Keeps a long session inside free-tier rate limits. */

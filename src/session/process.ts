@@ -2,8 +2,34 @@ import { pool } from '../db/pool';
 import { extractSessionNote } from './extract';
 import { logError, logEvent } from '../observability/logger';
 import { rawFromError } from '../llm/errors';
-import { markExtractionFailed } from './reclaim';
+import { markExtractionFailed, LEASE_MINUTES } from './reclaim';
 import { fetchSupplementVocabulary } from './supplements';
+
+/**
+ * Keep a running extraction's lease fresh so the reclaim sweep only reclaims a
+ * DEAD process, never a slow one. A genuinely long session — dozens of chunked
+ * LLM calls, each possibly waiting out a rate limit — can legitimately outlast
+ * the fixed lease; without a heartbeat it would be reclaimed mid-flight,
+ * re-extracted concurrently (double spend), and eventually dead-lettered to
+ * needs_review despite working fine. Beats at a third of the lease so a couple
+ * of missed beats still land inside the window; stops the instant the work ends.
+ */
+function startLeaseHeartbeat(conversationId: string): () => void {
+  const everyMs = Math.max(30_000, (LEASE_MINUTES * 60_000) / 3);
+  const timer = setInterval(() => {
+    void pool
+      .query(
+        `UPDATE conversations SET extraction_leased_at = now(), updated_at = now()
+          WHERE id = $1 AND extraction_status = 'processing'`,
+        [conversationId],
+      )
+      .catch(() => {
+        /* a missed beat only risks one early reclaim; the next beat recovers */
+      });
+  }, everyMs);
+  timer.unref?.(); // never keep the process alive on the heartbeat alone
+  return () => clearInterval(timer);
+}
 
 /**
  * Turn a matched conversation's transcript into an Appointment Sheet + Protocol.
@@ -44,6 +70,11 @@ export async function processConversation(conversationId: string): Promise<void>
   if (claim.rowCount === 0) return;
   const { appointment_id, client_id, transcript, client_name, appointment_date } = claim.rows[0];
 
+  // Renew the lease while we actually work, so a long session isn't mistaken for
+  // a dead process and reclaimed out from under itself. Stopped at every exit
+  // below (the extraction-failure return, and the persist block's finally).
+  const stopHeartbeat = startLeaseHeartbeat(conversationId);
+
   let note;
   try {
     // Who the client is, and which products this practice actually sells, are
@@ -68,6 +99,7 @@ export async function processConversation(conversationId: string): Promise<void>
     await logError('session.extract', 'transcript extraction failed', err, {
       conversation_id: conversationId,
     });
+    stopHeartbeat();
     return;
   }
 
@@ -151,5 +183,6 @@ export async function processConversation(conversationId: string): Promise<void>
     });
   } finally {
     db.release();
+    stopHeartbeat(); // covers the normal finish, the still-processing bailout, and the persist error
   }
 }

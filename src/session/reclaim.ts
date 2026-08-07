@@ -13,8 +13,10 @@ import { processConversation } from './process';
 // sheet. `failed` was barely better: retried only if a human happened to
 // re-match the conversation.
 
-/** How long a claim may go unfinished before we assume its owner died. */
-const LEASE_MINUTES = Number(process.env.EXTRACTION_LEASE_MINUTES ?? 10);
+/** How long a claim may go unfinished before we assume its owner died. A live
+ *  extraction renews its lease (see startLeaseHeartbeat in process.ts), so this
+ *  bounds crash-recovery latency, not how long a legitimate extraction may run. */
+export const LEASE_MINUTES = Number(process.env.EXTRACTION_LEASE_MINUTES ?? 10);
 /** Attempts before a conversation stops retrying and asks for a human. */
 const MAX_ATTEMPTS = Number(process.env.EXTRACTION_MAX_ATTEMPTS ?? 4);
 /** Capped backoff. Index by attempt count; past the end, use the last. */
