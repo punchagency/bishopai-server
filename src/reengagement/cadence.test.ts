@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { nextCadenceAction, DEACTIVATE_AFTER_DAYS, type LeadState } from './cadence';
+import {
+  nextCadenceAction,
+  nextScheduledStep,
+  trackNameFor,
+  CADENCE_DEFAULTS,
+  DEACTIVATE_AFTER_DAYS,
+  type LeadState,
+} from './cadence';
 
 const NOW = new Date('2026-07-03T12:00:00Z');
 const daysAgo = (d: number) => new Date(NOW.getTime() - d * 86_400_000);
@@ -106,3 +113,34 @@ describe('nextCadenceAction — deactivation', () => {
     expect(a.kind).toBe('send');
   });
 });
+
+describe('trackNameFor and CADENCE_DEFAULTS', () => {
+  it('maps known statuses to proper track names and defaults to inquiry', () => {
+    expect(trackNameFor('cancelled')).toBe('cancelled');
+    expect(trackNameFor('maintenance')).toBe('maintenance');
+    expect(trackNameFor('first_appointment')).toBe('first_appointment');
+    expect(trackNameFor('new')).toBe('inquiry');
+    expect(trackNameFor('contacted')).toBe('inquiry');
+    expect(trackNameFor('nurturing')).toBe('inquiry');
+  });
+
+  it('populates CADENCE_DEFAULTS for all 4 tracks with non-empty subject and body', () => {
+    const tracks = ['inquiry', 'cancelled', 'maintenance', 'first_appointment'];
+    for (const t of tracks) {
+      expect(CADENCE_DEFAULTS[t]).toBeDefined();
+      expect(Object.keys(CADENCE_DEFAULTS[t]).length).toBeGreaterThan(0);
+      for (const [, def] of Object.entries(CADENCE_DEFAULTS[t])) {
+        expect(def.subject).toBeTruthy();
+        expect(def.body).toBeTruthy();
+      }
+    }
+  });
+
+  it('nextScheduledStep includes the default step body', () => {
+    const s = nextScheduledStep(lead({ status: 'new', created_at: daysAgo(0) }), NOW);
+    expect(s).not.toBeNull();
+    expect(s?.step).toBe('welcome');
+    expect(s?.body).toBe(CADENCE_DEFAULTS.inquiry.welcome.body);
+  });
+});
+

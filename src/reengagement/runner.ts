@@ -1,7 +1,7 @@
 import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
 import { sendEmail } from '../integrations/outlook';
-import { nextCadenceAction, FIXED_TRACK_STATUSES, type LeadState } from './cadence';
+import { nextCadenceAction, FIXED_TRACK_STATUSES, trackNameFor, resolveTemplate, type LeadState } from './cadence';
 
 // WF3 cadence pass (run by the scheduler): evaluate every active lead, send the
 // due step (dry-run until Outlook is configured), and advance its sequence
@@ -15,11 +15,22 @@ export interface ReengagementResult {
   skipped: number; // due to send but no email on file
 }
 
+export interface LeadDraft {
+  subject: string;
+  body: string;
+  updated_at?: string;
+}
+
+export interface LeadSequenceState {
+  sent?: string[];
+  drafts?: Record<string, LeadDraft>;
+}
+
 interface LeadRow {
   id: string;
   email: string | null;
   status: string;
-  sequence_state: { sent?: string[] } | null;
+  sequence_state: LeadSequenceState | null;
   last_touch: string | null;
   created_at: string;
   cadence_cancelled_at: string | null;
@@ -53,13 +64,38 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
     }
     if (action.kind === 'send') {
       if (!row.email) return 'skipped';
+      // Per-lead custom draft wins over track template, which wins over hardcoded default.
+      const trackName = trackNameFor(row.status);
+      const draft = row.sequence_state?.drafts?.[action.step];
+      const tpl = draft ?? (await resolveTemplate(trackName, action.step)) ??
+        { subject: action.subject, body: action.body };
       // Inject available booking slots into emails that reference scheduling.
-      const body = await appendSlotSuggestions(action.body, row.id);
-      await sendEmail({ to: row.email, subject: action.subject, body });
+      const body = await appendSlotSuggestions(tpl.body, row.id);
+      const subject = tpl.subject;
+      let result: import('../integrations/outlook').EmailResult;
+      try {
+        result = await sendEmail({ to: row.email, subject, body });
+      } catch (sendErr) {
+        logError('reengagement.send', 'sendEmail threw unexpectedly', sendErr, { lead_id: row.id, step: action.step });
+        return 'none';
+      }
+      // Append-only send log (dry-run or live, success or failure).
+      await pool.query(
+        `INSERT INTO email_send_log (lead_id, track, step, to_email, subject, body, dry_run, ok, error)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [row.id, trackName, action.step, row.email, subject, body,
+          result.dryRun ?? false, result.ok, result.error ?? null],
+      ).catch((e) => logError('reengagement.send_log', 'failed to write send log', e, { lead_id: row.id }));
+      // Only advance sequence state and record in messages if the send succeeded
+      // (or was an ok dry-run). A failed live send doesn't count as "sent".
+      if (!result.ok) {
+        logError('reengagement.send', 'sendEmail returned ok=false', result.error, { lead_id: row.id, step: action.step });
+        return 'none';
+      }
       await pool.query(
         `INSERT INTO messages (lead_id, channel, body, sent_at, status)
               VALUES ($1, 'email', $2, now(), 'sent')`,
-        [row.id, `${action.subject}\n\n${body}`],
+        [row.id, `${subject}\n\n${body}`],
       );
       // Advance sequence state + status, and stamp last_touch. Fixed-track
       // leads (cancelled/maintenance) keep their status so they stay on that
@@ -71,9 +107,12 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
           : 'nurturing';
       await pool.query(
         `UPDATE leads
-            SET sequence_state = jsonb_set(
-                  coalesce(sequence_state, '{}'::jsonb), '{sent}',
-                  coalesce(sequence_state->'sent', '[]'::jsonb) || to_jsonb($2::text)),
+            SET sequence_state = (
+                  jsonb_set(
+                    coalesce(sequence_state, '{}'::jsonb), '{sent}',
+                    coalesce(sequence_state->'sent', '[]'::jsonb) || to_jsonb($2::text)
+                  ) #- ARRAY['drafts', $2::text]
+                ),
                 last_touch = now(),
                 status = $3
           WHERE id = $1`,
@@ -125,6 +164,95 @@ export async function runReengagementForLead(leadId: string, now: Date = new Dat
   );
   if (rows.length === 0) return 'none';
   return processLead(rows[0], now);
+}
+
+/**
+ * Send an email to a specific lead immediately — with optional custom subject
+ * and body edited by Nicole before sending.
+ */
+export async function sendIndividualLeadEmail(
+  leadId: string,
+  custom?: { step?: string; subject?: string; body?: string },
+): Promise<{ ok: boolean; step: string; subject: string; error?: string }> {
+  const { rows } = await pool.query<LeadRow>(
+    `SELECT ${LEAD_COLUMNS} FROM leads WHERE id = $1 AND status NOT IN ('closed', 'booked')`,
+    [leadId],
+  );
+  if (rows.length === 0) return { ok: false, step: '', subject: '', error: 'Lead not found or already closed/booked' };
+  const row = rows[0];
+  if (!row.email) return { ok: false, step: '', subject: '', error: 'Lead has no email on file' };
+
+  const now = new Date();
+  const state: LeadState = {
+    status: row.status,
+    created_at: new Date(row.created_at),
+    last_touch: row.last_touch ? new Date(row.last_touch) : null,
+    sentSteps: row.sequence_state?.sent ?? [],
+    cadenceCancelled: row.cadence_cancelled_at !== null,
+  };
+
+  const action = nextCadenceAction(state, now);
+  const step = custom?.step ?? (action.kind === 'send' ? action.step : 'manual_email');
+  const trackName = trackNameFor(row.status);
+
+  // Resolution hierarchy: explicit payload > stored draft > template override > cadence default
+  let subject = custom?.subject?.trim();
+  let body = custom?.body?.trim();
+  if (!subject || !body) {
+    const draft = row.sequence_state?.drafts?.[step];
+    const tpl = draft ?? (await resolveTemplate(trackName, step));
+    subject = subject || tpl?.subject || (action.kind === 'send' ? action.subject : 'Message from Nicole');
+    body = body || tpl?.body || (action.kind === 'send' ? action.body : '');
+  }
+
+  body = await appendSlotSuggestions(body, row.id);
+
+  let result: import('../integrations/outlook').EmailResult;
+  try {
+    result = await sendEmail({ to: row.email, subject, body });
+  } catch (err) {
+    logError('reengagement.send_individual', 'sendEmail threw', err, { lead_id: row.id, step });
+    return { ok: false, step, subject, error: err instanceof Error ? err.message : 'Send failed' };
+  }
+
+  await pool.query(
+    `INSERT INTO email_send_log (lead_id, track, step, to_email, subject, body, dry_run, ok, error)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [row.id, trackName, step, row.email, subject, body,
+      result.dryRun ?? false, result.ok, result.error ?? null],
+  ).catch((e) => logError('reengagement.send_log', 'failed to write send log', e, { lead_id: row.id }));
+
+  if (!result.ok) {
+    return { ok: false, step, subject, error: result.error ?? 'Email send failed' };
+  }
+
+  await pool.query(
+    `INSERT INTO messages (lead_id, channel, body, sent_at, status)
+          VALUES ($1, 'email', $2, now(), 'sent')`,
+    [row.id, `${subject}\n\n${body}`],
+  );
+
+  const nextStatus = FIXED_TRACK_STATUSES.has(row.status)
+    ? row.status
+    : row.status === 'new'
+      ? 'contacted'
+      : 'nurturing';
+
+  await pool.query(
+    `UPDATE leads
+        SET sequence_state = (
+              jsonb_set(
+                coalesce(sequence_state, '{}'::jsonb), '{sent}',
+                coalesce(sequence_state->'sent', '[]'::jsonb) || to_jsonb($2::text)
+              ) #- ARRAY['drafts', $2::text]
+            ),
+            last_touch = now(),
+            status = $3
+      WHERE id = $1`,
+    [row.id, step, nextStatus],
+  );
+
+  return { ok: true, step, subject };
 }
 
 // ---------------------------------------------------------------------------

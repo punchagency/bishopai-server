@@ -2,6 +2,7 @@
 // pass in runner.ts. Given a lead's state and the current time, decide the next
 // automated action: send a specific step, deactivate, or do nothing. Replies and
 // bookings stop the automation (build plan §5.3/§5.4).
+import { pool } from '../db/pool';
 
 export interface LeadState {
   status: string; // new | contacted | nurturing | booked | cancelled | replied | closed
@@ -120,6 +121,14 @@ export function trackFor(status: string): CadenceStep[] {
   return INQUIRY_STEPS;
 }
 
+/** The track name string (as stored in email_templates) for a given lead status. */
+export function trackNameFor(status: string): string {
+  if (status === 'cancelled') return 'cancelled';
+  if (status === 'maintenance') return 'maintenance';
+  if (status === 'first_appointment') return 'first_appointment';
+  return 'inquiry';
+}
+
 const STOP_STATUSES = new Set(['booked', 'replied', 'closed']);
 
 const dayspan = (from: Date, to: Date) => (to.getTime() - from.getTime()) / 86_400_000;
@@ -155,8 +164,56 @@ export function nextCadenceAction(lead: LeadState, now: Date = new Date()): Cade
 export interface ScheduledStep {
   step: string;
   subject: string;
+  body: string;
   /** When it sends. A step already past due sends on the next pass — i.e. `now`. */
   sendAt: Date;
+}
+
+// ---------------------------------------------------------------------------
+// Template resolution — DB overrides win over hardcoded defaults.
+// Exported so the templates API route can enumerate all valid (track,step)
+// pairs and include effective copy in every response.
+// ---------------------------------------------------------------------------
+
+/** Every valid cadence step across all tracks — used to enumerate + validate. */
+export const CADENCE_DEFAULTS: Record<string, Record<string, { subject: string; body: string }>> = {};
+
+function buildDefaults(): void {
+  const tracks: Record<string, CadenceStep[]> = {
+    inquiry: INQUIRY_STEPS,
+    cancelled: CANCELLED_STEPS,
+    maintenance: MAINTENANCE_STEPS,
+    first_appointment: FIRST_APPOINTMENT_STEPS,
+  };
+  for (const [track, steps] of Object.entries(tracks)) {
+    CADENCE_DEFAULTS[track] = {};
+    for (const s of steps) {
+      CADENCE_DEFAULTS[track][s.step] = { subject: s.subject, body: s.body };
+    }
+  }
+}
+buildDefaults();
+
+/**
+ * Return the effective subject + body for a (track, step) pair: DB override if
+ * Nicole has edited it, otherwise the hardcoded default. Returns null for unknown
+ * (track, step) combinations so the caller can validate input.
+ */
+export async function resolveTemplate(
+  track: string,
+  step: string,
+): Promise<{ subject: string; body: string } | null> {
+  const def = CADENCE_DEFAULTS[track]?.[step];
+  try {
+    const r = await pool.query<{ subject: string; body: string }>(
+      `SELECT subject, body FROM email_templates WHERE track = $1 AND step = $2 LIMIT 1`,
+      [track, step],
+    );
+    if (r.rowCount) return r.rows[0];
+  } catch {
+    // DB error — fall through to default so a send is never silently blocked.
+  }
+  return def ?? null;
 }
 
 /**
@@ -173,7 +230,7 @@ export function nextScheduledStep(lead: LeadState, now: Date = new Date()): Sche
   for (const step of trackFor(lead.status)) {
     if (sent.has(step.step)) continue;
     const at = new Date(lead.created_at.getTime() + step.afterDays * 86_400_000);
-    return { step: step.step, subject: step.subject, sendAt: at.getTime() < now.getTime() ? now : at };
+    return { step: step.step, subject: step.subject, body: step.body, sendAt: at.getTime() < now.getTime() ? now : at };
   }
   return null;
 }
