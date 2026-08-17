@@ -10,6 +10,7 @@ import { logError, logEvent, logWarn } from '../observability/logger';
 import { requireWebhookSecret, requirePbSignature, requirePocketSignature } from './webhookAuth';
 import { toConversationInput } from '../integrations/pocket/normalize';
 import { TRANSCRIPT_EVENTS, type PocketWebhookPayload } from '../integrations/pocket/types';
+import { triggerPocketPoll } from '../integrations/pocket/poller';
 import { classifyPbEvent, appointmentStatusFor } from '../integrations/pb/events';
 import { detectCheckout } from '../checkout/machine';
 import { ingestLead } from '../reengagement/intake';
@@ -135,6 +136,10 @@ webhooksRouter.post('/pb/session', requirePbSignature('PB_SIGNING_SECRET'), asyn
           void detectCheckout(apptId).catch((e) =>
             logError('checkout.detect', 'auto-detect failed', e, { appointment_id: apptId }),
           );
+          // Pocket needs ~1–2 min to finish transcription after the recording
+          // stops. Fire a delayed poll so the transcript lands without waiting
+          // for the next cron tick.
+          setTimeout(() => void triggerPocketPoll('pb_session_completed'), 90_000);
         }
         // Cancelled → enroll the client in the WF3 cancelled cadence (7d/14d),
         // off the request path. No-op when we have no email on file for them.

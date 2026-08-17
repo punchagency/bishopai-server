@@ -9,6 +9,7 @@ import {
   mergeAdjacentTurns,
   parseTranscript,
   prepareTranscript,
+  renderTurns,
 } from './transcript';
 
 const fixture = (name: string): string =>
@@ -152,5 +153,123 @@ describe('chunkTurns', () => {
     const turns = parseTranscript(`Speaker 1 0:01\n${'word '.repeat(5000)}`);
     const chunks = chunkTurns(turns, { targetTokens: 100 });
     expect(chunks).toHaveLength(1);
+  });
+});
+
+describe('inline speaker transcripts', () => {
+  // The shape the live recorder actually produces: label and utterance on one
+  // line, no timestamp. This used to fall through to the single-turn fallback,
+  // which silently attributed a whole two-person session to one speaker and
+  // still reported 100% attribution coverage.
+  const pocket = [
+    'SPEAKER_00: And it flares up here and there. It is this inflammation.',
+    'SPEAKER_01: Left side.',
+    'SPEAKER_00: In my neck, my upper back.',
+    'SPEAKER_01: How long has that been going on?',
+  ].join('\n');
+
+  it('splits a label-prefixed transcript into real turns', () => {
+    const turns = parseTranscript(pocket);
+    expect(turns).toHaveLength(4);
+    expect(turns[1].speaker).toBe('SPEAKER_01');
+    expect(turns[1].text).toBe('Left side.');
+  });
+
+  it('keeps the utterance out of the speaker label', () => {
+    const turns = parseTranscript(pocket);
+    expect(turns[0].text.startsWith('SPEAKER_00')).toBe(false);
+  });
+
+  it('reads a named-speaker transcript whose turns wrap across lines', () => {
+    const wrapped = [
+      'Nicole: Talk to me about where you are.',
+      '',
+      'Marta: Energy is genuinely good now. The afternoon crash is gone.',
+      'No headaches at all in the last two weeks.',
+      '',
+      'Nicole: Pulse 0 is 68 and even.',
+    ].join('\n');
+    const turns = parseTranscript(wrapped);
+    expect(turns.map((t) => t.speaker)).toEqual(['Nicole', 'Marta', 'Nicole']);
+    // The unlabelled continuation line belongs to the turn above it.
+    expect(turns[1].text).toContain('No headaches at all');
+  });
+
+  it('does not split prose on an ordinary mid-sentence colon', () => {
+    // "Stressors are food" fits the label pattern but is a clause, not a name —
+    // splitting here would cut a clinical finding in half.
+    const prose = [
+      'Speaker 1 0:02',
+      'Here is the thing: I have been tired.',
+      'Stressors are food: dairy only now.',
+      'Stressors are food: gluten as well.',
+    ].join('\n');
+    const turns = parseTranscript(prose);
+    expect(turns).toHaveLength(1);
+    expect(turns[0].text).toContain('dairy only now');
+  });
+
+  it('leaves a dictated single-paragraph summary as one turn', () => {
+    const summary = 'David reports bloating after meals, plus some joint aches.';
+    expect(parseTranscript(summary)).toHaveLength(1);
+  });
+});
+
+describe('merge cap', () => {
+  const many = (n: number, words: number) =>
+    Array.from({ length: n }, () => `SPEAKER_00: ${'word '.repeat(words).trim()}`).join('\n');
+
+  it('stops merging before a turn becomes a wall of text', () => {
+    // No timestamps, so the gap guard reads every gap as 0 and cannot brake.
+    // Without the word cap these 10 turns glue into one 300-word turn, which is
+    // the wide matching window span verification exists to avoid.
+    const turns = mergeAdjacentTurns(parseTranscript(many(10, 30)));
+    expect(turns.length).toBeGreaterThan(1);
+    for (const t of turns) {
+      expect(t.text.split(/\s+/).length).toBeLessThanOrEqual(120);
+    }
+  });
+
+  it('still glues the short fragments merging exists for', () => {
+    // The point of merging: "Yeah." / "Okay." carry no attribution signal alone.
+    const turns = mergeAdjacentTurns(
+      parseTranscript(['SPEAKER_00: Yeah.', 'SPEAKER_00: Okay.', 'SPEAKER_00: Right.'].join('\n')),
+    );
+    expect(turns).toHaveLength(1);
+    expect(turns[0].text).toBe('Yeah. Okay. Right.');
+  });
+
+  it('never splits a single source turn, however long', () => {
+    // A cap on MERGING only. Splitting a real utterance would invent a boundary
+    // mid-sentence, and half an utterance reads as a complete statement.
+    const long = 'word '.repeat(300).trim();
+    const turns = mergeAdjacentTurns(
+      parseTranscript([`SPEAKER_00: ${long}`, 'SPEAKER_01: Okay.', `SPEAKER_00: ${long}`].join('\n')),
+    );
+    expect(turns).toHaveLength(3);
+    expect(turns[0].text.split(/\s+/).length).toBe(300);
+    expect(turns[2].text.split(/\s+/).length).toBe(300);
+  });
+});
+
+describe('turn numbering', () => {
+  it('numbers turns globally, and renders the number the model cites', () => {
+    const turns = prepareTranscript('Speaker 1 0:02\nHello there.\n\nSpeaker 2 1:30\nHi back.').turns;
+    expect(turns.map((t) => t.index)).toEqual([0, 1]);
+    expect(renderTurns(turns)).toContain('#0 ');
+    expect(renderTurns(turns)).toContain('#1 ');
+  });
+
+  it('keeps a turn number stable after compaction drops its neighbours', () => {
+    // Compaction filters turns out; a positional index would renumber the
+    // survivors and point every citation at the wrong utterance.
+    const turns = prepareTranscript(
+      'Speaker 1 0:02\nClose your eyes. Pinky and thumb together.\n\n' +
+        'Speaker 1 0:40\nThe gallbladder is showing stress today.',
+    ).turns;
+    const kept = compactForNarrative(turns);
+    expect(kept).toHaveLength(1);
+    expect(kept[0].index).toBe(1);
+    expect(renderTurns(kept)).toContain('#1 ');
   });
 });

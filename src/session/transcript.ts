@@ -20,6 +20,18 @@
 export type Role = 'PRACTITIONER' | 'CLIENT' | 'UNKNOWN';
 
 export interface Turn {
+  /**
+   * Stable address of this turn within the session, and the unit the model cites
+   * findings against.
+   *
+   * Global and assigned ONCE, after merging — never a position in whatever array
+   * happens to be in hand. Compaction drops turns and chunking slices them, so a
+   * positional index would mean something different in every stage: the model
+   * would cite #12 of a compacted narrative and the server would resolve #12 of
+   * the full transcript. Carrying the number on the turn makes every stage agree
+   * on what a citation points at.
+   */
+  index: number;
   /** Original speaker label as written by the transcription tool. */
   speaker: string;
   /** Seconds from session start, when the transcript carries a timestamp. */
@@ -33,9 +45,72 @@ export interface Turn {
   roleConfidence: number;
 }
 
+/** Stamp sequential global indices. Call after merging, before anything slices. */
+export function indexTurns(turns: Turn[]): Turn[] {
+  return turns.map((t, i) => ({ ...t, index: i }));
+}
+
 // "Speaker 1  0:02" / "Speaker 1:" / "Nicole 12:03" / "[00:12:03] Speaker 2"
 const SPEAKER_LINE =
   /^[ \t]*(?:\[(?<lead>\d{1,2}:\d{2}(?::\d{2})?)\][ \t]*)?(?<name>[A-Za-z][\w .'-]{0,40}?)[ \t]*:?[ \t]*(?<time>\d{1,2}:\d{2}(?::\d{2})?)?[ \t]*$/;
+
+// The other shape, and the one the live recorder actually produces:
+// "SPEAKER_00: And it flares up here and there." — label and utterance on ONE
+// line, no timestamp. The seeded transcripts use it too ("Nicole: ...").
+//
+// This cannot be detected per-line, because "So here's the thing: I was tired"
+// looks identical to a speaker line. What separates them is repetition: a real
+// speaker label recurs throughout the transcript, an accidental one appears
+// once. So candidates are gathered first and only accepted as labels if they
+// behave like labels across the whole document.
+const INLINE_SPEAKER =
+  /^[ \t]*(?:\[(?<lead>\d{1,2}:\d{2}(?::\d{2})?)\][ \t]*)?(?<name>[A-Za-z][\w .'-]{0,30}?)[ \t]*:[ \t]+(?<text>\S.*)$/;
+
+/**
+ * Does this look like a person's name rather than the start of a sentence?
+ *
+ * "Nicole", "Marta", "SPEAKER_00", "Speaker 1" — every word capitalised, all
+ * caps, or a number. "Stressors are food" is not: a mid-sentence colon is the
+ * false positive that would shred a turn in half, and lowercase interior words
+ * are what give it away.
+ */
+function looksLikeName(label: string): boolean {
+  const words = label.split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > 3) return false;
+  return words.every((w) => /^\d+$/.test(w) || /^[A-Z][\w.'-]*$/.test(w));
+}
+
+/** Labels that recur often enough, and look enough like names, to be speakers. */
+function detectInlineLabels(lines: string[]): Set<string> {
+  const counts = new Map<string, number>();
+  let nonEmpty = 0;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    nonEmpty++;
+    const name = line.match(INLINE_SPEAKER)?.groups?.name?.trim();
+    if (!name || !looksLikeName(name)) continue;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  if (nonEmpty === 0) return new Set();
+
+  // A real speaker label recurs; a one-off is punctuation that happened to fit.
+  const repeated = [...counts.entries()].filter(([, n]) => n >= 2);
+  // Too many distinct labels means we're matching prose, not diarization.
+  if (repeated.length === 0 || repeated.length > 12) return new Set();
+  // A low floor on purpose: when a turn wraps across several lines only the
+  // first carries the label, so coverage in a well-formed dialogue can sit near
+  // a fifth. The name shape above is what excludes prose, not this ratio.
+  const covered = repeated.reduce((n, [, c]) => n + c, 0);
+  if (covered / nonEmpty < 0.15) return new Set();
+
+  // The repeated labels establish that this transcript IS speaker-prefixed
+  // dialogue. Once that's settled, a name-shaped label appearing only once is a
+  // participant who spoke once, not punctuation — and dropping it is not
+  // harmless: their lines fold into the previous speaker's turn, which then
+  // merges away entirely and attributes their words to someone else.
+  if (counts.size <= 12) return new Set(counts.keys());
+  return new Set(repeated.map(([name]) => name));
+}
 
 function toSeconds(stamp: string | undefined): number | null {
   if (!stamp) return null;
@@ -65,6 +140,7 @@ export function parseTranscript(raw: string): Turn[] {
     const text = current.body.join('\n').trim();
     if (text) {
       turns.push({
+        index: turns.length,
         speaker: current.speaker,
         startSeconds: current.startSeconds,
         text,
@@ -76,9 +152,35 @@ export function parseTranscript(raw: string): Turn[] {
     current = null;
   };
 
+  const inlineLabels = detectInlineLabels(lines);
+
   for (const line of lines) {
     const lineStart = offset;
     offset += line.length + 1; // +1 for the newline we split on
+
+    if (inlineLabels.size) {
+      const inline = line.match(INLINE_SPEAKER);
+      const name = inline?.groups?.name?.trim();
+      if (name && inlineLabels.has(name)) {
+        flush();
+        current = {
+          speaker: name,
+          startSeconds: toSeconds(inline?.groups?.lead),
+          body: [inline?.groups?.text ?? ''],
+          // Offset of the utterance itself, not the label.
+          offset: lineStart + line.indexOf(inline?.groups?.text ?? ''),
+        };
+        continue;
+      }
+      // A continuation line inside the current speaker's turn.
+      if (!current) {
+        if (!line.trim()) continue;
+        current = { speaker: 'UNKNOWN', startSeconds: null, body: [], offset: lineStart };
+      }
+      current.body.push(line);
+      continue;
+    }
+
     const m = line.match(SPEAKER_LINE);
     // A header must have a timestamp OR be short and followed by content; a bare
     // sentence that happens to end in a colon is not a speaker change.
@@ -103,6 +205,7 @@ export function parseTranscript(raw: string): Turn[] {
   if (turns.length === 0 && raw.trim()) {
     return [
       {
+        index: 0,
         speaker: 'UNKNOWN',
         startSeconds: null,
         text: raw.trim(),
@@ -127,20 +230,45 @@ export function parseTranscript(raw: string): Turn[] {
  *
  * Only merges across a small time gap: the same label reappearing five minutes
  * later is a different utterance, and possibly a different person.
+ *
+ * And only up to `maxWords`. The gap guard silently does nothing on a transcript
+ * with no timestamps — a null start makes every gap read as 0 — which is exactly
+ * the shape the live recorder produces, so merging there had no brake at all. On
+ * Patricia's session that glued a 272-word source turn into a 498-word one.
+ *
+ * That matters beyond tidiness: a turn is the unit a finding is cited against,
+ * and verification asks whether the cited turn says the thing. A 498-word turn
+ * re-creates the wide matching window the verifier deliberately dropped, and it
+ * is where that session's one real fabrication hid. Merging exists to give
+ * speaker attribution richer turns to score, and it gets that from a paragraph
+ * just as well as from a page.
  */
-export function mergeAdjacentTurns(turns: Turn[], maxGapSeconds = 30): Turn[] {
+export function mergeAdjacentTurns(turns: Turn[], maxGapSeconds = 30, maxWords = 120): Turn[] {
   const out: Turn[] = [];
+  // Track lengths alongside, so a long run of merges stays linear rather than
+  // re-counting the accumulated text on every step.
+  const lengths: number[] = [];
+  const countWords = (s: string): number => s.split(/\s+/).filter(Boolean).length;
+
   for (const t of turns) {
     const prev = out[out.length - 1];
     const gap =
       prev && prev.startSeconds != null && t.startSeconds != null
         ? t.startSeconds - prev.startSeconds
         : 0;
-    if (prev && prev.speaker === t.speaker && gap <= maxGapSeconds) {
+    const words = countWords(t.text);
+    if (
+      prev &&
+      prev.speaker === t.speaker &&
+      gap <= maxGapSeconds &&
+      lengths[lengths.length - 1] + words <= maxWords
+    ) {
       prev.text = `${prev.text} ${t.text}`;
+      lengths[lengths.length - 1] += words;
       continue;
     }
     out.push({ ...t });
+    lengths.push(words);
   }
   return out;
 }
@@ -281,14 +409,27 @@ export function attributionCoverage(turns: Turn[]): number {
   return total === 0 ? 1 : attributed / total;
 }
 
-/** Render attributed turns back to text for the prompt, with real role labels. */
+/**
+ * Render attributed turns back to text for the prompt, with real role labels and
+ * the turn's global number.
+ *
+ * The `#n` is what the model cites findings against. Numbering the source it is
+ * already reading costs nothing and turns provenance from prose the model has to
+ * reproduce from memory into a reference it only has to point at — and pointing
+ * is checkable, where reproducing is not.
+ */
 export function renderTurns(turns: Turn[]): string {
   return turns
     .map((t) => {
       const stamp = t.startSeconds != null ? ` [${formatStamp(t.startSeconds)}]` : '';
-      return `${t.role}${stamp}: ${t.text}`;
+      return `#${t.index} ${t.role}${stamp}: ${t.text}`;
     })
     .join('\n\n');
+}
+
+/** Turns keyed by their global index, for resolving a citation back to source. */
+export function turnsByIndex(turns: Turn[]): Map<number, Turn> {
+  return new Map(turns.map((t) => [t.index, t]));
 }
 
 export function formatStamp(seconds: number): string {
@@ -402,7 +543,9 @@ export interface PreparedTranscript {
 
 /** One-shot preparation used by the extractor. */
 export function prepareTranscript(raw: string): PreparedTranscript {
-  const turns = attributeSpeakers(mergeAdjacentTurns(parseTranscript(raw)));
+  // Index AFTER merging: merging collapses turns, so numbering before it would
+  // leave gaps and point citations at turns that no longer exist.
+  const turns = attributeSpeakers(indexTurns(mergeAdjacentTurns(parseTranscript(raw))));
   const full = renderTurns(turns);
   return {
     raw,

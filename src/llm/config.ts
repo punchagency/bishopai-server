@@ -32,16 +32,68 @@ function resolveProvider(): Provider {
 
 const provider = resolveProvider();
 
+/** Tokens of headroom left for the system prompt and schema on every call. */
+const PROMPT_OVERHEAD_TOKENS = 800;
+
+/**
+ * Completion budget requested on the FIRST attempt.
+ *
+ * Providers charge the REQUESTED completion against the rate limit, not the
+ * tokens actually produced — so this number is spent on every call whether the
+ * answer needs it or not. On an 8k/minute tier a 4096 reservation means roughly
+ * one call per minute, and a session that needs a dozen calls simply runs out of
+ * minute before it runs out of work: chunks then fail on rate limits and the
+ * stage lands `partial`.
+ *
+ * Tempting, therefore, to shrink it and buy more calls per minute. That was
+ * measured and it backfires: at 1536 the narrative stage's JSON — concerns,
+ * goals, assessments, follow-ups, lifestyle AND their evidence for a whole chunk
+ * — truncates, every chunk burns a retry at double the budget, and the stage is
+ * dropped outright rather than merely slowed. Recall fell from 14% to 3%.
+ *
+ * So the binding constraint is answer completeness, not call rate. 4096 stands
+ * until there is a measurement that says otherwise.
+ */
+function defaultMaxTokens(): number {
+  return 4096;
+}
+
+/**
+ * Largest transcript we can still send in one piece.
+ *
+ * Both halves of a request — the transcript going up and the completion budget
+ * reserved for the answer — are charged against the same per-minute allowance,
+ * so a single-pass call is only viable when input + output + prompt fit inside
+ * it. Anything larger must chunk, and finding that out from a 413 costs a whole
+ * window per stage.
+ */
+function defaultChunkThreshold(): number {
+  const budget = Number(
+    process.env.LLM_TOKENS_PER_MINUTE ?? (provider === 'groq' ? 8_000 : 1_000_000),
+  );
+  const output = Number(
+    process.env.LLM_MAX_TOKENS ?? process.env.ANTHROPIC_MAX_TOKENS ?? defaultMaxTokens(),
+  );
+  // Never collapse to something so small that every session shatters into chunks.
+  return Math.max(1500, budget - output - PROMPT_OVERHEAD_TOKENS);
+}
+
 export const llmConfig = {
   provider,
   // Per-minute token budget the rate limiter (llm/rateLimiter.ts) paces LLM calls
-  // under, so the extraction fan-out queues instead of 429-bursting. Sized to the
-  // active provider: Groq's free tier is ~12k TPM (counting requested completion
-  // tokens), so default to 10k for headroom; other providers / paid tiers have
-  // far higher limits, so effectively don't throttle unless LLM_TOKENS_PER_MINUTE
-  // is set. Raise this the moment you move off the Groq free tier.
+  // under, so the extraction fan-out queues instead of 429-bursting.
+  //
+  // 8000 is Groq's ACTUAL free-tier ceiling, read off `x-ratelimit-limit-tokens`
+  // on a live response — not the ~12k this was originally written against. The
+  // gap was not academic: the limiter was admitting calls the API then refused,
+  // so every stage of a real session burned a request on a 413 before falling
+  // back to chunks. Other providers / paid tiers have far higher limits, so they
+  // effectively don't throttle unless LLM_TOKENS_PER_MINUTE is set.
+  //
+  // Check it rather than assume it — the tier's limits and its model list both
+  // change without notice (`npm run check:llm`).
   tokensPerMinute: Number(
-    process.env.LLM_TOKENS_PER_MINUTE ?? (provider === 'groq' ? 10_000 : 1_000_000),
+    process.env.LLM_TOKENS_PER_MINUTE ?? (provider === 'groq' ? 8_000 : 1_000_000),
   ),
   // Output budget for the FIRST attempt. Deliberately modest: providers bill
   // requested completion tokens against rate limits (Groq's free tier counts
@@ -53,7 +105,9 @@ export const llmConfig = {
   // truncation is a typed error that retries at double the budget, so the cost
   // of guessing low is one extra call on the rare session that needs it,
   // instead of a rate-limit failure on every ordinary one.
-  maxTokens: Number(process.env.LLM_MAX_TOKENS ?? process.env.ANTHROPIC_MAX_TOKENS ?? 4096),
+  maxTokens: Number(
+    process.env.LLM_MAX_TOKENS ?? process.env.ANTHROPIC_MAX_TOKENS ?? defaultMaxTokens(),
+  ),
   /** Ceiling for the truncation retry, which doubles the budget and re-runs. */
   maxTokensCeiling: Number(process.env.LLM_MAX_TOKENS_CEILING ?? 32768),
 
@@ -62,12 +116,27 @@ export const llmConfig = {
   // recall on "find every scattered callout" decays silently, which is worse
   // than the merge cost of chunking.
   //
-  // Tuned to the real workload: a typical 30-minute session is ~6k tokens, so
-  // 6000 left her normal visit straddling the boundary — chunking some sessions
-  // that would read better whole. 8000 keeps a normal (and up to ~40-minute)
-  // session single-pass; chunking now only kicks in for genuinely long outliers.
-  chunkThresholdTokens: Number(process.env.EXTRACTION_CHUNK_THRESHOLD_TOKENS ?? 8000),
-  chunkTargetTokens: Number(process.env.EXTRACTION_CHUNK_TARGET_TOKENS ?? 3000),
+  // The ceiling is not a taste question, it is arithmetic: a whole-transcript
+  // call sends the input AND reserves the completion budget against the same
+  // per-minute allowance, so it is only possible when both fit inside it. On
+  // Groq's 8k tier a 7k-token session plus a 4k completion reservation is ~11k
+  // and CANNOT be served — the old fixed 8000 looked only at the input, judged
+  // it single-pass, and sent a request guaranteed to 413. Three stages did that
+  // in turn, spending most of the minute's budget before any real work started.
+  //
+  // So derive it: chunk whenever a whole call would not fit, and keep a margin
+  // for the prompt itself. On a high-limit provider this stays far above any
+  // real session, preserving the single-pass reading that reads better.
+  chunkThresholdTokens: Number(
+    process.env.EXTRACTION_CHUNK_THRESHOLD_TOKENS ?? defaultChunkThreshold(),
+  ),
+  // Sized as a FRACTION of the ceiling, not right at it. A chunk built to the
+  // exact limit leaves nothing for the ~4 chars/token estimate being wrong, and
+  // being wrong means a 413 that costs the whole window. Paying for an extra
+  // chunk is the cheap side of that trade.
+  chunkTargetTokens: Number(
+    process.env.EXTRACTION_CHUNK_TARGET_TOKENS ?? Math.max(1200, Math.floor(defaultChunkThreshold() * 0.7)),
+  ),
   chunkOverlapTurns: Number(process.env.EXTRACTION_CHUNK_OVERLAP_TURNS ?? 2),
   /** Parallel chunk calls. Keeps a long session inside free-tier rate limits. */
   chunkConcurrency: Number(process.env.EXTRACTION_CHUNK_CONCURRENCY ?? 3),
@@ -75,7 +144,7 @@ export const llmConfig = {
    *  per-minute budget the chunks of one long session queue behind each other,
    *  and abandoning a chunk on the first rate limit loses that slice of the
    *  session over a delay we could have waited. */
-  rateLimitRetries: Number(process.env.LLM_RATE_LIMIT_RETRIES ?? 3),
+  rateLimitRetries: Number(process.env.LLM_RATE_LIMIT_RETRIES ?? (provider === 'groq' ? 6 : 3)),
 
   groq: {
     apiKey: process.env.GROQ_API_KEY ?? '',

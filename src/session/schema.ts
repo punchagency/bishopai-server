@@ -414,14 +414,56 @@ export const SupplementSchema = z.preprocess(
  * mechanical hallucination check available: a quote that does not appear in the
  * transcript is a fabricated finding, detectable without a human.
  */
+/**
+ * How a piece of evidence was checked. Verbatim prose is the weakest form of
+ * citation a model can give — it has to reproduce the words from memory, and it
+ * routinely paraphrases instead, so a failed text match conflates "invented the
+ * finding" with "invented only the wording". A turn NUMBER cannot be
+ * paraphrased: it either addresses the turn that supports the claim or it does
+ * not, and the server can tell which without a human.
+ *
+ *  - `span`        cited a turn, and quoted it word for word — the strong case
+ *  - `span_near`   cited a turn that is clearly about this, but the quote is a
+ *                  paraphrase of it. The model had the turn in front of it and
+ *                  still reworded, so the wording is its own rather than the
+ *                  practitioner's. The finding stands; the phrasing wants eyes,
+ *                  because this is the shape a reversed meaning arrives in
+ *                  ("not high" against a turn that says "high ... not on
+ *                  anything"), and no lexical check resolves that scope
+ *  - `exact`       no usable citation, but the quote is verbatim in the transcript
+ *  - `near`        no usable citation, and the quote only approximately matches
+ *  - `unsupported` nothing backs this finding
+ *  - `misattributed` cited a REAL turn that does not say this — the model
+ *                  pointed somewhere specific and was wrong, which is a stronger
+ *                  fabrication signal than a quote that merely failed to match
+ *  - `bad_span`    cited a turn number that does not exist
+ */
+export const VERIFICATION_VALUES = [
+  'span', 'span_near', 'exact', 'near', 'unsupported', 'misattributed', 'bad_span',
+] as const;
+export type VerificationStatus = (typeof VERIFICATION_VALUES)[number];
+
 export const EvidenceSchema = z.object({
   /** Dotted field path: "nrt.hta", "concerns.0", "supplements.1". */
   path: z.string(),
   quote: z.string(),
   at_seconds: num(),
+  /** Global turn number this finding was read from — the `#n` in the rendered
+   *  transcript. Null when the model gave no citation. */
+  turn: num().optional(),
   /** Set by the server, not the model: the quote was not found in the
    *  transcript. The finding is kept and flagged, never silently dropped. */
   unverified: z.boolean().optional(),
+  /** Server-computed: how the check above was satisfied, or how it failed. */
+  verification: z.enum(VERIFICATION_VALUES).optional(),
+  /** Server-resolved: the cited turn's ACTUAL words. Review shows this rather
+   *  than the model's rendering of them, so what Nicole confirms against is the
+   *  transcript itself. */
+  turn_text: stated().optional(),
+  /** What the model originally cited, when the server had to repoint `turn`.
+   *  Keeps citation drift measurable rather than letting a corrected pointer
+   *  look like one that was right the first time. */
+  turn_cited: num().optional(),
 });
 export type Evidence = z.infer<typeof EvidenceSchema>;
 
@@ -520,6 +562,7 @@ const EvidenceWire = z.object({
   path: z.string(),
   quote: z.string(),
   at_seconds: num(),
+  turn: num(),
 });
 
 const SupplementWire = z.object({
@@ -599,6 +642,9 @@ const SERVER_ONLY = new Set([
   'type_raw',
   'type_unresolved',
   'unverified',
+  'verification',
+  'turn_text',
+  'turn_cited',
   'name_matched_to',
 ]);
 

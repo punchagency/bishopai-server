@@ -22,7 +22,7 @@ import { nrtPrompt } from './prompts/nrt';
 import { PROMPT_VERSION, type PromptContext } from './prompts/shared';
 import { matchCatalog } from './supplementName';
 import { chunkTurns, formatStamp, prepareTranscript, renderTurns, type Chunk } from './transcript';
-import { verifyEvidence } from './verifyEvidence';
+import { summarize, verifyEvidence } from './verifyEvidence';
 
 // Re-exported so the many existing importers of `./extract` keep working; the
 // schemas themselves now live in ./schema.
@@ -300,7 +300,29 @@ export async function extractSessionNote(
       return merged.note;
       };
 
-      return shouldChunk && stage.chunked ? runChunked() : runWhole();
+      // `stage.chunked` says a stage PREFERS the whole session; it cannot
+      // conjure budget that isn't there. The narrative pass wants every scattered
+      // concern in one view, so it never opts into chunking — and on a tier
+      // whose ceiling is below the transcript it would send a doomed call every
+      // time, spend most of the window on the 413, and only then chunk with what
+      // little was left. That is how the stage ended up `partial` while the two
+      // stages that chunked up front came back whole.
+      //
+      // The fallback below still exists for the cases only the API can reveal.
+      // This is for the case we can compute in advance: if it cannot fit, chunk
+      // now and spend the budget on work instead of on being told no.
+      const fitsWhole = prepared.tokens <= llmConfig.chunkThresholdTokens;
+      const mustChunk = !fitsWhole && chunkPlan.length > 0;
+      if (mustChunk && !stage.chunked) {
+        logEvent('info', 'session.extract', 'transcript exceeds a single call — chunking up front', {
+          stage: stage.name,
+          tokens: prepared.tokens,
+          threshold: llmConfig.chunkThresholdTokens,
+          chunks: chunkPlan.length,
+        });
+        partial.push(`${stage.name}:chunked`);
+      }
+      return (shouldChunk && stage.chunked) || mustChunk ? runChunked() : runWhole();
     }),
   );
 
@@ -310,8 +332,11 @@ export async function extractSessionNote(
   // transcript is a fabricated finding, and that is mechanically detectable
   // without a human. Flag, never drop — a real finding with a paraphrased quote
   // must not vanish.
-  const evidence = verifyEvidence(note.evidence ?? [], transcript);
-  const unverified = evidence.filter((e) => e.unverified).length;
+  // Pass the SAME turns the prompt rendered. The model cited "#47" against that
+  // numbering; re-deriving it here from scratch would work only by coincidence.
+  const evidence = verifyEvidence(note.evidence ?? [], transcript, prepared.turns);
+  const stats = summarize(evidence);
+  const unverified = stats.unverified;
 
   const parsed = SessionNoteSchema.parse({
     ...note,
@@ -335,6 +360,10 @@ export async function extractSessionNote(
     conflicts: conflicts.length,
     evidence: evidence.length,
     unverified,
+    // Share of findings anchored to a specific turn rather than matched as
+    // prose — the health signal for whether citation is actually working.
+    spans: stats.spans,
+    verification: stats.byStatus,
     attribution_coverage: Number(prepared.attributionCoverage.toFixed(3)),
   });
 

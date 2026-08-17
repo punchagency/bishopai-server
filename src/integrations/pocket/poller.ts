@@ -118,3 +118,35 @@ export async function pollPocketRecordings(
   logEvent('info', 'pocket.poll', 'sweep complete', { ...result, start_date: startDate, end_date: endDate });
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Debounced trigger — safe to call from any event handler (PB session
+// completed, appointment ended, manual trigger). If a poll ran within the
+// last DEBOUNCE_MS, the call is skipped so overlapping triggers don't stack
+// API requests.
+// ---------------------------------------------------------------------------
+const DEBOUNCE_MS = 60_000; // 1 minute
+let lastPollAt = 0;
+
+/**
+ * Fire a Pocket poll unless one ran very recently.
+ *
+ * Returns `true` if the poll actually ran, `false` if debounced.
+ * Safe to call from setTimeout / fire-and-forget contexts.
+ */
+export async function triggerPocketPoll(reason: string): Promise<boolean> {
+  const now = Date.now();
+  if (now - lastPollAt < DEBOUNCE_MS) {
+    logEvent('info', 'pocket.trigger', 'debounced — poll ran recently', { reason, last_poll_ago_s: Math.round((now - lastPollAt) / 1000) });
+    return false;
+  }
+  lastPollAt = now;
+  try {
+    const result = await pollPocketRecordings();
+    logEvent('info', 'pocket.trigger', 'event-driven poll complete', { reason, ...result });
+    return true;
+  } catch (err) {
+    await logError('pocket.trigger', 'event-driven poll failed', err, { reason });
+    return false;
+  }
+}

@@ -11,7 +11,7 @@ import {
   mapProtocolType,
 } from './schema';
 import { matchCatalog, nameSimilarity, normalizeSupplementName } from './supplementName';
-import { verifyEvidence } from './verifyEvidence';
+import { summarize, verifyEvidence } from './verifyEvidence';
 
 describe('supplement action mapping', () => {
   it('maps the words the practitioner actually uses', () => {
@@ -162,6 +162,40 @@ describe('evidence verification', () => {
     );
     expect(out).toHaveLength(1);
   });
+
+  it('passes a paraphrase whose content words are all present', () => {
+    // Near-matching exists for this case: same finding, looser wording.
+    const [e] = verifyEvidence(
+      [{ path: 'assessments.0', quote: 'gallbladder stress', at_seconds: 2 }],
+      transcript,
+    );
+    expect(e.unverified).toBe(false);
+  });
+
+  it('flags a quote that inverts the finding it cites', () => {
+    // The dangerous near-match: every content word is in the transcript, but the
+    // negation is not, so the quote asserts the opposite of what was said. Word
+    // overlap alone waves this through — which is why negators are required
+    // verbatim rather than counted toward the ratio.
+    const [e] = verifyEvidence(
+      [{ path: 'assessments.0', quote: 'the gallbladder is not showing stress', at_seconds: 2 }],
+      transcript,
+    );
+    expect(e.unverified).toBe(true);
+  });
+
+  it('does not let a wide window manufacture a match from scattered words', () => {
+    // Every content word below appears in this transcript, but spread across
+    // unrelated sentences — never as the claim the quote makes.
+    const scattered =
+      'Speaker 1 0:02\nThe gallbladder is fine.\nSpeaker 2 0:20\nSleep has been good.\n' +
+      'Speaker 1 0:40\nWe talked about stress at work last month.\n';
+    const [e] = verifyEvidence(
+      [{ path: 'assessments.0', quote: 'the gallbladder is showing stress', at_seconds: 2 }],
+      scattered,
+    );
+    expect(e.unverified).toBe(true);
+  });
 });
 
 describe('provider JSON schema', () => {
@@ -218,5 +252,126 @@ describe('provider JSON schema', () => {
       properties: { nrt: { properties: Record<string, unknown>; required: string[] } };
     };
     expect(nrt.properties.nrt.required).toEqual(Object.keys(nrt.properties.nrt.properties));
+  });
+});
+
+describe('span-based evidence', () => {
+  // Turn #0 practitioner, #1 client, #2 practitioner.
+  const transcript = [
+    'SPEAKER_00: So the gallbladder is showing some stress today.',
+    'SPEAKER_01: I do have high cholesterol. But I am not on anything for it.',
+    'SPEAKER_00: We are going to add a B vitamin to pair with that.',
+  ].join('\n');
+
+  const ev = (e: Record<string, unknown>) =>
+    verifyEvidence([{ path: 'assessments.0', at_seconds: null, ...e } as never], transcript)[0];
+
+  it('verifies a quote copied out of the turn it cites', () => {
+    const e = ev({ quote: 'the gallbladder is showing some stress', turn: 0 });
+    expect(e.verification).toBe('span');
+    expect(e.unverified).toBe(false);
+  });
+
+  it('resolves the cited turn back to its real words for review', () => {
+    // The point of a citation: Nicole reads the transcript, not the model's
+    // rendering of it.
+    const e = ev({ quote: 'the gallbladder is showing some stress', turn: 0 });
+    expect(e.turn_text).toContain('So the gallbladder is showing some stress today.');
+  });
+
+  it('flags a citation pointing at a turn that does not say this', () => {
+    // The strongest fabrication signal available: the model pointed somewhere
+    // specific and was wrong.
+    const e = ev({ quote: 'the thyroid was removed last year', turn: 0 });
+    expect(e.verification).toBe('misattributed');
+    expect(e.unverified).toBe(true);
+  });
+
+  it('flags a citation to a turn number that does not exist', () => {
+    const e = ev({ quote: 'HTA is coming in at sixty eight', turn: 99 });
+    expect(e.verification).toBe('bad_span');
+    expect(e.unverified).toBe(true);
+  });
+
+  it('corrects a wrong turn number when the quote is verbatim elsewhere', () => {
+    // The finding is real and the words are real — only the pointer was wrong,
+    // so repoint it rather than discarding the evidence.
+    const e = ev({ quote: 'We are going to add a B vitamin', turn: 0 });
+    expect(e.verification).toBe('exact');
+    expect(e.turn).toBe(2);
+    expect(e.unverified).toBe(false);
+  });
+
+  it('separates a reworded citation from a copied one', () => {
+    // "not high" against a turn that says "high cholesterol ... not on anything":
+    // the negation belongs to a different clause, and no lexical check resolves
+    // that scope. It stays supported but marked as the model's wording, which is
+    // what sends Nicole to the turn text where the reversal is obvious.
+    const e = ev({ quote: 'my cholesterol is not high', turn: 1 });
+    expect(e.verification).toBe('span_near');
+    expect(e.turn_text).toContain('I do have high cholesterol');
+  });
+
+  it('tolerates an off-by-one citation, and records the drift', () => {
+    // Real failure from Patricia's session: the model cited #160 for findings
+    // plainly stated in #161, having cited #161 correctly four other times.
+    // Not verbatim anywhere, so the exact-match repoint cannot rescue it — this
+    // reaches the drift path specifically.
+    const e = ev({ quote: 'gallbladder stress', turn: 1 });
+    expect(e.verification).toBe('span_near');
+    expect(e.turn).toBe(0);
+    expect(e.turn_cited).toBe(1);
+    expect(e.unverified).toBe(false);
+  });
+
+  it('does not let that tolerance rescue an invented finding', () => {
+    // The boundary that makes the tolerance safe: a finding stated nowhere in
+    // the session must stay flagged even with drift allowed.
+    const e = ev({ quote: 'the thyroid was removed last year', turn: 1 });
+    expect(e.verification).toBe('misattributed');
+    expect(e.unverified).toBe(true);
+  });
+
+  it('reads through a disfluency the speaker left in', () => {
+    // Real case: Nicole said "the thyroid is, like, crashing". The quote is a
+    // faithful copy and still not a substring, and that alone was enough to
+    // report a true clinical finding as fabricated.
+    const spoken = 'SPEAKER_00: To no surprise, the thyroid is, like, crashing.';
+    const [e] = verifyEvidence(
+      [{ path: 'assessments.0', quote: 'the thyroid is crashing', turn: 0, at_seconds: null } as never],
+      spoken,
+    );
+    expect(e.verification).toBe('span');
+    expect(e.unverified).toBe(false);
+  });
+
+  it('does not strip a meaningful "like" along with the filler', () => {
+    const spoken = 'SPEAKER_00: Yeah, I like garlic.';
+    const [e] = verifyEvidence(
+      [{ path: 'concerns.0', quote: 'I like garlic', turn: 0, at_seconds: null } as never],
+      spoken,
+    );
+    expect(e.verification).toBe('span');
+  });
+
+  it('still verifies notes extracted before citations existed', () => {
+    // No `turn` at all — the stored-note path must keep working.
+    const e = ev({ quote: 'the gallbladder is showing some stress' });
+    expect(e.verification).toBe('exact');
+    expect(e.unverified).toBe(false);
+  });
+
+  it('counts anchored findings so citation health is observable', () => {
+    const out = verifyEvidence(
+      [
+        { path: 'a', quote: 'the gallbladder is showing some stress', turn: 0, at_seconds: null },
+        { path: 'b', quote: 'invented entirely', turn: 0, at_seconds: null },
+      ] as never,
+      transcript,
+    );
+    const s = summarize(out);
+    expect(s.spans).toBe(1);
+    expect(s.unverified).toBe(1);
+    expect(s.byStatus.misattributed).toBe(1);
   });
 });

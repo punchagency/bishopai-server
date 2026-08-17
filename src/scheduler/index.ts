@@ -13,6 +13,7 @@ import { morningBriefJob } from './jobs/morningBrief';
 import { sessionsPollJob } from './jobs/sessionsPoll';
 import { extractionJob } from './jobs/extraction';
 import { pocketPollJob } from './jobs/pocketPoll';
+import { pocketPostSessionJob } from './jobs/pocketPostSession';
 
 // In-process scheduler for the WF3/WF4 cadences (§14). Opt-in via
 // SCHEDULER_ENABLED=true so dev/tests don't run background jobs. Each tick is
@@ -30,6 +31,7 @@ const jobs: Job[] = [
   sessionsPollJob,
   extractionJob,
   pocketPollJob,
+  pocketPostSessionJob,
 ];
 let tasks: ScheduledTask[] = [];
 

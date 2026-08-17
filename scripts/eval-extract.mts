@@ -350,8 +350,17 @@ if (names.length === 0) {
   process.exit(1);
 }
 
+// The LLM rate limiter unrefs its pacing timer so it can never hold a server
+// process open. In a one-shot script that backfires: while a stage waits for
+// token budget there is nothing else keeping the event loop alive, so Node
+// exits 0 with the eval silently producing no output at all — which reads as
+// "no problems found" rather than "never ran". Pin the loop open for the run.
+const keepAlive = setInterval(() => {}, 1000);
+
 const reports: FixtureReport[] = [];
 for (const name of names) reports.push(await evaluate(name));
+
+clearInterval(keepAlive);
 
 if (asJson) console.log(JSON.stringify({ provider: llmConfig.provider, reports }, null, 2));
 else print(reports);

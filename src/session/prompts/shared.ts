@@ -3,7 +3,7 @@
 // Version-stamped: the version is written onto every extracted note, so an
 // accuracy regression spotted weeks later can be traced back to the prompt
 // change that caused it rather than guessed at.
-export const PROMPT_VERSION = '2026-07-28.1';
+export const PROMPT_VERSION = '2026-08-17.1';
 
 export interface PromptContext {
   /** Who the client is. Removes the single biggest source of speaker confusion:
@@ -36,13 +36,25 @@ const SPEAKERS = [
 
 const EVIDENCE = [
   'EVIDENCE (required): alongside the findings, return an `evidence` object mapping',
-  'each field you filled to the exact words that justify it:',
-  '  { "nrt.hta": { "quote": "HTA is coming in negative", "at_seconds": 412 },',
-  '    "concerns.0": { "quote": "the gallbladder pain is back", "at_seconds": 96 } }',
+  'each field you filled to the place in the transcript that justifies it:',
+  '  { "nrt.hta": { "turn": 214, "quote": "HTA is coming in negative", "at_seconds": 412 },',
+  '    "concerns.0": { "turn": 31, "quote": "the gallbladder pain is back", "at_seconds": 96 } }',
   'Keys are dotted field paths; array items use their index (concerns.0, supplements.1).',
-  'The quote MUST be copied verbatim from the transcript and be 25 words or fewer.',
-  'at_seconds is the timestamp on the turn the quote came from, or null.',
-  'Do not invent a quote to justify a field — if you cannot quote it, do not fill it.',
+  '',
+  'Every turn in the transcript is numbered — the `#214` at the start of the line.',
+  '`turn` is that number, for the ONE turn you read the finding from. This is the',
+  'part that matters most: it is checked against the transcript automatically, so a',
+  'number pointing at a turn that does not say this is worse than no answer at all.',
+  'If a finding is built from several turns, cite the turn that states it most',
+  'directly. If you genuinely cannot point to a turn, return null — never guess a',
+  'number.',
+  '',
+  'The quote MUST be copied verbatim from that turn and be 25 words or fewer. Copy it',
+  'character for character — do not tidy, shorten, or rephrase it, and take special',
+  'care with any negation ("not", "no", "never"): dropping or adding one reverses the',
+  'clinical finding.',
+  'at_seconds is the timestamp on that turn, or null.',
+  'Do not invent evidence to justify a field — if you cannot point at it, do not fill it.',
 ].join('\n');
 
 /** Preamble shared by every stage. */

@@ -1,4 +1,6 @@
 import type { SessionNote } from './extract';
+import type { Evidence } from './schema';
+import { indexTurns, mergeAdjacentTurns, parseTranscript, type Turn } from './transcript';
 
 // Deterministic, no-API-key transcript extractor for LLM_PROVIDER=mock. Light
 // heuristics over the transcript text so seeded/demo conversations produce
@@ -129,14 +131,47 @@ function mockLifestyle(raw: string): SessionNote['lifestyle'] {
   };
 }
 
+/**
+ * Provenance for the mock, built the same way the real path expects it: a turn
+ * number plus words copied verbatim out of that turn.
+ *
+ * The mock exists so the whole chain can be demoed without an API key, and
+ * provenance is now part of that chain — a demo whose evidence is empty would
+ * show the review UI in a state it never reaches in production, and would leave
+ * the span verifier untested by every offline run.
+ */
+function citeTurn(turns: Turn[], re: RegExp): Omit<Evidence, 'path'> | null {
+  for (const turn of turns) {
+    const m = turn.text.match(re);
+    if (!m) continue;
+    // The sentence the cue landed in, capped the way the prompt caps a quote.
+    const at = turn.text.toLowerCase().indexOf(m[0].toLowerCase());
+    const start = Math.max(0, turn.text.lastIndexOf('.', at) + 1);
+    const endDot = turn.text.indexOf('.', at);
+    const end = endDot === -1 ? turn.text.length : endDot + 1;
+    const quote = turn.text.slice(start, end).trim().split(/\s+/).slice(0, 25).join(' ');
+    if (!quote) continue;
+    return { quote, turn: turn.index, at_seconds: turn.startSeconds };
+  }
+  return null;
+}
+
 export function mockExtractSessionNote(transcript: string): SessionNote {
   const raw = transcript || '';
   const t = raw.toLowerCase(); // cue matching only; captured values come from `raw`
+  const turns = indexTurns(mergeAdjacentTurns(parseTranscript(raw)));
+  const evidence: Evidence[] = [];
+  const cite = (path: string, re: RegExp): void => {
+    const found = citeTurn(turns, re);
+    if (found) evidence.push({ path, ...found });
+  };
 
   const concerns: string[] = [];
   const assessments: string[] = [];
   for (const s of SYMPTOMS) {
     if (s.match.test(t)) {
+      cite(`concerns.${concerns.length}`, s.match);
+      cite(`assessments.${assessments.length}`, s.match);
       concerns.push(s.concern);
       assessments.push(s.assessment);
     }
@@ -152,6 +187,7 @@ export function mockExtractSessionNote(transcript: string): SessionNote {
   for (const s of SUPPLEMENTS) {
     if (s.match.test(t)) {
       const change = starting ? 'start' : 'continue';
+      cite(`supplements.${supplements.length}.name`, s.match);
       supplements.push({ name: s.name, dose: s.dose, quantity: 60, change });
       protocol_changes.push({
         description: `${change === 'start' ? 'Start' : 'Continue'} ${s.name} — ${s.dose}`,
@@ -184,5 +220,6 @@ export function mockExtractSessionNote(transcript: string): SessionNote {
     follow_ups,
     nrt: mockNrt(raw),
     lifestyle: mockLifestyle(raw),
+    evidence: evidence.length ? evidence : undefined,
   };
 }

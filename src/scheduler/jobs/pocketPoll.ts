@@ -8,7 +8,7 @@ import { pollPocketRecordings } from '../../integrations/pocket/poller';
 // configured. No-op until POCKET_API_KEY is set.
 export const pocketPollJob: Job = {
   name: 'pocket.poll',
-  schedule: process.env.CRON_POCKET_POLL ?? '*/10 * * * *', // every 10 min
+  schedule: process.env.CRON_POCKET_POLL ?? '*/3 * * * *', // every 3 min
   async run() {
     const result = await pollPocketRecordings();
     if (result.skipped) return; // not configured / disabled — stay quiet
