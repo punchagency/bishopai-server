@@ -498,8 +498,27 @@ export const ExtractionMetaSchema = z.object({
       candidates: z.array(z.string()).default([]),
     }),
   ).optional(),
-  /** Time ranges of the session that produced no usable extraction. */
-  gaps: z.array(z.object({ from: num(), to: num() })).optional(),
+  /**
+   * Parts of the session that produced no usable extraction.
+   *
+   * `from`/`to` are seconds, and are null for a recorder that emits no
+   * timestamps — which is the one actually in use, so a gap rendered from time
+   * alone reads as "–, –, –" and tells Nicole nothing about what is missing.
+   * `from_turn`/`to_turn` always exist: turns are numbered by us, not by the
+   * recorder. `stage` says which pass lost the range, since a missing NRT grid
+   * and a missing narrative are very different problems.
+   */
+  gaps: z
+    .array(
+      z.object({
+        from: num(),
+        to: num(),
+        from_turn: num().optional(),
+        to_turn: num().optional(),
+        stage: z.string().optional(),
+      }),
+    )
+    .optional(),
   /** Share of transcript words that got a speaker role. */
   attribution_coverage: num().optional(),
   chunks: num().optional(),

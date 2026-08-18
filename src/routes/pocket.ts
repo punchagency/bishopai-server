@@ -4,6 +4,7 @@ import { logError } from '../observability/logger';
 import {
   isPocketConfigured,
   isPocketWebhookConfigured,
+  isSchedulerEnabled,
   pocketPollConfig,
 } from '../integrations/pocket/config';
 
@@ -41,7 +42,10 @@ pocketRouter.get('/status', async (_req, res) => {
     res.json({
       configured: isPocketConfigured(),
       webhookVerified: isPocketWebhookConfigured(),
-      pollEnabled: poll.enabled,
+      // Configured AND actually running. Reporting config alone once claimed the
+      // backstop was ON while SCHEDULER_ENABLED decided whether it ever ticked.
+      pollEnabled: poll.enabled && isSchedulerEnabled(),
+      pollLookbackDays: poll.lookbackDays,
       lastRecordingAt,
       recordingsLast24h: Number(r?.last_24h ?? 0),
       unmatched: Number(r?.unmatched ?? 0),

@@ -118,8 +118,10 @@ async function callStage(
   user: string,
 ): Promise<Partial<SessionNote>> {
   // Per-stage budget, capped by the global setting so LLM_MAX_TOKENS still works
-  // as an override for a provider that needs more.
-  let maxTokens = Math.min(stage.maxTokens, llmConfig.maxTokens);
+  // as an override for a provider that needs more — plus headroom for a model
+  // that bills its reasoning against the same allowance, which would otherwise
+  // consume the whole budget before writing a character of JSON.
+  let maxTokens = Math.min(stage.maxTokens, llmConfig.maxTokens) + llmConfig.reasoningHeadroomTokens;
   let rateLimitRetries = 0;
   for (let attempt = 0; ; attempt++) {
     try {
@@ -230,7 +232,13 @@ export async function extractSessionNote(
 
   const partial: string[] = [];
   const conflicts: { path: string; chosen: string | null; candidates: string[] }[] = [];
-  const gaps: { from: number | null; to: number | null }[] = [];
+  const gaps: {
+    from: number | null;
+    to: number | null;
+    from_turn?: number;
+    to_turn?: number;
+    stage?: string;
+  }[] = [];
 
   const stageResults = await Promise.all(
     STAGES.map(async (stage): Promise<Partial<SessionNote> | null> => {
@@ -276,8 +284,30 @@ export async function extractSessionNote(
 
       const ok: ChunkResult[] = [];
       settled.forEach((r, i) => {
-        if (r.status === 'fulfilled') ok.push({ index: chunkPlan[i].index, note: r.value });
-        else gaps.push({ from: chunkPlan[i].startSeconds, to: chunkPlan[i].endSeconds });
+        if (r.status === 'fulfilled') {
+          ok.push({ index: chunkPlan[i].index, note: r.value });
+          return;
+        }
+        const chunk = chunkPlan[i];
+        const turns = chunk.turns;
+        gaps.push({
+          from: chunk.startSeconds,
+          to: chunk.endSeconds,
+          from_turn: turns[0]?.index,
+          to_turn: turns[turns.length - 1]?.index,
+          stage: stage.name,
+        });
+        // The rejection reason used to be dropped here. That made a partial
+        // extraction unexplainable after the fact: the note said which minutes
+        // were missing and nothing anywhere said why, so a rate-limited tier and
+        // a malformed response looked identical in the logs.
+        logEvent('warn', 'session.extract', 'chunk failed — range dropped from this stage', {
+          stage: stage.name,
+          chunk: `${chunk.index}/${chunk.total}`,
+          turns: `${turns[0]?.index}-${turns[turns.length - 1]?.index}`,
+          error: r.reason instanceof Error ? r.reason.message : String(r.reason),
+          retryable: isRetryable(r.reason),
+        });
       });
 
       // A minority of failed chunks still yields a usable note covering the rest

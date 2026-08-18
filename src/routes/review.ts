@@ -962,6 +962,205 @@ function contextOne(table: Table) {
 }
 
 // Appointment Sheets (internal)
+/**
+ * Re-run extraction on a recording whose note is already drafted.
+ *
+ * There was no way to do this, and it turned out to be a real gap rather than a
+ * missing convenience. Extraction can come back thin for reasons that have
+ * nothing to do with the recording — a rate-limited tier drops chunks, a model
+ * is decommissioned mid-session, a stage times out — and the note is then
+ * permanently wrong with a plausible-looking draft sitting on top of a perfectly
+ * good transcript. `processConversation` only claims rows in `pending`/`failed`,
+ * so once a session reached `done` nothing in the system would ever look at it
+ * again. The transcript was still there; the only thing missing was a way to ask.
+ *
+ * Refuses to touch an approved session. A signed-off note is a clinical record,
+ * and re-deriving one from a model is not a correction, it is a replacement —
+ * amend it instead. (The note upsert in process.ts carries the same guard; this
+ * is the earlier, explainable refusal rather than a silent no-op.)
+ */
+async function reextractByConversation(
+  id: string,
+): Promise<{ code: number; body: Record<string, unknown> }> {
+  const conv = await pool.query<{
+    id: string;
+    appointment_id: string | null;
+    has_transcript: boolean;
+    extraction_status: string;
+  }>(
+    `SELECT id, appointment_id, transcript IS NOT NULL AS has_transcript, extraction_status
+       FROM conversations WHERE id = $1`,
+    [id],
+  );
+  if (conv.rowCount === 0) return { code: 404, body: { error: 'not found' } };
+  const c = conv.rows[0];
+
+  if (!c.has_transcript) {
+    return {
+      code: 409,
+      body: {
+        error: 'no transcript',
+        detail: 'This recording has no transcript yet, so there is nothing to extract from.',
+      },
+    };
+  }
+  if (!c.appointment_id) {
+    return {
+      code: 409,
+      body: {
+        error: 'not matched',
+        detail:
+          'This recording is not attached to an appointment. Match it to a client first — ' +
+          "extraction writes into that appointment's sheet and protocol.",
+      },
+    };
+  }
+
+  const approved = await pool.query(
+    `SELECT 1 FROM appointment_sheets WHERE appointment_id = $1 AND status = 'approved'
+      UNION ALL
+     SELECT 1 FROM protocols WHERE appointment_id = $1 AND status = 'approved'
+      LIMIT 1`,
+    [c.appointment_id],
+  );
+  if (approved.rowCount) {
+    return {
+      code: 409,
+      body: {
+        error: 'session already approved',
+        detail:
+          'This session has been approved and its documents published. Amend the note instead — ' +
+          're-running extraction would replace a signed-off record.',
+      },
+    };
+  }
+
+  // Snapshot the CURRENT draft before anything overwrites it.
+  //
+  // Learned the hard way: the first real re-extraction replaced a draft holding
+  // 14 assessments with one holding none — the second run happened to lose one
+  // more chunk than the first, which tripped the majority-failed rule and dropped
+  // the whole narrative stage. Nothing had snapshotted the old note (revisions
+  // are only written on amend), so a better draft was simply gone. Re-extraction
+  // is a gamble on a nondeterministic model; it must not be a destructive one.
+  const drafts = await pool.query<{ table_name: string; id: string; content_json: unknown }>(
+    `SELECT 'appointment_sheets' AS table_name, id, content_json
+       FROM appointment_sheets WHERE appointment_id = $1
+      UNION ALL
+     SELECT 'protocols', id, content_json
+       FROM protocols WHERE appointment_id = $1`,
+    [c.appointment_id],
+  );
+  const snapClient = await pool.connect();
+  for (const d of drafts.rows) {
+    await snapshotRevision(
+      snapClient,
+      d.table_name as 'appointment_sheets' | 'protocols',
+      d.id,
+      d.content_json,
+      're-extraction — draft replaced by a fresh run',
+    ).catch((e) =>
+      // A failed snapshot must not block the re-extract, but it must be loud:
+      // it means this run is unwinnable if the new note comes back worse.
+      logError('review.reextract', 'could not snapshot the draft before re-extracting', e, {
+        conversation_id: c.id,
+        source_id: d.id,
+      }),
+    );
+  }
+  snapClient.release();
+
+  // Back to `pending` so processConversation's locking UPDATE can claim it, with
+  // the retry counters cleared so a session that previously exhausted its
+  // attempts gets a genuine fresh start rather than one throttled go.
+  await pool.query(
+    `UPDATE conversations
+        SET extraction_status = 'pending',
+            extraction_attempts = 0,
+            extraction_next_attempt_at = NULL,
+            updated_at = now()
+      WHERE id = $1`,
+    [c.id],
+  );
+
+  // Off the request path, like every other extraction trigger here: a long
+  // transcript on a small tier takes minutes, far longer than any sensible HTTP
+  // timeout.
+  void processConversation(c.id).catch((e) =>
+    logError('session.process', 're-extraction failed', e, { conversation_id: c.id }),
+  );
+
+  logEvent('info', 'review.reextract', 're-running extraction on an existing recording', {
+    conversation_id: c.id,
+    appointment_id: c.appointment_id,
+    previous_status: c.extraction_status,
+  });
+  await recordAudit({
+    entityType: 'session',
+    entityId: c.appointment_id,
+    action: 'session.reextracted',
+    actor: 'nicole',
+    summary: 'Re-ran extraction on the existing recording — the draft note will be replaced',
+    metadata: { conversation_id: c.id, previous_status: c.extraction_status },
+  });
+
+  return {
+    code: 202,
+    body: {
+      conversation_id: c.id,
+      appointment_id: c.appointment_id,
+      previous_status: c.extraction_status,
+      status: 'pending',
+    },
+  };
+}
+
+/** POST /review/conversations/:id/reextract — by recording. */
+reviewRouter.post('/conversations/:id/reextract', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  try {
+    const out = await reextractByConversation(req.params.id);
+    return res.status(out.code).json(out.body);
+  } catch (err) {
+    logError('review.reextract', 're-extraction request failed', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+/**
+ * POST /review/:kind/:id/reextract — the same thing, reached from the session.
+ *
+ * Mirrors `unmatchOne`, for the same reason: Nicole notices a thin note while
+ * reading it, not while looking at a list of recordings, so the action has to
+ * exist where the problem becomes visible.
+ */
+function reextractOne(table: Table) {
+  return async (req: import('express').Request, res: import('express').Response) => {
+    if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+    try {
+      const conv = await pool.query<{ id: string }>(
+        `SELECT c.id
+           FROM conversations c
+           JOIN ${table} t ON t.appointment_id = c.appointment_id
+          WHERE t.id = $1
+          LIMIT 1`,
+        [req.params.id],
+      );
+      if (conv.rowCount === 0) {
+        return res.status(404).json({
+          error: 'no recording',
+          detail: 'This session has no recording attached, so there is nothing to re-extract from.',
+        });
+      }
+      const out = await reextractByConversation(conv.rows[0].id);
+      return res.status(out.code).json(out.body);
+    } catch (err) {
+      logError(`review.${table}_reextract`, 're-extract lookup failed', err, { id: req.params.id });
+      return res.status(500).json({ error: 'internal error' });
+    }
+  };
+}
+
 reviewRouter.get('/sheets/:id', getOne('appointment_sheets'));
 reviewRouter.patch('/sheets/:id', patchOne('appointment_sheets'));
 reviewRouter.post('/sheets/:id/approve', approveOne('appointment_sheets'));
@@ -970,6 +1169,7 @@ reviewRouter.post('/sheets/:id/amend', amendOne('appointment_sheets'));
 reviewRouter.get('/sheets/:id/revisions', revisionsOne('appointment_sheets'));
 reviewRouter.get('/sheets/:id/history', historyOne('appointment_sheets'));
 reviewRouter.post('/sheets/:id/unmatch', unmatchOne('appointment_sheets'));
+reviewRouter.post('/sheets/:id/reextract', reextractOne('appointment_sheets'));
 
 // Protocols (client-facing)
 reviewRouter.get('/protocols/:id', getOne('protocols'));
@@ -980,6 +1180,7 @@ reviewRouter.post('/protocols/:id/amend', amendOne('protocols'));
 reviewRouter.get('/protocols/:id/revisions', revisionsOne('protocols'));
 reviewRouter.get('/protocols/:id/history', historyOne('protocols'));
 reviewRouter.post('/protocols/:id/unmatch', unmatchOne('protocols'));
+reviewRouter.post('/protocols/:id/reextract', reextractOne('protocols'));
 
 // ---------------------------------------------------------------------------
 // Rendered documents — Markdown produced from the current content_json.

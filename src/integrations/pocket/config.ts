@@ -28,6 +28,31 @@ export interface PocketPollConfig {
 
 export const POCKET_DEFAULT_BASE_URL = 'https://public.heypocketai.com/api/v1';
 
+// How far back a sweep looks by default.
+//
+// This was 3 days, which is too short to be a backstop. A recording made on a
+// Friday and never delivered by webhook is invisible by Monday-plus-one, and
+// invisible permanently — the poller is the only other path, and once a
+// recording ages out of the window nothing ever looks at it again. That is
+// exactly what happened to a real 35-minute client session: it sat in Pocket
+// `completed` with a full transcript while every sweep reported `scanned: 0`.
+//
+// 30 days costs nothing to scan — listing is one cheap call per 100 recordings,
+// and the detail fetch is skipped for anything already ingested (see the poller)
+// — and it turns "lost" back into "late".
+export const DEFAULT_LOOKBACK_DAYS = 30;
+
+/**
+ * Whether the scheduler that OWNS the poll tick is actually running.
+ *
+ * Kept separate from `pocketPollConfig().enabled` on purpose: that answers "is
+ * polling configured", and a status screen that conflates the two will cheerfully
+ * report polling ON while nothing sweeps at all.
+ */
+export function isSchedulerEnabled(): boolean {
+  return process.env.SCHEDULER_ENABLED === 'true';
+}
+
 /** True when the REST API is usable (poller + backfill). */
 export function isPocketConfigured(): boolean {
   return !!process.env.POCKET_API_KEY;
@@ -62,7 +87,7 @@ export function pocketPollConfig(): PocketPollConfig {
     // failure mode of the opposite default is silence, which looks like the
     // product being broken.
     enabled: process.env.POCKET_POLL_ENABLED !== 'false' && isPocketConfigured(),
-    lookbackDays: positiveInt(process.env.POCKET_POLL_LOOKBACK_DAYS, 3),
+    lookbackDays: positiveInt(process.env.POCKET_POLL_LOOKBACK_DAYS, DEFAULT_LOOKBACK_DAYS),
     maxPages: positiveInt(process.env.POCKET_POLL_MAX_PAGES, 20),
   };
 }

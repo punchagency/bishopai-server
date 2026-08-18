@@ -42,6 +42,8 @@ export async function generateStructured(req: StructuredRequest): Promise<Struct
   await llmLimiter.acquire(estimatedCost);
 
   switch (llmConfig.provider) {
+    case 'openrouter':
+      return openrouterExtract(req);
     case 'anthropic':
       return anthropicExtract(req);
     case 'google':
@@ -168,6 +170,9 @@ async function googleExtract(req: StructuredRequest): Promise<StructuredResponse
         responseJsonSchema: req.jsonSchema,
         temperature: 0,
         maxOutputTokens: req.maxTokens ?? llmConfig.maxTokens,
+        // Cap the thinking rather than letting it consume the answer's budget.
+        // See llmConfig.google.thinkingBudget.
+        thinkingConfig: { thinkingBudget: llmConfig.google.thinkingBudget },
       },
     });
   } catch (err) {
@@ -199,6 +204,135 @@ function getGroq(): Groq {
   return groq;
 }
 
+/** Which Groq models accept `reasoning_effort`. Sending it to one that doesn't
+ *  is a 400, so this stays a positive list rather than a try-and-see. */
+function supportsReasoningEffort(model: string): boolean {
+  return /gpt-oss|qwen3|deepseek-r1/i.test(model);
+}
+
+/**
+ * Groq's 400 for "the model produced nothing valid to parse".
+ *
+ * Worth naming because it is thrown for a cause the message actively misleads
+ * about: "Please adjust your prompt" reads as a schema problem, and on a
+ * reasoning model it usually means the completion budget went on reasoning
+ * tokens. Classified as truncation so the message points somewhere useful — but
+ * note the retry-bigger path can 413 on a small tier, which is why the real fix
+ * is reasoning_effort, not a larger budget.
+ */
+function isJsonValidateFailed(err: unknown): boolean {
+  const msg = String((err as { message?: string })?.message ?? '');
+  return /json_validate_failed|failed to validate json/i.test(msg);
+}
+
+/**
+ * OpenRouter — an OpenAI-compatible gateway, used here for its wide-context free
+ * models (default: nvidia/nemotron-3-super-120b-a12b:free, 262k).
+ *
+ * Plain `fetch` rather than a fifth SDK: the request is one POST, and the error
+ * classifiers below key off `status`, which is easy to attach and hard to get
+ * from a wrapper that has already reshaped the failure.
+ *
+ * The point of this provider is what it removes. On an 8k/min tier a 35-minute
+ * session becomes 4 chunks x 3 stages = 12 calls, and the narrative stage is
+ * documented as one that must NOT chunk — a chunk that does not contain a
+ * concern cannot know the concern exists, which is exactly why `concerns` came
+ * back empty run after run. With the whole transcript in one call that failure
+ * mode does not exist.
+ */
+async function openrouterExtract(req: StructuredRequest): Promise<StructuredResponse> {
+  const cfg = llmConfig.openrouter;
+  if (!cfg.apiKey) {
+    throw new ProviderError('OpenRouter not configured — set OPENROUTER_API_KEY', {
+      provider: 'openrouter',
+    });
+  }
+  const schemaStr = req.jsonSchema ? JSON.stringify(req.jsonSchema) : '';
+
+  let res: Response;
+  try {
+    res = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${cfg.apiKey}`,
+        'content-type': 'application/json',
+        // Attribution only — OpenRouter shows these on the account's activity page.
+        'HTTP-Referer': cfg.appUrl,
+        'X-Title': cfg.appTitle,
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        temperature: 0,
+        max_tokens: req.maxTokens ?? llmConfig.maxTokens,
+        reasoning: { effort: cfg.reasoningEffort },
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              req.system +
+              '\n\nYou must return a JSON object matching this schema:\n' +
+              schemaStr +
+              '\n\nRespond with valid JSON only.',
+          },
+          { role: 'user', content: req.user },
+        ],
+      }),
+    });
+  } catch (err) {
+    // Network-level failure: no status to classify, and retrying immediately
+    // would not help, so surface it as-is rather than guessing a category.
+    throw new ProviderError('openrouter request failed', { provider: 'openrouter', cause: err });
+  }
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    // Give the classifiers below the shape they expect from an SDK error.
+    const err = Object.assign(new Error(`${res.status} ${body}`), { status: res.status, headers: hdrs(res) });
+    if (isTooLarge(err)) throw new RequestTooLargeError({ provider: 'openrouter', cause: err });
+    if (isRateLimit(err)) {
+      throw new RateLimitError({ provider: 'openrouter', retryAfterMs: retryAfterMs(err), cause: err });
+    }
+    if (isJsonValidateFailed(err)) {
+      throw new TruncatedOutputError({ provider: 'openrouter', raw: null, finishReason: 'json_validate_failed' });
+    }
+    throw new ProviderError('openrouter request failed', { provider: 'openrouter', cause: err });
+  }
+
+  const json = (await res.json()) as {
+    choices?: { finish_reason?: string; message?: { content?: string | null } }[];
+    error?: { message?: string };
+  };
+  // OpenRouter can answer 200 with an error body when an upstream provider fails.
+  if (json.error) {
+    throw new ProviderError(`openrouter upstream error: ${json.error.message ?? 'unknown'}`, {
+      provider: 'openrouter',
+      raw: null,
+    });
+  }
+  const choice = json.choices?.[0];
+  const finishReason = choice?.finish_reason;
+  const text = choice?.message?.content ?? null;
+  if (!text) {
+    if (TRUNCATION_REASONS.has(finishReason ?? '')) {
+      throw new TruncatedOutputError({ provider: 'openrouter', raw: null, finishReason });
+    }
+    throw new SchemaViolationError(`openrouter returned no content (finish_reason=${finishReason})`, {
+      provider: 'openrouter',
+      raw: null,
+    });
+  }
+  return { parsed: parseJson(text, 'openrouter', finishReason), raw: text };
+}
+
+/** `retry-after` off a fetch Response, in the record shape retryAfterMs expects. */
+function hdrs(res: Response): Record<string, string> {
+  const out: Record<string, string> = {};
+  const ra = res.headers.get('retry-after');
+  if (ra) out['retry-after'] = ra;
+  return out;
+}
+
 async function groqExtract(req: StructuredRequest): Promise<StructuredResponse> {
   // Compact (no indentation): the pretty-printed schema's whitespace is pure
   // token overhead on every call, and on the largest real transcripts those
@@ -211,6 +345,11 @@ async function groqExtract(req: StructuredRequest): Promise<StructuredResponse> 
       model: llmConfig.groq.model,
       temperature: 0,
       max_completion_tokens: req.maxTokens ?? llmConfig.maxTokens,
+      // See llmConfig.groq.reasoningEffort: without this a reasoning model burns
+      // the whole completion budget thinking and returns nothing to validate.
+      ...(supportsReasoningEffort(llmConfig.groq.model)
+        ? { reasoning_effort: llmConfig.groq.reasoningEffort }
+        : {}),
       response_format: { type: 'json_object' },
       messages: [
         {
@@ -228,6 +367,9 @@ async function groqExtract(req: StructuredRequest): Promise<StructuredResponse> 
     if (isTooLarge(err)) throw new RequestTooLargeError({ provider: 'groq', cause: err });
     if (isRateLimit(err)) {
       throw new RateLimitError({ provider: 'groq', retryAfterMs: retryAfterMs(err), cause: err });
+    }
+    if (isJsonValidateFailed(err)) {
+      throw new TruncatedOutputError({ provider: 'groq', raw: null, finishReason: 'json_validate_failed' });
     }
     throw new ProviderError('groq request failed', { provider: 'groq', cause: err });
   }

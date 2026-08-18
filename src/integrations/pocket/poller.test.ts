@@ -61,6 +61,18 @@ describe('pollPocketRecordings', () => {
     );
   });
 
+  it('defaults to a 30-day window, so a recording missed by the webhook stays reachable', async () => {
+    // Regression: the default was 3 days. A real client session recorded on a
+    // Friday and never delivered by webhook aged out of every subsequent sweep
+    // and became permanently invisible — the poller is the only other path in.
+    delete process.env.POCKET_POLL_LOOKBACK_DAYS;
+    const d = deps();
+    await pollPocketRecordings(d, NOW);
+    expect(d.listRecordings).toHaveBeenCalledWith(
+      expect.objectContaining({ startDate: '2026-01-19', endDate: '2026-02-18' }),
+    );
+  });
+
   it('ingests a recording it has not seen, and fires extraction when it matches', async () => {
     const d = deps({
       ingest: vi.fn(async () => ({
