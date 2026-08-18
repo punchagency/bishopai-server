@@ -15,8 +15,9 @@ import {
   removeSupplementsDroppedByAmendment,
 } from '../session/supplements';
 import { createTasksFromNote } from '../tasks/service';
-import { fetchRevisions, snapshotRevision } from '../session/revisions';
+import { DRAFT_REPLACED_REASON, fetchRevisions, snapshotRevision } from '../session/revisions';
 import { scoreNameMatch, nameSignalRank, overlapSeconds } from '../correlation/nameMatch';
+import { prepareTranscript } from '../session/transcript';
 import { recordAudit } from '../audit/log';
 import {
   listSessions,
@@ -857,10 +858,21 @@ function approveOne(table: Table) {
   };
 }
 
+/** One turn as the review pane reads it. `index` is the same number the model
+ *  cited and verifyEvidence resolved, which is what makes a citation something
+ *  the eye can check rather than something the UI has to search for. */
+export interface TranscriptTurn {
+  index: number;
+  role: 'PRACTITIONER' | 'CLIENT' | 'UNKNOWN';
+  speaker: string;
+  at_seconds: number | null;
+  text: string;
+}
+
 /** The recording behind an appointment, for the review pane's source panel. */
 async function fetchTranscript(
   appointmentId: string | null,
-): Promise<{ text: string; recorded_at: string | null } | null> {
+): Promise<{ text: string; recorded_at: string | null; turns: TranscriptTurn[] } | null> {
   if (!appointmentId) return null;
   const r = await pool.query<{ transcript: string | null; starts_at: string | null }>(
     `SELECT transcript, starts_at FROM conversations
@@ -869,7 +881,25 @@ async function fetchTranscript(
     [appointmentId],
   );
   if (r.rowCount === 0 || !r.rows[0].transcript) return null;
-  return { text: r.rows[0].transcript, recorded_at: r.rows[0].starts_at };
+  const text = r.rows[0].transcript;
+  // Parsed HERE rather than in the client, through the same pipeline the
+  // extractor used. Numbering is only meaningful because both sides derive it
+  // the same way; a second implementation in the renderer would drift, and a
+  // drifted "#133" points review at the wrong sentence while looking correct.
+  let turns: TranscriptTurn[] = [];
+  try {
+    turns = prepareTranscript(text).turns.map((t) => ({
+      index: t.index,
+      role: t.role,
+      speaker: t.speaker,
+      at_seconds: t.startSeconds,
+      text: t.text,
+    }));
+  } catch (err) {
+    // The raw text is still worth showing — the pane degrades to plain lines.
+    logError('review.transcript_turns', 'turn parsing failed', err, { appointmentId });
+  }
+  return { text, recorded_at: r.rows[0].starts_at, turns };
 }
 
 function contextOne(table: Table) {
@@ -1058,7 +1088,10 @@ async function reextractByConversation(
       d.table_name as 'appointment_sheets' | 'protocols',
       d.id,
       d.content_json,
-      're-extraction — draft replaced by a fresh run',
+      // Not an amendment — nothing here was ever approved, and the handler above
+      // refuses outright once it has been. This exact string is what keeps these
+      // rows out of the history the review pane shows.
+      DRAFT_REPLACED_REASON,
     ).catch((e) =>
       // A failed snapshot must not block the re-extract, but it must be loud:
       // it means this run is unwinnable if the new note comes back worse.
