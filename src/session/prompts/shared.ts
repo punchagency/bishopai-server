@@ -3,7 +3,7 @@
 // Version-stamped: the version is written onto every extracted note, so an
 // accuracy regression spotted weeks later can be traced back to the prompt
 // change that caused it rather than guessed at.
-export const PROMPT_VERSION = '2026-08-18.1';
+export const PROMPT_VERSION = '2026-08-19.1';
 
 export interface PromptContext {
   /** Who the client is. Removes the single biggest source of speaker confusion:

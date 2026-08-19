@@ -273,15 +273,157 @@ export const BodyScanSchema = z
   .preprocess((v) => (typeof v === 'string' ? { additional_nrt: v } : v), BodyScanObject)
   .transform((v) => (v ? stripEchoes(v, BODY_SCAN_LABELS) : v));
 
+// --- Stressors ---------------------------------------------------------------
+
+// The stressor is the POINT of Nutrition Response Testing: the foundation and
+// body-scan passes locate a stressed organ, and the stressor is the practitioner's
+// answer to *what is stressing it*. A single free-text string could not carry that
+// answer, and the loss showed up twice over:
+//
+//   1. A session names several stressors, minutes apart. Because `stressors` was a
+//      scalar, the chunk merge kept the LAST one and discarded the rest — the
+//      literal "we missed a lot of stressors" complaint.
+//   2. "Food" and "food, specifically dairy" collapsed into the same cell, so the
+//      finding that took the whole appointment to reach — the SOURCE — rendered
+//      identically to the category alone.
+//
+// Splitting category from source fixes both, and keeps the never-guess promise
+// exactly where it matters: `source` stays null when the practitioner named the
+// category but not the thing. "It's food, but not anything specific" is a real,
+// common, and clinically meaningful reading — and it must not become a guess.
+export const STRESSOR_CATEGORY_VALUES = [
+  'immune',
+  'food',
+  'chemical',
+  'metal',
+  'scar',
+  'emotional',
+  'other',
+] as const;
+export type StressorCategory = (typeof STRESSOR_CATEGORY_VALUES)[number];
+
+const STRESSOR_SYNONYMS: Record<string, StressorCategory> = {
+  immune: 'immune', 'immune challenge': 'immune', infection: 'immune', bacterial: 'immune',
+  viral: 'immune', virus: 'immune', fungal: 'immune', yeast: 'immune', candida: 'immune',
+  parasite: 'immune', parasitic: 'immune', mold: 'immune', bacteria: 'immune',
+  food: 'food', 'food sensitivity': 'food', 'food sensitivities': 'food', dietary: 'food',
+  'food allergy': 'food', allergen: 'food',
+  chemical: 'chemical', toxin: 'chemical', toxic: 'chemical', pesticide: 'chemical',
+  solvent: 'chemical', 'environmental toxin': 'chemical',
+  metal: 'metal', 'heavy metal': 'metal', 'heavy metals': 'metal', mercury: 'metal',
+  lead: 'metal', aluminum: 'metal', aluminium: 'metal',
+  scar: 'scar', 'scar tissue': 'scar', 'scar interference': 'scar',
+  emotional: 'emotional', emotion: 'emotional', stress: 'emotional', trauma: 'emotional',
+  psychological: 'emotional', 'nervous system': 'emotional',
+};
+const STRESSOR_COMPILED = compile(STRESSOR_SYNONYMS);
+
+/** Unresolved falls to 'other' — the only value that asserts no category at all.
+ *  Mapping an unrecognised word onto a real NRT category would put a clinical
+ *  claim in the client's Report of Findings that nobody made. */
+export function mapStressorCategory(input: unknown): EnumMapping<StressorCategory> {
+  return mapEnum(input, STRESSOR_CATEGORY_VALUES, 'other', STRESSOR_SYNONYMS, STRESSOR_COMPILED);
+}
+
+/** Wire twin — the shape the model fills. Plain, so the JSON Schema generator
+ *  can see every field. */
+export const StressorObject = z.object({
+  category: z.enum(STRESSOR_CATEGORY_VALUES),
+  source: stated(),
+  body_area: stated(),
+  detail: stated(),
+});
+
+export const StressorSchema = z
+  .object({
+    category: z.unknown(),
+    source: stated().optional(),
+    body_area: stated().optional(),
+    detail: stated().optional(),
+  })
+  .transform((v) => {
+    const mapped = mapStressorCategory(v.category);
+    return {
+      category: mapped.value,
+      category_raw: mapped.raw,
+      category_unresolved: mapped.unresolved,
+      source: v.source ?? null,
+      body_area: v.body_area ?? null,
+      detail: v.detail ?? null,
+    };
+  });
+
+export type Stressor = z.infer<typeof StressorSchema>;
+
+/**
+ * Accept every shape the field has ever held, so a note stored before this
+ * existed still parses:
+ *   - a legacy string ("immune, food")  → one entry carrying it verbatim as
+ *     `detail`, which renders byte-identically to how it always did. It is NOT
+ *     comma-split into categories: "food, but not anything specific" would
+ *     shatter into two findings, and inventing a stressor is the one failure
+ *     this file exists to prevent.
+ *   - an array of strings (some models answer that way) → one entry each.
+ *   - an array of objects → the real shape.
+ */
+function coerceStressors(v: unknown): unknown {
+  if (v == null) return [];
+  const list = Array.isArray(v) ? v : [v];
+  return list
+    .map((item) => {
+      if (typeof item === 'string') {
+        const text = item.trim();
+        if (!text) return null;
+        // A bare string carries no split between category and source, so the
+        // category is *derived* and the words are kept whole in `detail`.
+        return { category: text, detail: text };
+      }
+      return item;
+    })
+    .filter((x) => x != null);
+}
+
+const StressorListSchema = z.preprocess(
+  coerceStressors,
+  z.array(StressorSchema).default([]),
+) as unknown as z.ZodType<Stressor[], unknown>;
+
+/**
+ * One display line per stressor, for the ROF / flow sheet / prep brief, which
+ * are all plain text. Renders the SOURCE when there is one, because that is the
+ * part Nicole reads: "food — dairy (gallbladder)" beats "food".
+ */
+export function formatStressor(s: Stressor): string {
+  // A legacy entry is category-derived-from-detail: printing the derived
+  // category alongside its own source text would read as two findings.
+  if (s.detail && !s.source && !s.body_area) return s.detail;
+  const head = s.source ? `${s.category} — ${s.source}` : s.category;
+  const withArea = s.body_area ? `${head} (${s.body_area})` : head;
+  // `detail` is the practitioner's own words; keep it when it says more than the
+  // structured fields already do.
+  return s.detail && !withArea.toLowerCase().includes(s.detail.toLowerCase())
+    ? `${withArea} — ${s.detail}`
+    : withArea;
+}
+
+/**
+ * Takes the raw field, not just the parsed type. Notes reach the renderers from
+ * the database, where a row written before this change still holds a plain
+ * string — and a `.map` on a string is a crash in the middle of publishing a
+ * client's Report of Findings. The type says Stressor[]; the storage does not
+ * promise it, so this checks.
+ */
+export function formatStressors(list: Stressor[] | string | null | undefined): string | null {
+  if (typeof list === 'string') return list.trim() || null;
+  if (!Array.isArray(list) || !list.length) return null;
+  return list.map(formatStressor).join('; ') || null;
+}
+
 export const NrtFindingsSchema = z.object({
   pulse0: stated(),
   priority1: stated(),
   k27: stated(),
-  // Some models return stressors as an array — join it into a string.
-  stressors: z.preprocess(
-    (v) => (Array.isArray(v) ? v.join(', ') : (v ?? null)),
-    z.string().nullable(),
-  ),
+  stressors: StressorListSchema,
   foundation: FoundationSchema.nullish().transform((v) => v ?? null),
   body_scan: BodyScanSchema.nullish().transform((v) => v ?? null),
 });
@@ -291,7 +433,7 @@ export const NrtFindingsObject = z.object({
   pulse0: stated(),
   priority1: stated(),
   k27: stated(),
-  stressors: stated(),
+  stressors: z.array(StressorObject),
   foundation: FoundationObject.nullable(),
   body_scan: BodyScanObject.nullable(),
 });

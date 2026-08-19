@@ -152,6 +152,20 @@ export const llmConfig = {
     process.env.LLM_MAX_TOKENS ?? process.env.ANTHROPIC_MAX_TOKENS ?? defaultMaxTokens(),
   ),
   /**
+   * Whether `maxTokens` above is a deliberate setting or just the default.
+   *
+   * It matters because the per-stage budgets in extract.ts are capped by it, and
+   * capping a stage that was deliberately sized larger by a GLOBAL DEFAULT is
+   * silent damage: the narrative stage asks for every concern, assessment and
+   * follow-up in a 45-minute session, each with a verbatim quote, and 4096 does
+   * not hold that. Truncation would at least be caught and retried — but a model
+   * near its budget compresses instead, returning five general findings where
+   * twenty specific ones were stated, and nothing anywhere reports a problem.
+   * So an explicit override still binds every stage; the bare default does not.
+   */
+  maxTokensExplicit:
+    process.env.LLM_MAX_TOKENS != null || process.env.ANTHROPIC_MAX_TOKENS != null,
+  /**
    * Extra completion budget for models that bill THINKING against it.
    *
    * A stage's `maxTokens` is an output budget — sized to the JSON its schema can

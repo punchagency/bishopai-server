@@ -37,18 +37,58 @@ function tokens(s: string): Set<string> {
   );
 }
 
+function shared(a: Set<string>, b: Set<string>): number {
+  let n = 0;
+  for (const t of a) if (b.has(t)) n++;
+  return n;
+}
+
 /** Token-set overlap. Extraction is verbatim-ish, not exact, so exact string
  *  equality would score a correct capture as a miss over one dropped article. */
 function similarity(a: string, b: string): number {
   const ta = tokens(a);
   const tb = tokens(b);
   if (!ta.size || !tb.size) return 0;
-  let shared = 0;
-  for (const t of ta) if (tb.has(t)) shared++;
-  return shared / Math.max(ta.size, tb.size);
+  return shared(ta, tb) / Math.max(ta.size, tb.size);
+}
+
+/**
+ * Did `got` capture what the gold item says? Measured against the GOLD's length,
+ * not the longer of the two.
+ *
+ * `similarity` divides by the longer string, which silently penalises the right
+ * answer for being more complete: gold "the thyroid is crashing" against an
+ * extraction of "the thyroid is crashing, which is why the levothyroxine dose
+ * held" scored 0.36 and was reported as BOTH a miss and an invention. That is
+ * precisely backwards now — the extraction is asked to keep the practitioner's
+ * stated cause attached to the finding, so the more complete answer is the
+ * correct one and the metric was marking it wrong.
+ *
+ * The cap is what keeps this honest: an item may carry its own attribution, not
+ * a paragraph that happens to contain the gold words. Beyond it, coverage stops
+ * counting and `similarity` decides, so a summary of the whole session cannot
+ * match every gold item at once.
+ */
+const MAX_LENGTH_RATIO = 4;
+
+function covers(got: string, want: string): boolean {
+  const tg = tokens(got);
+  const tw = tokens(want);
+  if (!tg.size || !tw.size) return false;
+  if (tg.size > tw.size * MAX_LENGTH_RATIO) return false;
+  return shared(tw, tg) / tw.size >= COVERAGE_THRESHOLD;
 }
 
 const MATCH_THRESHOLD = 0.5;
+/** Higher than MATCH_THRESHOLD: coverage is the easier test to pass, so it has
+ *  to demand more of the gold item's words before calling it found. */
+const COVERAGE_THRESHOLD = 0.7;
+
+/** A gold item is found when either reading says so: the same words in a
+ *  different order, or the same words plus the attribution we now ask for. */
+function matches(got: string, want: string): boolean {
+  return similarity(got, want) >= MATCH_THRESHOLD || covers(got, want);
+}
 
 interface Score {
   matched: number;
@@ -69,7 +109,7 @@ function scoreList(got: string[], want: string[], acceptable: string[] = []): Sc
   let matched = 0;
 
   for (const w of want) {
-    const i = unclaimed.findIndex((g) => similarity(g, w) >= MATCH_THRESHOLD);
+    const i = unclaimed.findIndex((g) => matches(g, w));
     if (i === -1) missing.push(w);
     else {
       matched++;
@@ -77,9 +117,7 @@ function scoreList(got: string[], want: string[], acceptable: string[] = []): Sc
     }
   }
   // Anything left that matches an `acceptable` entry is set aside, not penalised.
-  const spurious = unclaimed.filter(
-    (g) => !acceptable.some((a) => similarity(g, a) >= MATCH_THRESHOLD),
-  );
+  const spurious = unclaimed.filter((g) => !acceptable.some((a) => matches(g, a)));
   return { matched, expected: want.length, extra: spurious.length, missing, spurious };
 }
 
@@ -105,9 +143,23 @@ interface Gold {
   supplements?: GoldSupplement[];
   supplements_acceptable?: GoldSupplement[];
   nrt?: Record<string, unknown>;
+  /** Scored separately from the nrt slot walk: a list, matched by content
+   *  rather than by position, and split into the category and the SOURCE so a
+   *  run that finds "food" but never "food — dairy" scores as the half-answer
+   *  it is. */
+  stressors?: GoldStressor[];
+  stressors_acceptable?: GoldStressor[];
   lifestyle?: Record<string, string>;
   expect_null?: string[];
   expect_null_acceptable?: string[];
+}
+
+interface GoldStressor {
+  category: string;
+  /** Null/absent means the practitioner named no specific source, and filling
+   *  one in is a fabrication — scored as such, not as extra credit. */
+  source?: string | null;
+  body_area?: string;
 }
 
 interface GoldSupplement {
@@ -129,6 +181,19 @@ interface FixtureReport {
     expected: number;
     extra: number;
     wrongChange: string[];
+    missing: string[];
+  };
+  stressors: {
+    matched: number;
+    expected: number;
+    extra: number;
+    /** Found the category but missed the source the practitioner named. This is
+     *  the exact complaint that prompted structured stressors, so it is counted
+     *  rather than folded into a plain hit. */
+    missingSource: string[];
+    /** A source we produced that the transcript never named — the fabrication
+     *  this field is most exposed to, since "food" begs to be narrowed. */
+    inventedSource: string[];
     missing: string[];
   };
   slots: { correct: number; expected: number; wrong: string[] };
@@ -165,6 +230,54 @@ function scoreSupplements(note: SessionNote, gold: Gold): FixtureReport['supplem
   }
   const extra = unclaimed.filter((s) => !acceptable.some((a) => nameMatches(s.name, a))).length;
   return { matched, expected: want.length, extra, wrongChange, missing };
+}
+
+function scoreStressors(note: SessionNote, gold: Gold): FixtureReport['stressors'] {
+  const want = gold.stressors ?? [];
+  const acceptable = gold.stressors_acceptable ?? [];
+  const got = note.nrt?.stressors ?? [];
+  const unclaimed = [...got];
+  const missing: string[] = [];
+  const missingSource: string[] = [];
+  const inventedSource: string[] = [];
+  let matched = 0;
+
+  const label = (g: GoldStressor): string => (g.source ? `${g.category} — ${g.source}` : g.category);
+
+  for (const g of want) {
+    // Match on the category, then judge the source separately: a run that says
+    // "food" when the gold says "food — dairy" HAS found the stressor and has
+    // NOT found the answer, and collapsing those into one number is what let the
+    // gap ship in the first place.
+    const i = unclaimed.findIndex((s) => similarity(s.category, g.category) >= MATCH_THRESHOLD);
+    if (i === -1) {
+      missing.push(label(g));
+      continue;
+    }
+    const [hit] = unclaimed.splice(i, 1);
+    matched++;
+    const wantSource = g.source ?? null;
+    const gotSource = hit.source ?? hit.detail ?? null;
+    // A shorter but correct naming of the same source ("Lyme" for "bacteria
+    // number four, which is Lyme") is a defensible reading, not a miss — so an
+    // `acceptable` entry for the same category counts too. Without this the
+    // eval measures phrasing rather than whether the source was found.
+    const sourceOk =
+      !!gotSource &&
+      [wantSource, ...acceptable.filter((a) => a.category === g.category).map((a) => a.source)]
+        .filter((x): x is string => !!x)
+        .some((want) => similarity(gotSource, want) >= MATCH_THRESHOLD);
+    if (wantSource && !sourceOk) {
+      missingSource.push(`${g.category}: expected source "${wantSource}", got ${JSON.stringify(gotSource)}`);
+    }
+    if (!wantSource && hit.source) {
+      inventedSource.push(`${g.category}: invented source "${hit.source}" (transcript names none)`);
+    }
+  }
+  const extra = unclaimed.filter(
+    (s) => !acceptable.some((a) => similarity(s.category, a.category) >= MATCH_THRESHOLD),
+  ).length;
+  return { matched, expected: want.length, extra, missingSource, inventedSource, missing };
 }
 
 function scoreSlots(note: SessionNote, gold: Gold): FixtureReport['slots'] {
@@ -226,6 +339,7 @@ async function evaluate(name: string): Promise<FixtureReport> {
     ok: false,
     lists: {},
     supplements: { matched: 0, expected: 0, extra: 0, wrongChange: [], missing: [] },
+    stressors: { matched: 0, expected: 0, extra: 0, missingSource: [], inventedSource: [], missing: [] },
     slots: { correct: 0, expected: 0, wrong: [] },
     fabrication: { filled: 0, total: 0, fields: [] },
     provenance: { total: 0, unverified: 0, missingFor: 0 },
@@ -260,6 +374,7 @@ async function evaluate(name: string): Promise<FixtureReport> {
     ok: true,
     lists,
     supplements: scoreSupplements(note, gold),
+    stressors: scoreStressors(note, gold),
     slots: scoreSlots(note, gold),
     fabrication: scoreFabrication(note, gold),
     provenance: scoreProvenance(note),
@@ -295,6 +410,18 @@ function print(reports: FixtureReport[]): void {
     for (const m of sup.missing) console.log(`       missed:   ${m}`);
     for (const w of sup.wrongChange) console.log(`       WRONG ACTION: ${w}`);
 
+    const st = r.stressors;
+    if (st.expected || st.extra) {
+      console.log(
+        `   ${'stressors'.padEnd(16)} recall ${pct(st.matched, st.expected)}` +
+          `  (${st.matched}/${st.expected})   spurious ${st.extra}` +
+          `   sources ${pct(st.matched - st.missingSource.length, st.matched)}`,
+      );
+      for (const m of st.missing) console.log(`       missed:   ${m}`);
+      for (const m of st.missingSource) console.log(`       NO SOURCE: ${m}`);
+      for (const m of st.inventedSource) console.log(`       FABRICATED: ${m}`);
+    }
+
     console.log(
       `   ${'nrt/lifestyle'.padEnd(16)} slots  ${pct(r.slots.correct, r.slots.expected)}` +
         `  (${r.slots.correct}/${r.slots.expected})`,
@@ -318,8 +445,14 @@ function print(reports: FixtureReport[]): void {
   // Totals — the numbers to paste into plan.md as the baseline.
   const ok = reports.filter((r) => r.ok);
   const sum = (f: (r: FixtureReport) => number): number => ok.reduce((n, r) => n + f(r), 0);
-  const recallM = sum((r) => Object.values(r.lists).reduce((n, s) => n + s.matched, 0)) + sum((r) => r.supplements.matched);
-  const recallE = sum((r) => Object.values(r.lists).reduce((n, s) => n + s.expected, 0)) + sum((r) => r.supplements.expected);
+  const recallM =
+    sum((r) => Object.values(r.lists).reduce((n, s) => n + s.matched, 0)) +
+    sum((r) => r.supplements.matched) +
+    sum((r) => r.stressors.matched);
+  const recallE =
+    sum((r) => Object.values(r.lists).reduce((n, s) => n + s.expected, 0)) +
+    sum((r) => r.supplements.expected) +
+    sum((r) => r.stressors.expected);
   const fabF = sum((r) => r.fabrication.filled);
   const fabT = sum((r) => r.fabrication.total);
   const slotC = sum((r) => r.slots.correct);

@@ -1,4 +1,5 @@
 import type { SessionNote } from './extract';
+import { NrtFindingsSchema } from './schema';
 import type { Evidence } from './schema';
 import { indexTurns, mergeAdjacentTurns, parseTranscript, type Turn } from './transcript';
 
@@ -109,12 +110,20 @@ function mockBodyScan(raw: string): NonNullable<SessionNote['nrt']>['body_scan']
   });
 }
 
+function mockStressors(text: string | null): NonNullable<SessionNote['nrt']>['stressors'] {
+  return text ? NrtFindingsSchema.shape.stressors.parse(text) : [];
+}
+
 function mockNrt(raw: string): SessionNote['nrt'] {
   return {
     pulse0: capture(raw, field(String.raw`pulse\s*0?`)),
     priority1: capture(raw, field(String.raw`priority\s*#?\s*1`)),
     k27: capture(raw, field(String.raw`k[\s-]?27`)),
-    stressors: capture(raw, field(String.raw`stressors?`)),
+    // The offline extractor is a regex, not a reader: it can see the sentence a
+    // stressor was stated in, but not which part of it is the category and which
+    // is the source. Splitting them here would be a guess, so the captured words
+    // go in whole and the schema's coercion derives what it safely can.
+    stressors: mockStressors(capture(raw, field(String.raw`stressors?`))),
     foundation: mockFoundation(raw),
     body_scan: mockBodyScan(raw),
   };

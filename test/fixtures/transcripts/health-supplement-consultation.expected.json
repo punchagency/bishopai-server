@@ -6,10 +6,11 @@
     "notes": [
       "Hand-verified against the transcript line by line.",
       "Only fields listed here are scored. `acceptable` items are neither rewarded",
-      "nor penalised \u2014 they are defensible readings a careful human could differ on,",
+      "nor penalised — they are defensible readings a careful human could differ on,",
       "and punishing them would make the eval measure taste rather than accuracy.",
       "`expect_null` is the fabrication test: the transcript never states these, so",
-      "any value at all is a fabricated clinical finding."
+      "any value at all is a fabricated clinical finding.",
+      "`stressors` is scored on its own, matched by category rather than position, and the SOURCE is graded separately from the category — finding \"food\" when the practitioner said \"food, specifically dairy\" is half an answer, and a source we supply that they never named is a fabrication."
     ]
   },
   "concerns": [
@@ -42,7 +43,7 @@
     "all doses from the previous visit came down"
   ],
   "assessments_acceptable": [
-    "pituitary and hypothalamus work together \u2014 HPA axis",
+    "pituitary and hypothalamus work together — HPA axis",
     "adrenals are the fight-or-flight glands; pituitary tells the adrenals to fight",
     "the drops are clear",
     "years of stress can throw off the natural sense of safety",
@@ -135,7 +136,7 @@
     }
   ],
   "follow_ups": [
-    "contact the practitioner if sleep or temperature gets disrupted \u2014 if sweating returns, the chaste tree can be brought back in"
+    "contact the practitioner if sleep or temperature gets disrupted — if sweating returns, the chaste tree can be brought back in"
   ],
   "follow_ups_due_in_days": {
     "0": null
@@ -144,9 +145,14 @@
     "foundation": {
       "art_cns": "clear",
       "art_hormonal": "blocks found"
-    },
-    "stressors": "food"
+    }
   },
+  "stressors": [
+    {
+      "category": "food",
+      "source": null
+    }
+  ],
   "lifestyle": {},
   "expect_null": [
     "nrt.pulse0",

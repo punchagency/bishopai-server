@@ -116,6 +116,34 @@ type Scalars = Record<string, unknown>;
  *                                    re-test and a mis-slotted value look
  *                                    identical from here, so a human decides.
  */
+/**
+ * Union list-valued findings across chunks, dropping only exact re-reads.
+ *
+ * Chunks overlap by design, so the same stressor is genuinely seen twice and one
+ * copy must go. The identity is category + source + body_area: two entries that
+ * agree on all three are the same finding read twice, while "food" and
+ * "food — dairy" are a category and a source and BOTH are kept, because the
+ * second is the answer the appointment was working toward and the first is what
+ * the practitioner said before they had it.
+ */
+function dedupeFindings(items: unknown[]): unknown[] {
+  const seen = new Set<string>();
+  const out: unknown[] = [];
+  for (const item of items) {
+    if (item == null) continue;
+    const key =
+      typeof item === 'object'
+        ? ['category', 'source', 'body_area', 'detail']
+            .map((k) => String((item as Record<string, unknown>)[k] ?? '').trim().toLowerCase())
+            .join('\u0000')
+        : String(item).trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 function mergeScalars(
   candidates: { value: Scalars; chunk: number }[],
   prefix: string,
@@ -146,6 +174,15 @@ function mergeScalars(
           path,
           conflicts,
         ) ?? null;
+      continue;
+    }
+
+    // List-valued slots are UNIONED, never picked between. `nrt.stressors` is the
+    // one that matters: a session names its stressors minutes apart, so scalar
+    // "latest wins" kept the last chunk's reading and silently dropped every
+    // earlier one — the whole point of the field is that there can be several.
+    if (vals.every((x) => Array.isArray(x.v))) {
+      out[key] = dedupeFindings(vals.flatMap((x) => x.v as unknown[]));
       continue;
     }
 

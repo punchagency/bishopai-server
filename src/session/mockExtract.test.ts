@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { mockExtractSessionNote } from './mockExtract';
+import { formatStressors } from './schema';
 
 // The offline extractor feeds every demo and the seeded cockpit, so its NRT /
 // lifestyle capture is what Nicole actually sees in her documents. Two things must
@@ -30,7 +31,9 @@ describe('mockExtractSessionNote — NRT findings', () => {
     expect(nrt?.pulse0).toBe('78, thready');
     expect(nrt?.priority1).toBe('an immune stressor in the upper GI'); // "GI" not "gi"
     expect(nrt?.k27).toBe('switched, corrected on the rub');
-    expect(nrt?.stressors).toBe('immune challenge and food, mainly dairy');
+    // The offline extractor keeps the captured words whole rather than guessing
+    // where the category ends and the source begins.
+    expect(formatStressors(nrt?.stressors)).toBe('immune challenge and food, mainly dairy');
   });
 
   it('routes a named prompt to its own slot', () => {

@@ -17,7 +17,9 @@
       "`acceptable` items are neither rewarded nor penalised — defensible readings a",
       "careful human could differ on. `expect_null` is the fabrication test: the",
       "transcript never states these, so any value at all is a fabricated finding.",
-      "Gold strings are phrased close to the transcript on purpose: extraction is verbatim-ish, and summary phrasing scores a correct capture as both a miss and a false positive."
+      "Gold strings are phrased close to the transcript on purpose: extraction is verbatim-ish, and summary phrasing scores a correct capture as both a miss and a false positive.",
+      "`stressors` is scored on its own, matched by category rather than position, and the SOURCE is graded separately from the category — finding \"food\" when the practitioner said \"food, specifically dairy\" is half an answer, and a source we supply that they never named is a fabrication.",
+      "Three causal assessments were added on 2026-08-19 after a live eval showed the extraction finding statements the gold set had simply omitted — all three name what a finding comes FROM, the class of statement this fixture now exists to protect. Verified against the transcript before adding."
     ]
   },
   "concerns": [
@@ -62,7 +64,10 @@
     "all of those organs show up as stressed",
     "the thyroid is crashing",
     "parasitic activity",
-    "blood sugar dysregulation"
+    "blood sugar dysregulation",
+    "a lot of the inflammation that you're experiencing is from the gluten peptides",
+    "it's mostly sitting in your brain, which is where it loves to hide",
+    "eighty percent of your body's human potential is going elsewhere, either organs, deficiencies, toxicity"
   ],
   "assessments_acceptable": [
     "the hypothalamus, thyroid, pancreas, gallbladder, ovaries and adrenal show up as stressed",
@@ -173,6 +178,23 @@
       "scan_priority": "pancreas"
     }
   },
+  "stressors": [
+    {
+      "category": "immune",
+      "source": "bacteria number four, which is Lyme",
+      "body_area": "brain stem"
+    }
+  ],
+  "stressors_acceptable": [
+    {
+      "category": "immune",
+      "source": "bacteria"
+    },
+    {
+      "category": "immune",
+      "source": "Lyme"
+    }
+  ],
   "lifestyle": {
     "bm": "great",
     "sleep": "seven hours",

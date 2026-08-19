@@ -74,8 +74,14 @@ const STAGES: Stage[] = [
     jsonSchema: NARRATIVE_JSON_SCHEMA,
     parse: (raw) => NarrativeStageSchema.parse(raw),
     chunked: false,
-    // The largest output: verbatim assessments and concerns, each with a quote.
-    maxTokens: Number(process.env.LLM_MAX_TOKENS_NARRATIVE ?? 3000),
+    // The largest output by a wide margin: every concern, goal, assessment and
+    // follow-up in the session, each paired with a verbatim evidence quote — and
+    // it sees the WHOLE transcript, not a chunk of it. 3000 was not a budget,
+    // it was a recall cap: a full appointment states twenty-odd assessments, and
+    // a model that senses it cannot fit them all does not truncate loudly, it
+    // summarises quietly. Fewer, vaguer findings is the exact failure Nicole
+    // reported, and it left no trace in the logs.
+    maxTokens: Number(process.env.LLM_MAX_TOKENS_NARRATIVE ?? 8000),
   },
   {
     name: 'protocol',
@@ -117,11 +123,25 @@ async function callStage(
   system: string,
   user: string,
 ): Promise<Partial<SessionNote>> {
-  // Per-stage budget, capped by the global setting so LLM_MAX_TOKENS still works
-  // as an override for a provider that needs more — plus headroom for a model
-  // that bills its reasoning against the same allowance, which would otherwise
-  // consume the whole budget before writing a character of JSON.
-  let maxTokens = Math.min(stage.maxTokens, llmConfig.maxTokens) + llmConfig.reasoningHeadroomTokens;
+  // Per-stage budget, plus headroom for a model that bills its reasoning against
+  // the same allowance and would otherwise consume the whole budget before
+  // writing a character of JSON.
+  //
+  // The global cap applies only when it was actually SET. An explicit
+  // LLM_MAX_TOKENS is an operator saying "this provider will not serve more than
+  // this", and must still bind every stage — but the bare 4096 default is not
+  // that statement, and letting it clamp a stage deliberately sized larger threw
+  // away findings with nothing to show for it.
+  //
+  // The per-minute budget still binds, and unconditionally: providers bill the
+  // REQUESTED completion tokens against it, so a stage asking for more than the
+  // tier serves in a minute is a call that can never succeed. Half the budget,
+  // because the transcript going up is charged against the same allowance.
+  const explicitCap = llmConfig.maxTokensExplicit
+    ? Math.min(stage.maxTokens, llmConfig.maxTokens)
+    : stage.maxTokens;
+  const ceiling = Math.min(explicitCap, Math.floor(llmConfig.tokensPerMinute / 2));
+  let maxTokens = ceiling + llmConfig.reasoningHeadroomTokens;
   let rateLimitRetries = 0;
   for (let attempt = 0; ; attempt++) {
     try {

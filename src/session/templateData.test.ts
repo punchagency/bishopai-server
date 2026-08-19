@@ -77,7 +77,10 @@ const richNote: SessionNote = {
     pulse0: '72, regular',
     priority1: 'Immune stressor — upper GI',
     k27: 'Switched, corrected with rub',
-    stressors: 'Immune, food (dairy)',
+    stressors: [
+      { category: 'immune', category_raw: null, category_unresolved: false, source: null, body_area: 'upper GI', detail: null },
+      { category: 'food', category_raw: null, category_unresolved: false, source: 'dairy', body_area: null, detail: null },
+    ],
     foundation: {
       laying1: null,
       standing: null,
@@ -134,7 +137,9 @@ describe('toRofData', () => {
     expect(rof.pulse0).toBe('72, regular');
     expect(rof.priority1).toBe('Immune stressor — upper GI');
     expect(rof.k27).toBe('Switched, corrected with rub');
-    expect(rof.stressors).toBe('Immune, food (dairy)');
+    // The source is what Nicole reads off the ROF, so it renders alongside the
+    // category rather than collapsing into it.
+    expect(rof.stressors).toBe('immune (upper GI); food — dairy');
   });
 });
 

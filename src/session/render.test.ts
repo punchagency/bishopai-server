@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { renderAppointmentSheet, renderProtocol, coerceSessionNote } from './render';
+import { formatStressors } from './schema';
 
 const fullNote = {
   concerns: ['poor sleep'],
@@ -80,7 +81,10 @@ describe('coerceSessionNote', () => {
     expect(n.nrt?.pulse0).toBe('72');
     expect(n.nrt?.priority1).toBe('liver');
     expect(n.nrt?.k27).toBe('positive');
-    expect(n.nrt?.stressors).toBe('immune, food');
+    // A note stored before stressors were structured still parses, and still
+    // renders the words it was stored with — never comma-split into findings
+    // nobody made.
+    expect(formatStressors(n.nrt?.stressors)).toBe('immune, food');
     expect(n.nrt?.foundation).toBeNull(); // unstated stays null, never invented
     expect(n.lifestyle?.bm).toBe('daily');
     expect(n.lifestyle?.sleep).toBe('6 hours');

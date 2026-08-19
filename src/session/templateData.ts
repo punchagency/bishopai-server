@@ -1,4 +1,5 @@
 import type { SessionNote } from './extract';
+import { formatStressors } from './schema';
 import { followUpTexts } from './followups';
 import type { CurrentSupplementRow } from './supplements';
 import { renderBodyScan, renderFoundation } from '../integrations/docs/flowsheet';
@@ -91,7 +92,7 @@ export function toRofData(note: SessionNote, ctx: { name: string; date: string }
     pulse0: text(nrt?.pulse0),
     priority1: text(nrt?.priority1),
     k27: text(nrt?.k27),
-    stressors: text(nrt?.stressors),
+    stressors: text(formatStressors(nrt?.stressors)),
     protocol: protocol.length ? protocol : undefined,
   };
 }

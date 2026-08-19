@@ -41,7 +41,10 @@ const intake: SessionNote = {
     pulse0: '76, thready',
     priority1: 'Immune stressor — upper GI',
     k27: 'Switched; corrected on rub',
-    stressors: 'Immune challenge, food (dairy, gluten)',
+    stressors: [
+      { category: 'immune', category_raw: null, category_unresolved: false, source: null, body_area: null, detail: 'immune challenge' },
+      { category: 'food', category_raw: null, category_unresolved: false, source: 'dairy, gluten', body_area: null, detail: null },
+    ],
     foundation: 'HTA positive; CNS switched; dental clear',
     body_scan: 'ART: matrix — liver/gallbladder. NRT: cell — adrenal.',
   },
@@ -74,7 +77,9 @@ const followUp: SessionNote = {
     pulse0: '70, steady',
     priority1: 'Hormonal — ovary/pituitary',
     k27: 'Holding',
-    stressors: 'Hormonal',
+    stressors: [
+      { category: 'other', category_raw: 'hormonal', category_unresolved: true, source: null, body_area: null, detail: 'hormonal' },
+    ],
     foundation: 'HTA clear; CNS holding',
     body_scan: 'ART: matrix — endocrine. Ectoderm clear.',
     // Nothing else was muscle-tested this session — those cells stay blank.
