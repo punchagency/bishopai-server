@@ -22,6 +22,9 @@ const ONEVISIT = 'onevisit-mtest@example.test'; // ineligible for maintenance: o
 suite('maintenance reactivation (integration)', () => {
   const cleanup = async () => {
     await pool
+      .query(`DELETE FROM outbound_emails WHERE lower(to_email) = ANY($1)`, [[GAP, RECENT, UPCOMING, ONEVISIT]])
+      .catch(() => {});
+    await pool
       .query(`DELETE FROM leads WHERE lower(email) = ANY($1)`, [[GAP, RECENT, UPCOMING, ONEVISIT]])
       .catch(() => {});
     await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'mtest-%'`).catch(() => {});
@@ -84,12 +87,14 @@ suite('maintenance reactivation (integration)', () => {
     const leadId = byEmail.get(GAP)!;
     const gapLead = await pool.query<{ id: string }>(`SELECT id FROM leads WHERE lower(email) = lower($1)`, [GAP]);
     const day8 = new Date(Date.now() + 8 * 86_400_000);
-    expect(await runReengagementForLead(gapLead.rows[0].id, day8)).toBe('sent');
-    const sent = await pool.query<{ sequence_state: { sent?: string[] }; status: string }>(
-      `SELECT sequence_state, status FROM leads WHERE id = $1`,
-      [gapLead.rows[0].id],
-    );
-    expect(sent.rows[0].sequence_state.sent).toContain('maintenance_7d');
+    // Queued for approval, not sent — nothing automated reaches a client until
+    // a person has seen it.
+    expect(await runReengagementForLead(gapLead.rows[0].id, day8)).toBe('queued');
+    const sent = await pool.query<{
+      sequence_state: { sent?: string[]; queued?: string[] };
+      status: string;
+    }>(`SELECT sequence_state, status FROM leads WHERE id = $1`, [gapLead.rows[0].id]);
+    expect(sent.rows[0].sequence_state.queued).toContain('maintenance_7d');
     expect(sent.rows[0].status).toBe('maintenance'); // stays on the maintenance track
     void leadId;
 

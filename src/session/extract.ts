@@ -1,9 +1,17 @@
 import { generateStructured } from '../llm/providers';
 import { llmConfig } from '../llm/config';
-import { RateLimitError, RequestTooLargeError, TruncatedOutputError, isRetryable } from '../llm/errors';
+import {
+  RateLimitError,
+  RequestTooLargeError,
+  TransientServerError,
+  TruncatedOutputError,
+  isRetryable,
+} from '../llm/errors';
 import { logEvent } from '../observability/logger';
 import { mockExtractSessionNote } from './mockExtract';
 import {
+  ASSESSMENTS_JSON_SCHEMA,
+  AssessmentsStageSchema,
   NARRATIVE_JSON_SCHEMA,
   NRT_JSON_SCHEMA,
   NarrativeStageSchema,
@@ -16,6 +24,7 @@ import {
   type SessionNote,
 } from './schema';
 import { mergeChunkNotes, mergeStages, type ChunkResult } from './mergeNotes';
+import { assessmentsPrompt } from './prompts/assessments';
 import { narrativePrompt } from './prompts/narrative';
 import { protocolPrompt } from './prompts/protocol';
 import { nrtPrompt } from './prompts/nrt';
@@ -23,6 +32,7 @@ import { PROMPT_VERSION, type PromptContext } from './prompts/shared';
 import { matchCatalog } from './supplementName';
 import { chunkTurns, formatStamp, prepareTranscript, renderTurns, type Chunk } from './transcript';
 import { summarize, verifyEvidence } from './verifyEvidence';
+import { findUnstatedNumbers } from './verifyNumbers';
 
 // Re-exported so the many existing importers of `./extract` keep working; the
 // schemas themselves now live in ./schema.
@@ -41,10 +51,37 @@ export interface ExtractContext {
   appointmentDate?: string | null;
   /** Known product names to match garbled supplement names against. */
   catalog?: readonly string[];
+  /**
+   * Run only these stages. Production passes nothing and gets all of them.
+   *
+   * This exists for measurement, and it is not a micro-optimisation: on a free
+   * tier metered in requests per day, a four-stage session costs four of them,
+   * and an A/B at three runs a side costs twenty-four — more than a day's
+   * allowance, so the comparison cannot be made at all. Measuring only the two
+   * stages a change touches halves that, which is the difference between
+   * knowing whether a change worked and guessing.
+   */
+  stages?: readonly StageName[];
 }
 
+export type StageName = 'narrative' | 'assessments' | 'protocol' | 'nrt';
+
+/**
+ * Which stage fills which top-level field.
+ *
+ * Exported because a caller that skips a stage has to know which fields are
+ * absent-by-request rather than genuinely empty — scoring a skipped stage's
+ * fields as zero would read as total recall failure.
+ */
+export const STAGE_FIELDS: Record<StageName, readonly string[]> = {
+  narrative: ['concerns', 'goals', 'follow_ups', 'lifestyle'],
+  assessments: ['assessments'],
+  protocol: ['supplements', 'protocol_changes'],
+  nrt: ['nrt'],
+};
+
 interface Stage {
-  name: 'narrative' | 'protocol' | 'nrt';
+  name: StageName;
   prompt: (ctx: PromptContext) => string;
   zodSchema: typeof STAGE_WIRE[keyof typeof STAGE_WIRE];
   jsonSchema: unknown;
@@ -53,6 +90,18 @@ interface Stage {
    *  stage never is: concerns and goals are stated once, often in passing, and a
    *  chunk that doesn't contain them cannot know they exist. */
   chunked: boolean;
+  /**
+   * Window even when the whole session WOULD fit in one call.
+   *
+   * Chunking is otherwise a concession to a token limit — something we do
+   * because we must, and which costs accuracy at the boundaries. For one stage
+   * it is the opposite. Assessments are dense, local and long-listed, and a
+   * model reading 7,000 tokens for the twentieth finding skims the middle; the
+   * ones it drops cluster there rather than spreading evenly. Reading the
+   * session in windows is what stops that, and each finding still arrives whole
+   * because it was one sentence to begin with.
+   */
+  alwaysWindow?: boolean;
   /**
    * Output budget for THIS stage, sized to what its schema can actually emit.
    *
@@ -64,6 +113,8 @@ interface Stage {
    * low is one extra call, the cost of guessing high is every call.
    */
   maxTokens: number;
+  /** Reasoning budget for this stage, when the provider exposes one. */
+  thinkingBudget?: number;
 }
 
 const STAGES: Stage[] = [
@@ -82,6 +133,34 @@ const STAGES: Stage[] = [
     // summarises quietly. Fewer, vaguer findings is the exact failure Nicole
     // reported, and it left no trace in the logs.
     maxTokens: Number(process.env.LLM_MAX_TOKENS_NARRATIVE ?? 8000),
+  },
+  {
+    name: 'assessments',
+    prompt: assessmentsPrompt,
+    zodSchema: STAGE_WIRE.assessments,
+    jsonSchema: ASSESSMENTS_JSON_SCHEMA,
+    parse: (raw) => AssessmentsStageSchema.parse(raw),
+    chunked: true,
+    // OFF by default, and the reason is a measurement rather than a preference.
+    //
+    // The theory is sound — a model reading 7,000 tokens for the twentieth
+    // finding skims the middle — and the A/B did not support it: with windows
+    // and without, on the same model and the same session, assessments recall
+    // came back at exactly 56%. What moved between those runs moved on the
+    // fixture short enough that windowing never engaged, which makes it
+    // run-to-run variance and not this.
+    //
+    // At n=1 per fixture that is not proof of no effect; it is a refusal to
+    // charge three extra calls per long session for an effect nobody has seen.
+    // The mechanism stays, behind a switch, so the question can be settled
+    // properly once repeated runs are affordable.
+    alwaysWindow: process.env.EXTRACTION_WINDOW_ASSESSMENTS === 'true',
+    // One field, but the longest list in the note: every clinical statement in
+    // the window, each with its quote.
+    maxTokens: Number(process.env.LLM_MAX_TOKENS_ASSESSMENTS ?? 4000),
+    // The one stage where thinking earns its tokens: working through a window in
+    // order and emitting every finding is the task that was being economised on.
+    thinkingBudget: Number(process.env.LLM_THINKING_ASSESSMENTS ?? 8192),
   },
   {
     name: 'protocol',
@@ -151,13 +230,21 @@ async function callStage(
         zodSchema: stage.zodSchema,
         jsonSchema: stage.jsonSchema,
         maxTokens,
+        thinkingBudget: stage.thinkingBudget,
       });
       return stage.parse(parsed);
     } catch (err) {
-      if (err instanceof RateLimitError && rateLimitRetries < llmConfig.rateLimitRetries) {
+      // An exhausted allowance is not a pace to wait out: the retry-after is
+      // about a per-minute window the provider is no longer refusing on, and
+      // every attempt spends another request against the cap that just said no.
+      // A server-side blip and a rate limit want the same response — wait, then
+      // try again — so they share the ladder. A spent quota does not: see below.
+      const waitable =
+        (err instanceof RateLimitError && !err.exhausted) || err instanceof TransientServerError;
+      if (waitable && rateLimitRetries < llmConfig.rateLimitRetries) {
         rateLimitRetries++;
         const waitMs = err.retryAfterMs ?? 1000 * 2 ** rateLimitRetries;
-        logEvent('info', 'session.extract', 'rate limited — waiting before retry', {
+        logEvent('info', 'session.extract', 'provider unavailable — waiting before retry', {
           stage: stage.name,
           attempt: rateLimitRetries,
           wait_ms: waitMs,
@@ -249,6 +336,20 @@ export async function extractSessionNote(
     overlapTurns: llmConfig.chunkOverlapTurns,
   });
   const chunks = shouldChunk ? chunkPlan : [];
+  // A SEPARATE plan for the stages that read in windows by choice.
+  //
+  // chunkPlan is sized to the provider's context limit, and on a million-token
+  // model that makes the whole session one chunk — which is correct for a
+  // fallback and useless as a window. What a window is for is attention, not
+  // capacity: it is small because a model reading 7,000 tokens for the twentieth
+  // finding skims, not because 7,000 tokens do not fit. So this is sized in
+  // absolute terms and does not move when the provider does.
+  const windowPlan = STAGES.some((s) => s.alwaysWindow)
+    ? chunkTurns(prepared.turns, {
+        targetTokens: llmConfig.windowTokens,
+        overlapTurns: llmConfig.chunkOverlapTurns,
+      })
+    : [];
 
   const partial: string[] = [];
   const conflicts: { path: string; chosen: string | null; candidates: string[] }[] = [];
@@ -260,8 +361,17 @@ export async function extractSessionNote(
     stage?: string;
   }[] = [];
 
+  const active = ctx.stages?.length ? STAGES.filter((s) => ctx.stages!.includes(s.name)) : STAGES;
+  const skipped = STAGES.filter((s) => !active.includes(s)).map((s) => s.name);
+  if (skipped.length) {
+    logEvent('info', 'session.extract', 'running a subset of stages', {
+      running: active.map((s) => s.name),
+      skipped,
+    });
+  }
+
   const stageResults = await Promise.all(
-    STAGES.map(async (stage): Promise<Partial<SessionNote> | null> => {
+    active.map(async (stage): Promise<Partial<SessionNote> | null> => {
       const fail = (err: unknown, note: string): null => {
         partial.push(stage.name);
         logEvent('warn', 'session.extract', note, {
@@ -281,7 +391,12 @@ export async function extractSessionNote(
           // account's per-minute budget. Losing the entire narrative pass over
           // that is far worse than the accuracy cost of chunking it, so degrade
           // rather than drop — and say so, since the note is now weaker.
-          if ((err instanceof RequestTooLargeError || err instanceof RateLimitError) && chunkPlan.length) {
+          // ...but not when the allowance is spent rather than paced. Chunking
+          // answers a refusal by sending MORE requests, so on a per-day cap it
+          // turns one clean "out of quota" into four dropped chunks and a note
+          // that looks partially extracted instead of not extracted at all.
+          const pacedNotSpent = err instanceof RateLimitError && !err.exhausted;
+          if ((err instanceof RequestTooLargeError || pacedNotSpent) && chunkPlan.length) {
             logEvent('warn', 'session.extract', 'whole-transcript call too large — falling back to chunks', {
               stage: stage.name,
               chunks: chunkPlan.length,
@@ -293,8 +408,8 @@ export async function extractSessionNote(
         }
       };
 
-      const runChunked = async (): Promise<Partial<SessionNote> | null> => {
-      const settled = await pooled(chunkPlan, llmConfig.chunkConcurrency, (chunk) =>
+      const runChunked = async (plan: Chunk[] = chunkPlan): Promise<Partial<SessionNote> | null> => {
+      const settled = await pooled(plan, llmConfig.chunkConcurrency, (chunk) =>
         callStage(
           stage,
           stage.prompt({ ...promptCtx, chunk: chunkLabel(chunk) }),
@@ -305,10 +420,10 @@ export async function extractSessionNote(
       const ok: ChunkResult[] = [];
       settled.forEach((r, i) => {
         if (r.status === 'fulfilled') {
-          ok.push({ index: chunkPlan[i].index, note: r.value });
+          ok.push({ index: plan[i].index, note: r.value });
           return;
         }
-        const chunk = chunkPlan[i];
+        const chunk = plan[i];
         const turns = chunk.turns;
         gaps.push({
           from: chunk.startSeconds,
@@ -334,16 +449,16 @@ export async function extractSessionNote(
       // of the session — labelled, so Nicole knows which minutes are missing. A
       // majority failing means we learned nothing, and pretending otherwise
       // would hide a broken extraction behind a plausible-looking draft.
-      if (ok.length === 0 || ok.length * 2 < chunkPlan.length) {
+      if (ok.length === 0 || ok.length * 2 < plan.length) {
         partial.push(stage.name);
         logEvent('warn', 'session.extract', 'too many chunks failed — stage dropped', {
           stage: stage.name,
           ok: ok.length,
-          total: chunkPlan.length,
+          total: plan.length,
         });
         return null;
       }
-      if (ok.length < chunkPlan.length) partial.push(`${stage.name}:partial`);
+      if (ok.length < plan.length) partial.push(`${stage.name}:partial`);
 
       const merged = mergeChunkNotes(ok);
       conflicts.push(...merged.conflicts);
@@ -363,6 +478,10 @@ export async function extractSessionNote(
       // now and spend the budget on work instead of on being told no.
       const fitsWhole = prepared.tokens <= llmConfig.chunkThresholdTokens;
       const mustChunk = !fitsWhole && chunkPlan.length > 0;
+      // Not a fallback: this stage reads in windows by choice. Only when there
+      // is more than one window, since a session short enough to be a single
+      // window is already being read the way this asks for.
+      const wantsWindows = !!stage.alwaysWindow && windowPlan.length > 1;
       if (mustChunk && !stage.chunked) {
         logEvent('info', 'session.extract', 'transcript exceeds a single call — chunking up front', {
           stage: stage.name,
@@ -371,6 +490,15 @@ export async function extractSessionNote(
           chunks: chunkPlan.length,
         });
         partial.push(`${stage.name}:chunked`);
+      }
+      if (wantsWindows) {
+        logEvent('info', 'session.extract', 'reading in windows by design', {
+          stage: stage.name,
+          tokens: prepared.tokens,
+          windows: windowPlan.length,
+          window_tokens: llmConfig.windowTokens,
+        });
+        return runChunked(windowPlan);
       }
       return (shouldChunk && stage.chunked) || mustChunk ? runChunked() : runWhole();
     }),
@@ -396,12 +524,26 @@ export async function extractSessionNote(
       provider: llmConfig.provider,
       model: modelName(),
       partial: partial.length ? partial : undefined,
+      skipped: skipped.length ? skipped : undefined,
       conflicts: conflicts.length ? conflicts : undefined,
       gaps: gaps.length ? gaps : undefined,
       attribution_coverage: prepared.attributionCoverage,
       chunks: chunks.length || null,
     },
   });
+
+  // The other half of provenance: a citation can point at a real turn about the
+  // right subject while the finding itself carries a figure nobody said. The
+  // quote check reads green on exactly that case, so the numbers are checked
+  // against the transcript separately.
+  const unstatedNumbers = findUnstatedNumbers(parsed, transcript);
+  if (unstatedNumbers.length) {
+    parsed.extraction = { ...parsed.extraction, unstated_numbers: unstatedNumbers };
+    logEvent('warn', 'session.extract', 'findings state numbers the transcript does not', {
+      count: unstatedNumbers.length,
+      fields: unstatedNumbers.map((u) => `${u.path}=${u.numbers.join('/')}`),
+    });
+  }
 
   logEvent('info', 'session.extract', 'extraction complete', {
     tokens: prepared.tokens,
@@ -410,6 +552,7 @@ export async function extractSessionNote(
     conflicts: conflicts.length,
     evidence: evidence.length,
     unverified,
+    unstated_numbers: unstatedNumbers.length,
     // Share of findings anchored to a specific turn rather than matched as
     // prose — the health signal for whether citation is actually working.
     spans: stats.spans,

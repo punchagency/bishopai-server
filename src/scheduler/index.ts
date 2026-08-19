@@ -2,6 +2,7 @@ import cron, { type ScheduledTask } from 'node-cron';
 import { logError, logEvent } from '../observability/logger';
 import type { Job } from './types';
 import { reengagementJob } from './jobs/reengagement';
+import { outboundDispatchJob } from './jobs/outboundDispatch';
 import { refillsJob } from './jobs/refills';
 import { maintenanceJob } from './jobs/maintenance';
 import { firstAppointmentJob } from './jobs/firstAppointment';
@@ -20,6 +21,7 @@ import { pocketPostSessionJob } from './jobs/pocketPostSession';
 // wrapped so one failing job never takes down the timer or the process.
 const jobs: Job[] = [
   reengagementJob,
+  outboundDispatchJob,
   refillsJob,
   maintenanceJob,
   firstAppointmentJob,

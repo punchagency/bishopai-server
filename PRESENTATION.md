@@ -123,6 +123,12 @@ rm -rf demo-output  # optional: clear previous output
   because the client didn't mention it. Worth pointing at: it shows the system
   knows what it doesn't know. Still frame the docs as **review drafts** she signs
   off, not final records.
+- **Every figure is checked against the recording.** Each finding already carries
+  the turn of the transcript it came from, and that citation is verified server-side.
+  The gap that left is a real turn, about the right thing, with a number added to it
+  — so any weight, dose, count or duration in the draft is now matched against what
+  was actually said (including "one seventy-two" for 172). Anything unmatched is
+  flagged at the top of the review, never silently removed.
 - **The Flow Sheet grows.** Her template has 7 pre-formatted blocks; past that we
   manufacture new ones with the same borders/merges, so a long-term client never
   hits a wall.

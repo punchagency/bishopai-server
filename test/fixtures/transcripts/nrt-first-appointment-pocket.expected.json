@@ -1,228 +1,230 @@
 {
-  "_meta": {
-    "source": "Real first appointment, Pocket recorder export (SPEAKER_00: inline labels, no timestamps).",
-    "authored": "2026-08-17",
-    "complete": true,
-    "notes": [
-      "Hand-verified against the transcript line by line.",
-      "This fixture exists because every other fixture is the Otter shape — a speaker",
-      "line with a timestamp, then the utterance. The recorder in actual use emits",
-      "inline 'SPEAKER_00: text' with no timestamps, and that format silently parsed",
-      "as ONE turn for the whole session while reporting 100% attribution coverage.",
-      "The golden set never covered the format that was broken, which is why it stayed",
-      "broken. Keep a no-timestamp fixture here.",
-      "Diarization is unreliable on purpose: the speaker label drifts across",
-      "SPEAKER_00..04 for the same two people, so role attribution must come from",
-      "content, not the label.",
-      "`acceptable` items are neither rewarded nor penalised — defensible readings a",
-      "careful human could differ on. `expect_null` is the fabrication test: the",
-      "transcript never states these, so any value at all is a fabricated finding.",
-      "Gold strings are phrased close to the transcript on purpose: extraction is verbatim-ish, and summary phrasing scores a correct capture as both a miss and a false positive.",
-      "`stressors` is scored on its own, matched by category rather than position, and the SOURCE is graded separately from the category — finding \"food\" when the practitioner said \"food, specifically dairy\" is half an answer, and a source we supply that they never named is a fabrication.",
-      "Three causal assessments were added on 2026-08-19 after a live eval showed the extraction finding statements the gold set had simply omitted — all three name what a finding comes FROM, the class of statement this fixture now exists to protect. Verified against the transcript before adding."
-    ]
-  },
-  "concerns": [
-    "inflammation in the neck, upper back and shoulder",
-    "neck pain",
-    "soreness in joints",
-    "weight gain",
-    "history of Lyme disease",
-    "high cholesterol",
-    "Graves' disease and thyroid removal",
-    "pre-diabetic",
-    "three PM crash",
-    "itching at night, mainly the legs"
-  ],
-  "concerns_acceptable": [
-    "fatigue",
-    "menopause",
-    "sugar and bread cravings",
-    "taking about two Advil a day for the last six weeks",
-    "nausea from taking vitamins",
-    "left neck and shoulder pain that radiates",
-    "I carry inflammation",
-    "I do get this craving, I'd rather have a coffee and a danish in the morning",
-    "they did tell me I was pre-diabetic"
-  ],
-  "goals": [
-    "regulate blood work as much as possible",
-    "support weight",
-    "ease tension in the body",
-    "support immunity",
-    "mental and emotional clarity",
-    "better energy"
-  ],
-  "goals_acceptable": [
-    "vitality",
-    "lose some more weight",
-    "find a natural option for cholesterol"
-  ],
-  "assessments": [
-    "your arms are only about twenty percent",
-    "that is bacteria number four, which is Lyme",
-    "all of those organs show up as stressed",
-    "the thyroid is crashing",
-    "parasitic activity",
-    "blood sugar dysregulation",
-    "a lot of the inflammation that you're experiencing is from the gluten peptides",
-    "it's mostly sitting in your brain, which is where it loves to hide",
-    "eighty percent of your body's human potential is going elsewhere, either organs, deficiencies, toxicity"
-  ],
-  "assessments_acceptable": [
-    "the hypothalamus, thyroid, pancreas, gallbladder, ovaries and adrenal show up as stressed",
-    "brain stem involvement, with roots to the nervous system",
-    "much of the inflammation is coming from gluten peptides",
-    "ovarian inflammation",
-    "the pancreas and the gallbladder are more digestive",
-    "the pancreas is also part of the endocrine system with your blood sugar regulation",
-    "those sugar cravings, those bread cravings could be coming from some parasitic activity",
-    "working your blood sugar, pancreas, because that area is already stressed",
-    "pancreas is the priority",
-    "Lyme goes into hiding as a biofilm and antibiotics do not clear it",
-    "cholesterol is tied to the liver, and the liver to the thyroid",
-    "blood sugar may be driving the cholesterol",
-    "mostly hormonal",
-    "thyroid is a zero",
-    "eighty percent of the body's potential is going elsewhere",
-    "weight gain, soreness in joints, neck pain, history of Lyme, high cholesterol, Graves' and thyroid removal"
-  ],
-  "supplements": [
-    {
-      "name": "Sedrophin",
-      "change": "start",
-      "name_variants": [
-        "sedrophin",
-        "Cedrophin"
-      ]
-    },
-    {
-      "name": "Artichoke",
-      "change": "start",
-      "dose_contains": "four"
-    },
-    {
-      "name": "Garlic",
-      "change": "start",
-      "name_variants": [
-        "Garlic rotate"
-      ]
-    },
-    {
-      "name": "Frankincense",
-      "change": "start",
-      "dose_contains": "dropper"
-    },
-    {
-      "name": "Texas oil powder",
-      "change": "start",
-      "dose_contains": "scoop"
-    },
-    {
-      "name": "Cedar",
-      "change": "start",
-      "dose_contains": "two"
-    }
-  ],
-  "supplements_acceptable": [
-    {
-      "name": "Ultena",
-      "change": "continue"
-    },
-    {
-      "name": "Iodine",
-      "change": "start"
-    },
-    {
-      "name": "levothyroxine",
-      "change": "continue"
-    },
-    {
-      "name": "B12",
-      "change": "continue"
-    },
-    {
-      "name": "glutathione",
-      "change": "continue"
-    },
-    {
-      "name": "magnesium",
-      "change": "continue"
-    },
-    {
-      "name": "probiotic",
-      "change": "continue"
-    },
-    {
-      "name": "glandular thyroid support",
-      "change": "start",
-      "name_variants": [
-        "ARM Thyroid",
-        "NP Thyroid"
-      ]
-    }
-  ],
-  "follow_ups": [
-    "practitioner will type up the protocol and send it to the client to review together"
-  ],
-  "follow_ups_acceptable": [
-    "provide a parasite diet to follow",
-    "open capsules into a smoothie if the pills cause nausea"
-  ],
-  "follow_ups_due_in_days": {
-    "0": null
-  },
-  "nrt": {
-    "priority1": "pancreas",
-    "body_scan": {
-      "scan_priority": "pancreas"
-    }
-  },
-  "stressors": [
-    {
-      "category": "immune",
-      "source": "bacteria number four, which is Lyme",
-      "body_area": "brain stem"
-    }
-  ],
-  "stressors_acceptable": [
-    {
-      "category": "immune",
-      "source": "bacteria"
-    },
-    {
-      "category": "immune",
-      "source": "Lyme"
-    }
-  ],
-  "lifestyle": {
-    "bm": "great",
-    "sleep": "seven hours",
-    "water": "I try",
-    "cycle": "normal",
-    "exercise": "very active",
-    "diet": "hydration first, coffee, protein shake"
-  },
-  "expect_null": [
-    "nrt.pulse0",
-    "nrt.k27",
-    "nrt.foundation.standing",
-    "nrt.foundation.hta_post_run",
-    "nrt.foundation.art_switch",
-    "nrt.body_scan.art_ectoderm",
-    "nrt.body_scan.art_priority",
-    "nrt.body_scan.art_matrix",
-    "nrt.body_scan.art_cell",
-    "nrt.body_scan.scan_matrix",
-    "nrt.body_scan.scan_cell"
-  ],
-  "expect_null_acceptable": [
-    "nrt.foundation.laying1",
-    "nrt.foundation.laying2",
-    "nrt.foundation.hta",
-    "nrt.foundation.art_open",
-    "nrt.foundation.art_cns",
-    "nrt.foundation.art_dental",
-    "nrt.foundation.art_hormonal"
+ "_meta": {
+  "source": "Real first appointment, Pocket recorder export (SPEAKER_00: inline labels, no timestamps).",
+  "authored": "2026-08-17",
+  "complete": true,
+  "notes": [
+   "Hand-verified against the transcript line by line.",
+   "This fixture exists because every other fixture is the Otter shape — a speaker",
+   "line with a timestamp, then the utterance. The recorder in actual use emits",
+   "inline 'SPEAKER_00: text' with no timestamps, and that format silently parsed",
+   "as ONE turn for the whole session while reporting 100% attribution coverage.",
+   "The golden set never covered the format that was broken, which is why it stayed",
+   "broken. Keep a no-timestamp fixture here.",
+   "Diarization is unreliable on purpose: the speaker label drifts across",
+   "SPEAKER_00..04 for the same two people, so role attribution must come from",
+   "content, not the label.",
+   "`acceptable` items are neither rewarded nor penalised — defensible readings a",
+   "careful human could differ on. `expect_null` is the fabrication test: the",
+   "transcript never states these, so any value at all is a fabricated finding.",
+   "Gold strings are phrased close to the transcript on purpose: extraction is verbatim-ish, and summary phrasing scores a correct capture as both a miss and a false positive.",
+   "`stressors` is scored on its own, matched by category rather than position, and the SOURCE is graded separately from the category — finding \"food\" when the practitioner said \"food, specifically dairy\" is half an answer, and a source we supply that they never named is a fabrication.",
+   "Three causal assessments were added on 2026-08-19 after a live eval showed the extraction finding statements the gold set had simply omitted — all three name what a finding comes FROM, the class of statement this fixture now exists to protect. Verified against the transcript before adding.",
+   "GRANULARITY: one complaint per entry. A diagnosis and an operation are two facts even when spoken in one breath, and gold pairing them made a correct extraction of both score as one miss plus two fabrications."
   ]
+ },
+ "concerns": [
+  "inflammation in the neck, upper back and shoulder",
+  "neck pain",
+  "soreness in joints",
+  "weight gain",
+  "history of Lyme disease",
+  "high cholesterol",
+  "Graves' disease",
+  "thyroid removed",
+  "pre-diabetic",
+  "three PM crash",
+  "itching at night, mainly the legs"
+ ],
+ "concerns_acceptable": [
+  "fatigue",
+  "menopause",
+  "sugar and bread cravings",
+  "taking about two Advil a day for the last six weeks",
+  "nausea from taking vitamins",
+  "left neck and shoulder pain that radiates",
+  "I carry inflammation",
+  "I do get this craving, I'd rather have a coffee and a danish in the morning",
+  "they did tell me I was pre-diabetic"
+ ],
+ "goals": [
+  "regulate blood work as much as possible",
+  "support weight",
+  "ease tension in the body",
+  "support immunity",
+  "mental and emotional clarity",
+  "better energy"
+ ],
+ "goals_acceptable": [
+  "vitality",
+  "lose some more weight",
+  "find a natural option for cholesterol"
+ ],
+ "assessments": [
+  "your arms are only about twenty percent",
+  "that is bacteria number four, which is Lyme",
+  "all of those organs show up as stressed",
+  "the thyroid is crashing",
+  "parasitic activity",
+  "blood sugar dysregulation",
+  "a lot of the inflammation that you're experiencing is from the gluten peptides",
+  "it's mostly sitting in your brain, which is where it loves to hide",
+  "eighty percent of your body's human potential is going elsewhere, either organs, deficiencies, toxicity"
+ ],
+ "assessments_acceptable": [
+  "the hypothalamus, thyroid, pancreas, gallbladder, ovaries and adrenal show up as stressed",
+  "brain stem involvement, with roots to the nervous system",
+  "much of the inflammation is coming from gluten peptides",
+  "ovarian inflammation",
+  "the pancreas and the gallbladder are more digestive",
+  "the pancreas is also part of the endocrine system with your blood sugar regulation",
+  "those sugar cravings, those bread cravings could be coming from some parasitic activity",
+  "working your blood sugar, pancreas, because that area is already stressed",
+  "pancreas is the priority",
+  "Lyme goes into hiding as a biofilm and antibiotics do not clear it",
+  "cholesterol is tied to the liver, and the liver to the thyroid",
+  "blood sugar may be driving the cholesterol",
+  "mostly hormonal",
+  "thyroid is a zero",
+  "eighty percent of the body's potential is going elsewhere",
+  "weight gain, soreness in joints, neck pain, history of Lyme, high cholesterol, Graves' and thyroid removal"
+ ],
+ "supplements": [
+  {
+   "name": "Sedrophin",
+   "change": "start",
+   "name_variants": [
+    "sedrophin",
+    "Cedrophin"
+   ]
+  },
+  {
+   "name": "Artichoke",
+   "change": "start",
+   "dose_contains": "four"
+  },
+  {
+   "name": "Garlic",
+   "change": "start",
+   "name_variants": [
+    "Garlic rotate"
+   ]
+  },
+  {
+   "name": "Frankincense",
+   "change": "start",
+   "dose_contains": "dropper"
+  },
+  {
+   "name": "Texas oil powder",
+   "change": "start",
+   "dose_contains": "scoop"
+  },
+  {
+   "name": "Cedar",
+   "change": "start",
+   "dose_contains": "two"
+  }
+ ],
+ "supplements_acceptable": [
+  {
+   "name": "Ultena",
+   "change": "continue"
+  },
+  {
+   "name": "Iodine",
+   "change": "start"
+  },
+  {
+   "name": "levothyroxine",
+   "change": "continue"
+  },
+  {
+   "name": "B12",
+   "change": "continue"
+  },
+  {
+   "name": "glutathione",
+   "change": "continue"
+  },
+  {
+   "name": "magnesium",
+   "change": "continue"
+  },
+  {
+   "name": "probiotic",
+   "change": "continue"
+  },
+  {
+   "name": "glandular thyroid support",
+   "change": "start",
+   "name_variants": [
+    "ARM Thyroid",
+    "NP Thyroid"
+   ]
+  }
+ ],
+ "follow_ups": [
+  "practitioner will type up the protocol and send it to the client to review together"
+ ],
+ "follow_ups_acceptable": [
+  "provide a parasite diet to follow",
+  "open capsules into a smoothie if the pills cause nausea"
+ ],
+ "follow_ups_due_in_days": {
+  "0": null
+ },
+ "nrt": {
+  "priority1": "pancreas",
+  "body_scan": {
+   "scan_priority": "pancreas"
+  }
+ },
+ "stressors": [
+  {
+   "category": "immune",
+   "source": "bacteria number four, which is Lyme",
+   "body_area": "brain stem"
+  }
+ ],
+ "stressors_acceptable": [
+  {
+   "category": "immune",
+   "source": "bacteria"
+  },
+  {
+   "category": "immune",
+   "source": "Lyme"
+  }
+ ],
+ "lifestyle": {
+  "bm": "great",
+  "sleep": "seven hours",
+  "water": "I try",
+  "cycle": "normal",
+  "exercise": "very active",
+  "diet": "hydration first, coffee, protein shake"
+ },
+ "expect_null": [
+  "nrt.pulse0",
+  "nrt.k27",
+  "nrt.foundation.standing",
+  "nrt.foundation.hta_post_run",
+  "nrt.foundation.art_switch",
+  "nrt.body_scan.art_ectoderm",
+  "nrt.body_scan.art_priority",
+  "nrt.body_scan.art_matrix",
+  "nrt.body_scan.art_cell",
+  "nrt.body_scan.scan_matrix",
+  "nrt.body_scan.scan_cell"
+ ],
+ "expect_null_acceptable": [
+  "nrt.foundation.laying1",
+  "nrt.foundation.laying2",
+  "nrt.foundation.hta",
+  "nrt.foundation.art_open",
+  "nrt.foundation.art_cns",
+  "nrt.foundation.art_dental",
+  "nrt.foundation.art_hormonal"
+ ]
 }

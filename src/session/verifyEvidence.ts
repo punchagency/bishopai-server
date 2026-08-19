@@ -49,7 +49,10 @@ const NEGATORS = new Set([
   "couldn't", "ain't",
 ]);
 
-function stem(word: string): string {
+/** Exported so the eval's gold matcher stems the same way this does. Two
+ *  hand-rolled stemmers in one repo drift, and the one that drifts is the one
+ *  nobody is looking at. */
+export function stem(word: string): string {
   const w = word.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (w.length <= 3) return w;
   if (w.endsWith('sses')) return w.slice(0, -2);
@@ -135,6 +138,41 @@ function supports(quote: string, haystack: string): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * How much of `text` is actually the practitioner's wording, 0–1.
+ *
+ * The quote check asks whether the transcript backs a finding. This asks a
+ * different question the same evidence can answer: whether the finding is still
+ * in the words that were said. An assessment is meant to be a span of the
+ * practitioner's speech trimmed of filler — but models rewrite clinical speech
+ * into chart-note prose by default ("the gallbladder is showing stress" becomes
+ * "cholestatic pattern noted"), and that rewrite verifies perfectly: the turn is
+ * real, the quote is copied from it, and only the item Nicole reads has changed.
+ *
+ * So: what share of the finding's content words appear in the turn it was read
+ * from. 1.0 is a trimmed quote; a low score is prose the model composed. It is a
+ * measurement, not a gate — nothing is rejected on it, because a faithful item
+ * can legitimately drop or reorder words, and the point is to see the rate move
+ * when a prompt changes.
+ */
+export function wordingFidelity(text: string, turnText: string): number {
+  const cText = canonical(text);
+  const cTurn = canonical(turnText);
+  if (!cText || !cTurn) return 0;
+  if (cTurn.includes(cText)) return 1;
+
+  const stems = cText
+    .split(' ')
+    .filter((w) => w && !STOP_WORDS.has(w))
+    .map(stem)
+    .filter((w) => w.length >= 2);
+  if (!stems.length) return 1;
+  const turnStems = new Set(cTurn.split(' ').map(stem));
+  let hits = 0;
+  for (const w of stems) if (turnStems.has(w)) hits++;
+  return hits / stems.length;
 }
 
 /** Verbatim containment only — the strong form, used to decide whether a quote

@@ -62,12 +62,72 @@ export class RequestTooLargeError extends ProviderError {
   }
 }
 
-/** Rate limited / overloaded. Retryable after a wait. */
+/** Rate limited / overloaded. Retryable after a wait — unless `exhausted`. */
 export class RateLimitError extends ProviderError {
   readonly retryAfterMs: number | null;
-  constructor(opts: { provider: string; retryAfterMs?: number | null; cause?: unknown }) {
-    super('provider rate limited', opts);
+  /**
+   * The allowance is SPENT, not merely paced: a per-day request cap or a
+   * billing limit, which no amount of waiting inside this run will restore.
+   *
+   * The distinction is not cosmetic. Every response to an ordinary rate limit —
+   * back off and retry, or split the transcript into chunks and send those —
+   * makes an exhausted quota strictly worse, because each one spends MORE
+   * requests against the cap that just refused this one. Google's free tier is
+   * 20 requests per day; a session that reacts by chunking into four turns one
+   * refusal into five, and reports the difference as a partial extraction rather
+   * than as "the key is out of quota".
+   */
+  readonly exhausted: boolean;
+  constructor(opts: {
+    provider: string;
+    retryAfterMs?: number | null;
+    exhausted?: boolean;
+    cause?: unknown;
+  }) {
+    super(opts.exhausted ? 'provider quota exhausted' : 'provider rate limited', opts);
     this.name = 'RateLimitError';
+    this.retryAfterMs = opts.retryAfterMs ?? null;
+    this.exhausted = opts.exhausted ?? false;
+  }
+}
+
+/**
+ * A 429 that will still be a 429 in an hour.
+ *
+ * Providers return the same status for "you are going too fast" and "you have
+ * used your allowance for the day", and only the body tells them apart: Google
+ * names the quota it refused on (`...PerDayPerProjectPerModel-FreeTier`), and
+ * OpenAI-compatible tiers say `insufficient_quota`. The retry-after they attach
+ * is about the former and is meaningless for the latter — Google offers "retry
+ * in 8s" on a cap that resets at midnight.
+ *
+ * Deliberately narrow. Reading an ordinary per-minute limit as exhausted would
+ * abandon a session the provider was willing to serve thirty seconds later,
+ * which is the more expensive mistake of the two.
+ */
+export function isQuotaExhausted(err: unknown): boolean {
+  const msg = String((err as { message?: string })?.message ?? '');
+  return /per[-_ ]?day|daily (?:limit|quota)|insufficient_quota|billing details/i.test(msg);
+}
+
+/**
+ * The provider is up but this request did not land: 500, 502, 503, 504.
+ *
+ * Distinct from a rate limit, which says the account has asked for too much, and
+ * from a quota, which says it has asked for too much today. This says nothing
+ * about us at all — "the model is currently experiencing high demand" is the
+ * provider having a moment, and the correct response is the one thing the
+ * extractor was NOT doing: try again shortly.
+ *
+ * It cost a whole measurement to find. A 503 on the two stages being measured
+ * dropped them both, and only the degraded-run check stopped the resulting zeros
+ * from being recorded as a catastrophic regression.
+ */
+export class TransientServerError extends ProviderError {
+  readonly retryAfterMs: number | null;
+  constructor(opts: { provider: string; status?: number; retryAfterMs?: number | null; cause?: unknown }) {
+    super(`provider temporarily unavailable${opts.status ? ` (${opts.status})` : ''}`, opts);
+    this.name = 'TransientServerError';
     this.retryAfterMs = opts.retryAfterMs ?? null;
   }
 }
@@ -78,7 +138,10 @@ export function isRetryable(err: unknown): boolean {
   // Waiting cannot shrink the request; only the caller sending less can.
   if (err instanceof RequestTooLargeError) return false;
   if (err instanceof TruncatedOutputError) return true;
-  if (err instanceof RateLimitError) return true;
+  if (err instanceof TransientServerError) return true;
+  // A spent daily allowance does not come back within a run, and every retry
+  // spends another request against the cap that refused this one.
+  if (err instanceof RateLimitError) return !err.exhausted;
   if (err instanceof ProviderError) return true;
   // Unknown errors (network, DNS, timeouts) are usually transient.
   return true;

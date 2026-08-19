@@ -2,6 +2,8 @@ import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
 import { sendEmail } from '../integrations/outlook';
 import { nextCadenceAction, FIXED_TRACK_STATUSES, trackNameFor, resolveTemplate, type LeadState } from './cadence';
+import { queueEmail } from '../outbound/queue';
+import { categoryForTrack } from '../outbound/policy';
 
 // WF3 cadence pass (run by the scheduler): evaluate every active lead, send the
 // due step (dry-run until Outlook is configured), and advance its sequence
@@ -10,6 +12,9 @@ import { nextCadenceAction, FIXED_TRACK_STATUSES, trackNameFor, resolveTemplate,
 
 export interface ReengagementResult {
   scanned: number;
+  /** Held for approval — nothing reaches a client from this pass. */
+  queued: number;
+  /** Sent outright: only the welcome to a brand-new enquiry is exempt. */
   sent: number;
   deactivated: number;
   skipped: number; // due to send but no email on file
@@ -23,6 +28,8 @@ export interface LeadDraft {
 
 export interface LeadSequenceState {
   sent?: string[];
+  /** Steps sitting in the approval queue — rendered, not yet seen by a client. */
+  queued?: string[];
   drafts?: Record<string, LeadDraft>;
 }
 
@@ -39,7 +46,20 @@ interface LeadRow {
 const LEAD_COLUMNS = `id, email, status, sequence_state, last_touch, created_at, cadence_cancelled_at`;
 
 /** Outcome of evaluating one lead — tallied by the batch runner. */
-type LeadOutcome = 'sent' | 'deactivated' | 'skipped' | 'none';
+type LeadOutcome = 'sent' | 'queued' | 'deactivated' | 'skipped' | 'none';
+
+/**
+ * The one automated email that does not wait for approval.
+ *
+ * Someone who has just written in is owed a reply now; holding the welcome until
+ * the weekly review would answer a Tuesday enquiry on Friday, and the value of
+ * "thanks for reaching out" decays to nothing in a day. Every other step — every
+ * nudge, every win-back, every dose reminder — goes to the queue.
+ *
+ * Scoped to the step, not to the caller: the immediate path is also used when a
+ * webhook enrols a lead, and only the enquiry welcome is exempt there too.
+ */
+const EXEMPT_STEP = 'welcome';
 
 /**
  * Evaluate and action a single lead: send the due cadence step (dry-run until
@@ -52,7 +72,10 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
     status: row.status,
     created_at: new Date(row.created_at),
     last_touch: row.last_touch ? new Date(row.last_touch) : null,
-    sentSteps: row.sequence_state?.sent ?? [],
+    // A step already waiting for approval counts as done for scheduling purposes.
+    // Without this the weekly assembly would offer the same nudge again every
+    // time it ran, and the cadence would stall on whatever is sitting unapproved.
+    sentSteps: [...(row.sequence_state?.sent ?? []), ...(row.sequence_state?.queued ?? [])],
     cadenceCancelled: row.cadence_cancelled_at !== null,
   };
   const action = nextCadenceAction(state, now);
@@ -72,6 +95,36 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
       // Inject available booking slots into emails that reference scheduling.
       const body = await appendSlotSuggestions(tpl.body, row.id);
       const subject = tpl.subject;
+
+      // Everything except the enquiry welcome is held for approval. The step is
+      // recorded as queued so the next assembly moves on rather than re-offering
+      // it, and it stays consumed if the item is later rejected or expires — a
+      // nudge nobody approved is a nudge that should not keep coming back.
+      if (action.step !== EXEMPT_STEP) {
+        const res = await queueEmail(
+          {
+            category: categoryForTrack(trackName),
+            toEmail: row.email,
+            subject,
+            body,
+            sourceRef: `cadence:${trackName}:${action.step}`,
+            leadId: row.id,
+          },
+          now,
+        );
+        if (!res.queued) return res.duplicate ? 'none' : 'skipped';
+        await pool.query(
+          `UPDATE leads
+              SET sequence_state = jsonb_set(
+                    coalesce(sequence_state, '{}'::jsonb), '{queued}',
+                    coalesce(sequence_state->'queued', '[]'::jsonb) || to_jsonb($2::text)
+                  )
+            WHERE id = $1`,
+          [row.id, action.step],
+        );
+        return 'queued';
+      }
+
       let result: import('../integrations/outlook').EmailResult;
       try {
         result = await sendEmail({ to: row.email, subject, body });
@@ -135,20 +188,23 @@ export async function runReengagement(now: Date = new Date()): Promise<Reengagem
   let sent = 0;
   let deactivated = 0;
   let skipped = 0;
+  let queued = 0;
   for (const row of rows) {
     const outcome = await processLead(row, now);
     if (outcome === 'sent') sent++;
+    else if (outcome === 'queued') queued++;
     else if (outcome === 'deactivated') deactivated++;
     else if (outcome === 'skipped') skipped++;
   }
 
   logEvent('info', 'reengagement.run', 'cadence pass complete', {
     scanned: rows.length,
+    queued,
     sent,
     deactivated,
     skipped,
   });
-  return { scanned: rows.length, sent, deactivated, skipped };
+  return { scanned: rows.length, queued, sent, deactivated, skipped };
 }
 
 /**

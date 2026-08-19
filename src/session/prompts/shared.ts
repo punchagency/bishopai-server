@@ -3,7 +3,7 @@
 // Version-stamped: the version is written onto every extracted note, so an
 // accuracy regression spotted weeks later can be traced back to the prompt
 // change that caused it rather than guessed at.
-export const PROMPT_VERSION = '2026-08-19.1';
+export const PROMPT_VERSION = '2026-08-19.3';
 
 export interface PromptContext {
   /** Who the client is. Removes the single biggest source of speaker confusion:
@@ -23,6 +23,14 @@ const NEVER_GUESS = [
   'plausible clinical value. A blank field is correct and expected; a fabricated one',
   'is a clinical error. If the transcript does not state something, return null (for',
   'string fields) or an empty array.',
+  '',
+  // Numbers are checked against the transcript automatically after extraction, so
+  // an invented one is not merely wrong, it is caught and shown to the reviewer as
+  // a figure nobody said. Saying so here is cheap; the check runs either way.
+  'FIGURES ESPECIALLY. A weight, a dose, a count, a duration, a lab value: write it',
+  'only if it was said, in the form it was said. Numbers are the one detail that',
+  'cannot be approximated — a rounded or reconstructed figure reads exactly like a',
+  'measured one, and a record is where it stops being obvious which it was.',
 ].join('\n');
 
 const SPEAKERS = [

@@ -7,7 +7,8 @@ import { fullscriptDispensaryUrl } from '../integrations/fullscript';
 import { computeAdherence, suggestedMonths } from '../refills/adherence';
 import { computeRunOut, dailyUnits, type DoseSchedule } from '../refills/project';
 import { recordAudit } from '../audit/log';
-import { sendEmail, resolveOutlookAccess } from '../integrations/outlook';
+import { resolveOutlookAccess } from '../integrations/outlook';
+import { queueEmail } from '../outbound/queue';
 
 // WF4 dashboard surface: the daily refill digest (who's running low, tiered by
 // urgency) plus Nicole's actions — snooze, skip, or bulk-send the orders to
@@ -267,16 +268,23 @@ refillsRouter.post('/orders', async (req, res) => {
       const clientFirst = group.clientName.split(' ')[0] || 'there';
       const emailBody = `Hi ${clientFirst},\n\nThis is a friendly reminder from Innerlume Healing that the following supplement(s) from your protocol are running low:\n\n${suppStrings}\n\nTo purchase your refills, please place an order via your Practice Better client portal or visit our Fullscript dispensary at:\n${dispensaryUrl}\n\nBest regards,\nNicole & the Innerlume Healing Team`;
 
+      // Queued, not sent. One click here used to mail every client with a
+      // supplement running low — the largest single blast in the product, and
+      // the one with the least review per recipient. It now lands in the same
+      // approval list as everything else, grouped under doses.
       let sendOk = false;
       let sendError = '';
       try {
-        const emailRes = await sendEmail({
-          to: email,
+        const queued = await queueEmail({
+          category: 'dose_lapse',
+          toEmail: email,
           subject: 'Refill Reminder: Your Innerlume Supplements',
           body: emailBody,
+          sourceRef: `refill_batch:${batchId}:${group.clientId ?? email}`,
+          clientId: group.clientId ?? null,
         });
-        sendOk = emailRes.ok;
-        sendError = emailRes.error ?? '';
+        sendOk = queued.queued || !!queued.duplicate;
+        sendError = sendOk ? '' : 'could not queue for approval';
       } catch (err) {
         sendOk = false;
         sendError = err instanceof Error ? err.message : String(err);

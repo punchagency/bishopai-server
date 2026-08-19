@@ -19,6 +19,10 @@ const EMAIL = 'cancel-it@example.test';
 
 suite('cancellation → cancelled cadence (integration)', () => {
   const cleanup = async () => {
+    // outbound_emails outlives its lead on purpose (history), so clear it
+     // explicitly — a stale pending row would dedupe against the next run and
+     // the cadence step would silently come back 'none'.
+    await pool.query(`DELETE FROM outbound_emails WHERE lower(to_email) = lower($1)`, [EMAIL]).catch(() => {});
     await pool.query(`DELETE FROM leads WHERE lower(email) = lower($1)`, [EMAIL]).catch(() => {});
     await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'citest-%'`).catch(() => {});
     await pool.query(`DELETE FROM clients WHERE pb_id LIKE 'citest-%'`).catch(() => {});
@@ -67,15 +71,27 @@ suite('cancellation → cancelled cadence (integration)', () => {
     // Nothing due immediately (cancelled_7d is at 7 days).
     expect(await runReengagementForLead(leadId, new Date())).toBe('none');
 
-    // At day 8, the first reschedule prompt sends.
+    // At day 8 the first reschedule prompt is DUE — and is held for approval
+    // rather than sent. Nothing automated reaches a client until a person says
+    // so; the step is recorded as queued so the cadence moves on rather than
+    // offering it again on the next pass.
     const day8 = new Date(Date.now() + 8 * 86_400_000);
-    expect(await runReengagementForLead(leadId, day8)).toBe('sent');
-    const sent = await pool.query<{ sequence_state: { sent?: string[] }; status: string }>(
-      `SELECT sequence_state, status FROM leads WHERE id = $1`,
+    expect(await runReengagementForLead(leadId, day8)).toBe('queued');
+    const sent = await pool.query<{
+      sequence_state: { sent?: string[]; queued?: string[] };
+      status: string;
+    }>(`SELECT sequence_state, status FROM leads WHERE id = $1`, [leadId]);
+    expect(sent.rows[0].sequence_state.queued).toContain('cancelled_7d');
+    expect(sent.rows[0].sequence_state.sent ?? []).not.toContain('cancelled_7d');
+    expect(sent.rows[0].status).toBe('cancelled'); // stays on the cancelled track
+
+    // ...and it landed in the cancelled win-back list, not the normal one.
+    const queued = await pool.query<{ list: string; category: string; state: string }>(
+      `SELECT list, category, state FROM outbound_emails WHERE lead_id = $1`,
       [leadId],
     );
-    expect(sent.rows[0].sequence_state.sent).toContain('cancelled_7d');
-    expect(sent.rows[0].status).toBe('cancelled'); // stays on the cancelled track
+    expect(queued.rows).toHaveLength(1);
+    expect(queued.rows[0]).toMatchObject({ list: 'cancelled', category: 'cancelled', state: 'pending' });
   });
 
   it('skips a cancellation when the client has no email', async () => {

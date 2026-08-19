@@ -6,6 +6,14 @@ import { nextCadenceAction, nextScheduledStep, trackNameFor, type LeadState } fr
 import { runReengagement, sendIndividualLeadEmail } from '../reengagement/runner';
 import { getOutlookConnection } from '../integrations/outlook';
 import { recordAudit } from '../audit/log';
+import {
+  approve,
+  listPending,
+  pendingSummary,
+  reject,
+  sendApproved,
+  updatePending,
+} from '../outbound/queue';
 
 // WF3 dashboard surface: the lead list with each lead's next cadence step, the
 // live site-activity feed (lead_activity), and Nicole's actions — stop the
@@ -323,6 +331,109 @@ engagementRouter.get('/leads/:id/history', async (req, res) => {
     return res.json({ history: rows });
   } catch (err) {
     logError('engagement.history', 'history query failed', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// --- Approval queue ---------------------------------------------------------
+//
+// Nothing automated reaches a client until it is approved here. The list is
+// assembled weekly and split two ways: `cancelled` is the win-back track for
+// people who cancelled a booking, `normal` is everything else (new enquiries,
+// people who never rebooked, clients past the session gap, supplements running
+// out), grouped by category so a week's worth can be read a group at a time.
+
+const listParam = z.enum(['normal', 'cancelled']).optional();
+
+// GET /engagement/approvals?list=normal|cancelled
+engagementRouter.get('/approvals', async (req, res) => {
+  const parsed = listParam.safeParse(req.query.list);
+  if (!parsed.success) return res.status(400).json({ error: 'list must be normal or cancelled' });
+  try {
+    return res.json({ approvals: await listPending(parsed.data) });
+  } catch (err) {
+    logError('engagement.approvals', 'failed to list pending approvals', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// GET /engagement/approvals/summary — counts for the dashboard alert.
+engagementRouter.get('/approvals/summary', async (_req, res) => {
+  try {
+    return res.json(await pendingSummary());
+  } catch (err) {
+    logError('engagement.approvals', 'failed to summarise approvals', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+const idsPayload = z.object({
+  ids: z.array(z.string()).min(1),
+  reason: z.string().max(500).optional(),
+});
+
+// POST /engagement/approvals/approve — bulk, because a weekly batch is reviewed
+// in one sitting. Approving does not send; the daily dispatch job does.
+engagementRouter.post('/approvals/approve', async (req, res) => {
+  const parsed = idsPayload.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'ids required' });
+  if (!parsed.data.ids.every(isUuid)) return res.status(400).json({ error: 'invalid id' });
+  try {
+    const actor = (req as { user?: { email?: string } }).user?.email ?? 'nicole';
+    const count = await approve(parsed.data.ids, actor);
+    return res.json({ approved: count });
+  } catch (err) {
+    logError('engagement.approvals', 'approve failed', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// POST /engagement/approvals/reject
+engagementRouter.post('/approvals/reject', async (req, res) => {
+  const parsed = idsPayload.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'ids required' });
+  if (!parsed.data.ids.every(isUuid)) return res.status(400).json({ error: 'invalid id' });
+  try {
+    const actor = (req as { user?: { email?: string } }).user?.email ?? 'nicole';
+    const count = await reject(parsed.data.ids, actor, parsed.data.reason);
+    return res.json({ rejected: count });
+  } catch (err) {
+    logError('engagement.approvals', 'reject failed', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+const editPayload = z.object({
+  subject: z.string().min(1).max(300),
+  body: z.string().min(1),
+});
+
+// PUT /engagement/approvals/:id — edit before approving. Editing is not
+// approving: the item stays pending until someone says so explicitly.
+engagementRouter.put('/approvals/:id', async (req, res) => {
+  const { id } = req.params;
+  if (!isUuid(id)) return res.status(400).json({ error: 'invalid id' });
+  const parsed = editPayload.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'subject and body required' });
+  try {
+    const ok = await updatePending(id, parsed.data.subject, parsed.data.body);
+    if (!ok) return res.status(404).json({ error: 'not pending' });
+    return res.json({ ok: true });
+  } catch (err) {
+    logError('engagement.approvals', 'edit failed', err);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// POST /engagement/approvals/dispatch — send approved items now rather than
+// waiting for the daily job. Sends nothing that is not already approved.
+engagementRouter.post('/approvals/dispatch', async (_req, res) => {
+  try {
+    const result = await sendApproved();
+    logEvent('info', 'engagement.approvals', 'manual dispatch', result);
+    return res.json(result);
+  } catch (err) {
+    logError('engagement.approvals', 'dispatch failed', err);
     return res.status(500).json({ error: 'internal error' });
   }
 });

@@ -1,0 +1,321 @@
+{
+  "saved_at": "2026-08-19T11:59:37.958Z",
+  "notes": [
+    {
+      "concerns": [
+        "Inflammation in the neck and upper body",
+        "Left neck and shoulder pain",
+        "History of Lyme's disease",
+        "High cholesterol",
+        "History of Graves' disease",
+        "Thyroid removed over twenty years ago",
+        "Itching at night, specifically the legs",
+        "Weight gain with menopause",
+        "Soreness in joints",
+        "Pain in the breastbone",
+        "Energy crash around three o'clock",
+        "Pre-diabetic",
+        "Sugar and bread cravings"
+      ],
+      "goals": [
+        "Regulate blood work as much as possible",
+        "Support weight",
+        "Ease tension in the body",
+        "Support immunity",
+        "Mental and emotional clarity",
+        "Better energy and vitality"
+      ],
+      "assessments": [],
+      "protocol_changes": [],
+      "supplements": [],
+      "follow_ups": [
+        {
+          "text": "Follow parasite diet guidelines to avoid feeding parasites",
+          "due_in_days": null
+        }
+      ],
+      "lifestyle": {
+        "bm": "Great",
+        "sleep": "Seven hours, solid",
+        "water": "Does not drink enough",
+        "cycle": "Menopause",
+        "exercise": "Very active, always on the go, but no formal exercise",
+        "diet": "Coffee with non-dairy creamer, protein shakes, picking at kids' leftovers, chicken, vegetables, potato, rice, one meal a day"
+      },
+      "evidence": [
+        {
+          "path": "concerns.0",
+          "quote": "it's like all in my neck, my upper. So inflammation is why they, they want me to get there.",
+          "at_seconds": null,
+          "turn": 4,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "-it's like all in my neck, my upper. So inflammation is why they, they want me to get there."
+        },
+        {
+          "path": "concerns.1",
+          "quote": "right now it's like this left neck and shoulder?",
+          "at_seconds": null,
+          "turn": 15,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "So, so like upper, kind of like upper chest, but then right now it's like this left neck and shoulder?"
+        },
+        {
+          "path": "concerns.2",
+          "quote": "the only thing they told me I had was Lyme's disease. I mean, but that was three years ago.",
+          "at_seconds": null,
+          "turn": 18,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "It's all over. But I do feel better. I just did now two treatments this week. And I'll have another one. I mean, three years ago they. I mean, I had to do extensive blood work, and the only thing they told me I had was Lyme's disease. I mean, but that was three years ago. So I did do the Doxy. And that's really. Everything else came back. Besides that, I do have high cholesterol. But I'm not on anything 'cause I tried it twice."
+        },
+        {
+          "path": "concerns.3",
+          "quote": "Besides that, I do have high cholesterol.",
+          "at_seconds": null,
+          "turn": 18,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "It's all over. But I do feel better. I just did now two treatments this week. And I'll have another one. I mean, three years ago they. I mean, I had to do extensive blood work, and the only thing they told me I had was Lyme's disease. I mean, but that was three years ago. So I did do the Doxy. And that's really. Everything else came back. Besides that, I do have high cholesterol. But I'm not on anything 'cause I tried it twice."
+        },
+        {
+          "path": "concerns.4",
+          "quote": "were you diagnosed Graves, do you know? I was.",
+          "at_seconds": null,
+          "turn": 33,
+          "unverified": false,
+          "verification": "span_near",
+          "turn_text": "For sure. Um, so were, were you diagnosed Graves, do you know?"
+        },
+        {
+          "path": "concerns.5",
+          "quote": "That was removed probably over twenty years ago. It was- What was happening? I was hyperactive.",
+          "at_seconds": null,
+          "turn": 22,
+          "unverified": false,
+          "verification": "span_near",
+          "turn_text": "Or no, that was removed probably over twenty years ago. It was-"
+        },
+        {
+          "path": "concerns.6",
+          "quote": "I itch though at night, so I don't know if that's the cortisol thing.",
+          "at_seconds": null,
+          "turn": 40,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "I itch though at night, so I don't know if that's the cortisol thing."
+        },
+        {
+          "path": "concerns.7",
+          "quote": "biggest symptoms. We'll say like some waking with menopause, right?",
+          "at_seconds": null,
+          "turn": 89,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "She's awesome. She's taking care of you. All right, so biggest symptoms. We'll say like some waking with menopause, right?"
+        },
+        {
+          "path": "concerns.8",
+          "quote": "Inflammation. The soreness, the joints.",
+          "at_seconds": null,
+          "turn": 90,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Inflammation. The soreness, the joints. Like, but it's not all over. That's what's creepy. Like, my legs are fine. My everything else."
+        },
+        {
+          "path": "concerns.9",
+          "quote": "before I had it all into the breastbone.",
+          "at_seconds": null,
+          "turn": 92,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Here. Like, like before I had it all into the breastbone. And now it's just. It, it's in the back and it does move. That's what's creepy to me. But the chiropractor, he did release some of that."
+        },
+        {
+          "path": "concerns.10",
+          "quote": "Three o'clock, a little coffee. So you then crash.",
+          "at_seconds": null,
+          "turn": 98,
+          "unverified": false,
+          "verification": "span_near",
+          "turn_text": "Three o'clock, a little coffee."
+        },
+        {
+          "path": "concerns.11",
+          "quote": "And they did tell me I was pre-diabetic.",
+          "at_seconds": null,
+          "turn": 117,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "And they did tell me I was pre-diabetic."
+        },
+        {
+          "path": "concerns.12",
+          "quote": "I do get this craving. Like I'd rather have a coffee and a danish in the morning.",
+          "at_seconds": null,
+          "turn": 119,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "But I found myself with that craving. I do get this craving. Like I'd rather have a coffee and a danish in the morning. That's sweet. I do have this craving that I'm trying to stay with the-"
+        },
+        {
+          "path": "goals.0",
+          "quote": "regulate your blood work as much as possible, right?",
+          "at_seconds": null,
+          "turn": 121,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Sure. Um, so goals. We want to, for me, for you, regulate your blood work as much as possible, right? Again, Graves', remove thyroid, you're gonna have some things going on. I'm not gonna get you off levothyroxine. I know that. That's okay. Um, I'm just gonna put support weight. Not here to lose twenty pounds. Obviously, menopause does some things, but there's some weight that your body's holding that it's ready to let go of. We'll find it, and we can help your body let go of it. Um, ease tension in the body, right? Support immunity, history of Lyme and all of that. Me-mental and emotional clarity and better energy. Slash vitality."
+        },
+        {
+          "path": "goals.1",
+          "quote": "I'm just gonna put support weight.",
+          "at_seconds": null,
+          "turn": 121,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Sure. Um, so goals. We want to, for me, for you, regulate your blood work as much as possible, right? Again, Graves', remove thyroid, you're gonna have some things going on. I'm not gonna get you off levothyroxine. I know that. That's okay. Um, I'm just gonna put support weight. Not here to lose twenty pounds. Obviously, menopause does some things, but there's some weight that your body's holding that it's ready to let go of. We'll find it, and we can help your body let go of it. Um, ease tension in the body, right? Support immunity, history of Lyme and all of that. Me-mental and emotional clarity and better energy. Slash vitality."
+        },
+        {
+          "path": "goals.2",
+          "quote": "ease tension in the body, right?",
+          "at_seconds": null,
+          "turn": 121,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Sure. Um, so goals. We want to, for me, for you, regulate your blood work as much as possible, right? Again, Graves', remove thyroid, you're gonna have some things going on. I'm not gonna get you off levothyroxine. I know that. That's okay. Um, I'm just gonna put support weight. Not here to lose twenty pounds. Obviously, menopause does some things, but there's some weight that your body's holding that it's ready to let go of. We'll find it, and we can help your body let go of it. Um, ease tension in the body, right? Support immunity, history of Lyme and all of that. Me-mental and emotional clarity and better energy. Slash vitality."
+        },
+        {
+          "path": "goals.3",
+          "quote": "Support immunity, history of Lyme and all of that.",
+          "at_seconds": null,
+          "turn": 121,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Sure. Um, so goals. We want to, for me, for you, regulate your blood work as much as possible, right? Again, Graves', remove thyroid, you're gonna have some things going on. I'm not gonna get you off levothyroxine. I know that. That's okay. Um, I'm just gonna put support weight. Not here to lose twenty pounds. Obviously, menopause does some things, but there's some weight that your body's holding that it's ready to let go of. We'll find it, and we can help your body let go of it. Um, ease tension in the body, right? Support immunity, history of Lyme and all of that. Me-mental and emotional clarity and better energy. Slash vitality."
+        },
+        {
+          "path": "goals.4",
+          "quote": "Me-mental and emotional clarity",
+          "at_seconds": null,
+          "turn": 121,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Sure. Um, so goals. We want to, for me, for you, regulate your blood work as much as possible, right? Again, Graves', remove thyroid, you're gonna have some things going on. I'm not gonna get you off levothyroxine. I know that. That's okay. Um, I'm just gonna put support weight. Not here to lose twenty pounds. Obviously, menopause does some things, but there's some weight that your body's holding that it's ready to let go of. We'll find it, and we can help your body let go of it. Um, ease tension in the body, right? Support immunity, history of Lyme and all of that. Me-mental and emotional clarity and better energy. Slash vitality."
+        },
+        {
+          "path": "goals.5",
+          "quote": "better energy. Slash vitality.",
+          "at_seconds": null,
+          "turn": 121,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Sure. Um, so goals. We want to, for me, for you, regulate your blood work as much as possible, right? Again, Graves', remove thyroid, you're gonna have some things going on. I'm not gonna get you off levothyroxine. I know that. That's okay. Um, I'm just gonna put support weight. Not here to lose twenty pounds. Obviously, menopause does some things, but there's some weight that your body's holding that it's ready to let go of. We'll find it, and we can help your body let go of it. Um, ease tension in the body, right? Support immunity, history of Lyme and all of that. Me-mental and emotional clarity and better energy. Slash vitality."
+        },
+        {
+          "path": "follow_ups.0",
+          "quote": "we will also give you a parasite diet to ideally follow that helps you follow guidelines to, to not feed the parasites",
+          "at_seconds": null,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "so parasites, which comes. So a lot of those sugar cravings, those bread cravings too, could be coming from some parasitic activity. Um, they live on grains, sugars, and alcohol. So if they wanna survive, they're gonna make you crave those things. Um, so we're gonna help put in some things that help your body to kill, bind, and drain, and just regulate your blood sugar. Um, you might notice that you crave those things less as we start to eradicate them. But we will also give you a parasite diet to ideally follow that helps you follow guidelines to, to not feed the parasites as, as long as you do that, it's pretty easy. But that could be some of those, like, nasty kind of feelings and a lot of that sugar crash can be a sign of blood sugar dysregulation, so. Uh, any questions so far? You doing okay? Making sense a little bit? You can say no too, it's okay. Bring that out."
+        },
+        {
+          "path": "lifestyle.bm",
+          "quote": "Great. I do great.",
+          "at_seconds": null,
+          "turn": 36,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Great. I do great."
+        },
+        {
+          "path": "lifestyle.sleep",
+          "quote": "Seven hours. ... sleep's solid. I'm a great sleeper.",
+          "at_seconds": null,
+          "turn": 38,
+          "unverified": true,
+          "verification": "misattributed",
+          "turn_text": "Seven hours."
+        },
+        {
+          "path": "lifestyle.water",
+          "quote": "You don't drink enough water, Mom.",
+          "at_seconds": null,
+          "turn": 50,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "They're always yelling at me. \"You don't drink enough water, Mom."
+        },
+        {
+          "path": "lifestyle.cycle",
+          "quote": "how was your transition to menopause?",
+          "at_seconds": null,
+          "turn": 53,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Normal. And how was your transition to menopause?"
+        },
+        {
+          "path": "lifestyle.exercise",
+          "quote": "I'm very active. ... Do I exercise, exercise? No, but I am- Moving around a lot.",
+          "at_seconds": null,
+          "turn": 62,
+          "unverified": true,
+          "verification": "misattributed",
+          "turn_text": "I'm very active."
+        },
+        {
+          "path": "lifestyle.diet",
+          "quote": "I have a coffee. ... protein shake ... I'm a picker. ... I try and have a sandwich. I'm always having dinner. ... chicken, a vegetable. Potato, rice.",
+          "at_seconds": null,
+          "turn": 78,
+          "unverified": false,
+          "verification": "span_near",
+          "turn_text": "Um, I have a coffee. I usually try and use non-dairy creamer. I will. I've been trying the protein shake Brooke makes me these days. She buys me that I need. Um, I'm a picker. Like I, you know, there's something left from the two kids- -I just pick on that. I try and have a sandwich. I'm always having dinner."
+        }
+      ],
+      "extraction": {
+        "prompt_version": "2026-08-19.3",
+        "provider": "google",
+        "model": "gemini-3-flash-preview",
+        "partial": [
+          "assessments"
+        ],
+        "skipped": [
+          "protocol",
+          "nrt"
+        ],
+        "attribution_coverage": 0.8745762711864407,
+        "chunks": null
+      }
+    },
+    {
+      "concerns": [],
+      "goals": [],
+      "assessments": [],
+      "protocol_changes": [],
+      "supplements": [],
+      "follow_ups": [],
+      "evidence": [],
+      "extraction": {
+        "prompt_version": "2026-08-19.3",
+        "provider": "google",
+        "model": "gemini-3-flash-preview",
+        "partial": [
+          "narrative",
+          "assessments"
+        ],
+        "skipped": [
+          "protocol",
+          "nrt"
+        ],
+        "attribution_coverage": 0.8745762711864407,
+        "chunks": null
+      }
+    }
+  ]
+}

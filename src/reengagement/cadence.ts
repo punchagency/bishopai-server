@@ -92,8 +92,13 @@ const MAINTENANCE_STEPS: CadenceStep[] = [
 ];
 
 // First-appointment track: a client who came once and hasn't rebooked. Mirrors
-// the cancelled cadence's 7/14-day timing; the 14-day step carries an incentive
-// to encourage them to return or commit to a plan.
+// the cancelled cadence's 7/14-day timing.
+//
+// The 14-day step used to offer "15% off your next visit if you book this month".
+// A standing discount, mailed automatically to everyone who has not rebooked in a
+// fortnight, is a pricing decision — and it was living in a code default where
+// nobody had agreed to it. Removed 2026-08-19. If a promotion is wanted it should
+// be a deliberate campaign with an end date, not a line in a cadence.
 const FIRST_APPOINTMENT_STEPS: CadenceStep[] = [
   {
     step: 'first_appt_7d',
@@ -104,8 +109,8 @@ const FIRST_APPOINTMENT_STEPS: CadenceStep[] = [
   {
     step: 'first_appt_14d',
     afterDays: 14,
-    subject: 'A little something to get you started',
-    body: "To help you commit to your plan, here's 15% off your next visit if you book this month. Just reply and we'll set it up.",
+    subject: 'Picking up where we left off',
+    body: "The work we started builds on itself, and the second visit is where most of that progress happens. Whenever you're ready, just reply and we'll find a time that suits you.",
   },
 ];
 

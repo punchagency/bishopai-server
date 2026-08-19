@@ -1,6 +1,6 @@
 import { pool } from '../db/pool';
 import { logEvent, logError } from '../observability/logger';
-import { sendEmail } from '../integrations/outlook';
+import { queueEmail } from '../outbound/queue';
 import { computeRunOut, type DoseSchedule } from './project';
 import { nextReminderAction, reminderMessage, followUpDays, type ReminderState } from './reminders';
 
@@ -23,6 +23,7 @@ export interface ReminderRunResult {
 
 type ReminderRow = ReminderState & {
   id: string;
+  client_id: string | null;
   client_name: string | null;
   email: string | null;
   supplement_name: string | null;
@@ -36,7 +37,7 @@ type ReminderRow = ReminderState & {
 export const REMINDER_SELECT = `rf.id, rf.status, to_char(rf.due_date, 'YYYY-MM-DD') AS due_date,
             rf.reminder_stage, to_char(rf.reminder_next_at, 'YYYY-MM-DD') AS reminder_next_at,
             rf.reminders_cancelled_at,
-            c.name AS client_name, c.email,
+            c.id AS client_id, c.name AS client_name, c.email,
             s.name AS supplement_name, s.dose, s.qty,
             to_char(s.start_date, 'YYYY-MM-DD') AS start_date, s.schedule`;
 
@@ -81,7 +82,22 @@ export async function runRefillReminders(today = new Date().toISOString().slice(
         perDay,
         daysLeft,
       });
-      await sendEmail({ to: r.email, subject: msg.subject, body: msg.body });
+      // Held for approval like every other automated client email. The stage
+      // advances here rather than at send time for the same reason the cadence
+      // records a queued step: the weekly assembly must not offer this reminder
+      // again while the first one is still sitting in the review list.
+      const queueRes = await queueEmail({
+        category: 'dose_lapse',
+        toEmail: r.email,
+        subject: msg.subject,
+        body: msg.body,
+        sourceRef: `refill:${r.id}:stage${action.stage}`,
+        clientId: r.client_id ?? null,
+      });
+      if (!queueRes.queued && !queueRes.duplicate) {
+        result.skipped++;
+        continue;
+      }
       const next = new Date(`${today}T00:00:00Z`);
       next.setUTCDate(next.getUTCDate() + followUpDays(daysSupply));
       await pool.query(

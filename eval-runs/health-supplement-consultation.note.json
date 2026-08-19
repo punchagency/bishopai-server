@@ -1,0 +1,568 @@
+{
+  "saved_at": "2026-08-19T10:32:00.652Z",
+  "note": {
+    "concerns": [
+      "Gallbladder pain, stones on ultrasound, and elevated liver enzymes a couple years ago",
+      "Waking up at night in sheer panic for no apparent reason"
+    ],
+    "goals": [],
+    "assessments": [
+      "the central nervous system is clear",
+      "looking at some hormonal points in the brain, and we are finding some blocks",
+      "the pituitary is a little bit offline",
+      "Your inhaler is not testing well",
+      "all of your doses from previous came down"
+    ],
+    "protocol_changes": [
+      {
+        "description": "Discontinue MSM",
+        "type": "remove",
+        "type_raw": null,
+        "type_unresolved": false
+      },
+      {
+        "description": "Hold Chaste Tree",
+        "type": "remove",
+        "type_raw": null,
+        "type_unresolved": false
+      },
+      {
+        "description": "Decrease Equifem from 3 to 1 daily at night",
+        "type": "adjust",
+        "type_raw": null,
+        "type_unresolved": false
+      },
+      {
+        "description": "Decrease Livatrit Plus from 3 to 2 daily",
+        "type": "adjust",
+        "type_raw": null,
+        "type_unresolved": false
+      },
+      {
+        "description": "Start Cyto-Zyme PT/HPT for pituitary and hypothalamus glandular support",
+        "type": "add",
+        "type_raw": null,
+        "type_unresolved": false
+      },
+      {
+        "description": "Start Bio B Complex",
+        "type": "add",
+        "type_raw": null,
+        "type_unresolved": false
+      },
+      {
+        "description": "Start Beta Plus for gallbladder support",
+        "type": "add",
+        "type_raw": null,
+        "type_unresolved": false
+      },
+      {
+        "description": "Continue TMG",
+        "type": "continue",
+        "type_raw": null,
+        "type_unresolved": false
+      }
+    ],
+    "supplements": [
+      {
+        "name": "MSM",
+        "dose": null,
+        "quantity": null,
+        "change": "stop",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": null
+        },
+        "obtained_from": null,
+        "func": null,
+        "units_per_dose": null,
+        "unit": null,
+        "doses_per_day": null
+      },
+      {
+        "name": "Chaste Tree",
+        "dose": null,
+        "quantity": null,
+        "change": "stop",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": null
+        },
+        "obtained_from": null,
+        "func": null,
+        "units_per_dose": null,
+        "unit": null,
+        "doses_per_day": null
+      },
+      {
+        "name": "Equifem",
+        "dose": "just one",
+        "quantity": null,
+        "change": "decrease",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": "1"
+        },
+        "obtained_from": null,
+        "func": null,
+        "units_per_dose": 1,
+        "unit": null,
+        "doses_per_day": 1
+      },
+      {
+        "name": "Livatrit Plus",
+        "dose": "just two",
+        "quantity": null,
+        "change": "decrease",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": null
+        },
+        "obtained_from": null,
+        "func": null,
+        "units_per_dose": 2,
+        "unit": null,
+        "doses_per_day": null
+      },
+      {
+        "name": "Cyto-Zyme PT/HPT",
+        "dose": null,
+        "quantity": null,
+        "change": "start",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": null
+        },
+        "obtained_from": null,
+        "func": "pituitary and hypothalamus glandular support",
+        "units_per_dose": null,
+        "unit": null,
+        "doses_per_day": null
+      },
+      {
+        "name": "Bio B Complex",
+        "dose": null,
+        "quantity": null,
+        "change": "start",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": null
+        },
+        "obtained_from": null,
+        "func": null,
+        "units_per_dose": null,
+        "unit": null,
+        "doses_per_day": null
+      },
+      {
+        "name": "Beta Plus",
+        "dose": null,
+        "quantity": null,
+        "change": "start",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": null
+        },
+        "obtained_from": null,
+        "func": "for the gallbladders",
+        "units_per_dose": null,
+        "unit": null,
+        "doses_per_day": null
+      },
+      {
+        "name": "TMG",
+        "dose": null,
+        "quantity": null,
+        "change": "continue",
+        "change_raw": null,
+        "change_unresolved": false,
+        "schedule": {
+          "uponWaking": null,
+          "breakfast": null,
+          "midMorning": null,
+          "lunch": null,
+          "midAfternoon": null,
+          "dinner": null,
+          "beforeBed": null
+        },
+        "obtained_from": null,
+        "func": null,
+        "units_per_dose": null,
+        "unit": null,
+        "doses_per_day": null
+      }
+    ],
+    "follow_ups": [
+      {
+        "text": "Contact practitioner if sleep or temperature gets disrupted",
+        "due_in_days": null
+      }
+    ],
+    "nrt": {
+      "pulse0": null,
+      "priority1": null,
+      "k27": null,
+      "stressors": [
+        {
+          "category": "food",
+          "category_raw": null,
+          "category_unresolved": false,
+          "source": null,
+          "body_area": "gallbladder",
+          "detail": "not anything specific"
+        }
+      ],
+      "foundation": {
+        "laying1": null,
+        "standing": null,
+        "hta": null,
+        "hta_post_run": null,
+        "laying2": null,
+        "art_open": null,
+        "art_switch": null,
+        "art_cns": "clear",
+        "art_dental": null,
+        "art_hormonal": "blocks",
+        "additional": null
+      },
+      "body_scan": {
+        "art_ectoderm": null,
+        "art_priority": null,
+        "art_matrix": null,
+        "art_cell": null,
+        "additional_art": null,
+        "scan_priority": null,
+        "scan_matrix": null,
+        "scan_cell": null,
+        "additional_nrt": null
+      }
+    },
+    "lifestyle": {
+      "bm": null,
+      "sleep": null,
+      "water": null,
+      "cycle": null,
+      "exercise": null,
+      "diet": null
+    },
+    "evidence": [
+      {
+        "path": "concerns.0",
+        "quote": "a couple years ago I was getting pains in it",
+        "at_seconds": 393,
+        "turn": 10,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "I forgot to tell you, a couple years ago I was getting pains in it. Yeah. So my doctor sent me for a skin ultrasound. Yeah, and he said there were stones in there. Yeah, so he referred me to a surgeon, and my liver enzymes were elevated. The surgeon, oh my goodness, I have no respect for him whatsoever. He said, \"Well, take it out. We'll take the gallbladder out, and then if the liver enzymes decrease, then we'll know that it wasn't, and they will know that it was the gallbladder. Yeah, wait, you're just going to remove major organs to check. No, thank you. Yeah, happens unfortunately a"
+      },
+      {
+        "path": "concerns.1",
+        "quote": "there are some nights where I'll just wake up in sheer panic for seeming with no reason.",
+        "at_seconds": 761,
+        "turn": 21,
+        "unverified": true,
+        "verification": "misattributed",
+        "turn_text": "Awesome. Yeah, absolutely. there there are some nights where I'll just wake up in sheer panic for"
+      },
+      {
+        "path": "follow_ups.0",
+        "quote": "if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "assessments.0",
+        "quote": "the central nervous system is clear",
+        "at_seconds": 90,
+        "turn": 2,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Pinky and thumb on your left hand. Add your ring finger. Good. Place all 10 of your fingertips together. Center of your chest with each hand. Got it, and we're going to pop the elbows out a little bit. Okay, so the central nervous system is clear, which is great. All right, see that there, like your elbow gets stuck, instead of where like here, it's nice and open. So here we're looking at some hormonal points in the brain, and we are finding some blocks. Not here. Stay there, but I'm going to keep your fingers in the belly button and really pop the elbow like out. Yep, there you go. You're here like that. Okay."
+      },
+      {
+        "path": "assessments.1",
+        "quote": "looking at some hormonal points in the brain, and we are finding some blocks",
+        "at_seconds": 90,
+        "turn": 2,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Pinky and thumb on your left hand. Add your ring finger. Good. Place all 10 of your fingertips together. Center of your chest with each hand. Got it, and we're going to pop the elbows out a little bit. Okay, so the central nervous system is clear, which is great. All right, see that there, like your elbow gets stuck, instead of where like here, it's nice and open. So here we're looking at some hormonal points in the brain, and we are finding some blocks. Not here. Stay there, but I'm going to keep your fingers in the belly button and really pop the elbow like out. Yep, there you go. You're here like that. Okay."
+      },
+      {
+        "path": "assessments.2",
+        "quote": "the pituitary is a little bit offline",
+        "at_seconds": 185,
+        "turn": 4,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "So right now, what we see is like that the pituitary is a little bit offline, which is what it was. Yeah, third eye kind of thing. Yeah, so that's like nicole. Yeah, pituitary is a little more like hormonal than that, but we do recommendially. Yeah, but it's really big with like safety regulation in the body. So you do want to tell the body, okay, we're beginning to heal. You can relax a little bit, right? Okay. You can start signaling to the body that there is actually safety. I like that. Yeah. Which again, after years of any kind of stress, but talking about the stress that you were under that can really throw some natural sense of safety. So it's the pituitary and hypothalamus worker like that. HPA access, the teacher, have been done in the tutorial journal. So we're going to support that. Thank you. Welcome. Should feel pretty good. It should help the body just kind of calm a little bit better. Count me on the edge of my seat. Exactly. Relax your left hand on your side. Bringing your right arm up. Yeah. So we're going to give you a product called cytosine PTHPT, which is pituitary and hypothalamus glandular support. So it kind of goes in for those overworked glands, and since we can take a little break, so shift your rib through the bottom."
+      },
+      {
+        "path": "assessments.3",
+        "quote": "Your inhaler is not testing well",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "assessments.4",
+        "quote": "all of your doses from previous came down",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "supplements.0",
+        "quote": "So the MSM we're taking out.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "supplements.1",
+        "quote": "I'm going to hold on the chase tree",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "supplements.2",
+        "quote": "Equifam went from three to just one. So I'm actually going to keep that at night.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "supplements.3",
+        "quote": "The Livatrip Plus went from three to just two.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "supplements.4",
+        "quote": "we're going to give you a product called cytosine PTHPT, which is pituitary and hypothalamus glandular support.",
+        "at_seconds": 185,
+        "turn": 4,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "So right now, what we see is like that the pituitary is a little bit offline, which is what it was. Yeah, third eye kind of thing. Yeah, so that's like nicole. Yeah, pituitary is a little more like hormonal than that, but we do recommendially. Yeah, but it's really big with like safety regulation in the body. So you do want to tell the body, okay, we're beginning to heal. You can relax a little bit, right? Okay. You can start signaling to the body that there is actually safety. I like that. Yeah. Which again, after years of any kind of stress, but talking about the stress that you were under that can really throw some natural sense of safety. So it's the pituitary and hypothalamus worker like that. HPA access, the teacher, have been done in the tutorial journal. So we're going to support that. Thank you. Welcome. Should feel pretty good. It should help the body just kind of calm a little bit better. Count me on the edge of my seat. Exactly. Relax your left hand on your side. Bringing your right arm up. Yeah. So we're going to give you a product called cytosine PTHPT, which is pituitary and hypothalamus glandular support. So it kind of goes in for those overworked glands, and since we can take a little break, so shift your rib through the bottom."
+      },
+      {
+        "path": "supplements.5",
+        "quote": "So I'm gonna swap you to a different B vitamin called Bio B Complex.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "supplements.6",
+        "quote": "Now we're putting in something called Beta Plus. That is for the gallbladders.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "supplements.7",
+        "quote": "Keep that TMI.",
+        "at_seconds": 518,
+        "turn": 16,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Yeah, exactly. That's why I said in these early stages, no need to refill anything because we're seeing each other so frequently that you might be done. Keep that TMI. You should be having almost enough shows. Okay. We are actually going to take out the cheese tree. We'll hold it, so I'll slide it down a little. It might bring you back in. Keep that equifem. Keep that litatric just till they are gone. Okay, so we have cytosine PTHPT beta plus calpenzp cormai equifem and litatric. I'm just gonna dosu caliperspor one two cytosine one two."
+      },
+      {
+        "path": "protocol_changes.0",
+        "quote": "So the MSM we're taking out.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "protocol_changes.1",
+        "quote": "I'm going to hold on the chase tree",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "protocol_changes.2",
+        "quote": "Equifam went from three to just one.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "protocol_changes.3",
+        "quote": "The Livatrip Plus went from three to just two.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "protocol_changes.4",
+        "quote": "we're going to give you a product called cytosine PTHPT, which is pituitary and hypothalamus glandular support.",
+        "at_seconds": 185,
+        "turn": 4,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "So right now, what we see is like that the pituitary is a little bit offline, which is what it was. Yeah, third eye kind of thing. Yeah, so that's like nicole. Yeah, pituitary is a little more like hormonal than that, but we do recommendially. Yeah, but it's really big with like safety regulation in the body. So you do want to tell the body, okay, we're beginning to heal. You can relax a little bit, right? Okay. You can start signaling to the body that there is actually safety. I like that. Yeah. Which again, after years of any kind of stress, but talking about the stress that you were under that can really throw some natural sense of safety. So it's the pituitary and hypothalamus worker like that. HPA access, the teacher, have been done in the tutorial journal. So we're going to support that. Thank you. Welcome. Should feel pretty good. It should help the body just kind of calm a little bit better. Count me on the edge of my seat. Exactly. Relax your left hand on your side. Bringing your right arm up. Yeah. So we're going to give you a product called cytosine PTHPT, which is pituitary and hypothalamus glandular support. So it kind of goes in for those overworked glands, and since we can take a little break, so shift your rib through the bottom."
+      },
+      {
+        "path": "protocol_changes.5",
+        "quote": "So I'm gonna swap you to a different B vitamin called Bio B Complex.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "protocol_changes.6",
+        "quote": "Now we're putting in something called Beta Plus. That is for the gallbladders.",
+        "at_seconds": 591,
+        "turn": 20,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Your inhaler is not testing well, but do you use it every day? Only before I exercise a little bit when I was walking in the seat. Okay. Yeah. So then, just as needed is okay. Yeah, that's all I would do. And the drops are clear. Totally different. You can absolutely use those. They smoke them. Yeah. And we have another number of all this. I have it all. Yeah. All right. So this is back for you. Okay. The good news is, is all of your doses from previous came down, which is exactly what we're looking for. Oh, good. So the MSM we're taking out. Then the Equifam went from three to just one. So I'm actually going to keep that at night. I'm going to hold on the chase tree, but if you feel like your sleep stops being as deep, let me know. Okay. So I'm just going to put a note next to it that says if sleep or temperature gets disrupted, like if my temperature gets higher, if you start sweating again, okay, contact, okay, and we'll bring it back in. But you should be okay. The Livatrip Plus went from three to just two. Awesome. Then we are adding in something called Catalyze the Core. Actually, let me check you on. Sorry, I think we're just feeling like that. No, it's okay. You can say standing. Check this guy instead. So hold this one in your hand. Okay, so I'm gonna swap you to a different B vitamin called Bio B Complex. Your pious finisher yellow-that is totally fine. Yeah. I heard that he does that. Yeah. Now we're putting in something called Beta Plus. That is for the gallbladders. It's actually bile salt, so it can really help your bile, and it might outbreak down stones, and it will help you with stones as we go on too. Okay. Should help even more, and then we are putting in something for your adrenals. What you told me, but what do adrenals do? They are like your fight or flight glands. Okay. So we're trying this whole thing that we're doing is trying to really reset the safety in your body. Okay. Hypothalamus, pituitary, and adrenal. So today we're working on adrenal, which kind of calms down like the cortisol and like the fight, and the pituitary is the one who tells the adrenals to fight. So we also want to tell them you're safe. So we're going from like an upstream and downstream kind of support there. Nice. This should feel pretty good in the body."
+      },
+      {
+        "path": "protocol_changes.7",
+        "quote": "Keep that TMI.",
+        "at_seconds": 518,
+        "turn": 16,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Yeah, exactly. That's why I said in these early stages, no need to refill anything because we're seeing each other so frequently that you might be done. Keep that TMI. You should be having almost enough shows. Okay. We are actually going to take out the cheese tree. We'll hold it, so I'll slide it down a little. It might bring you back in. Keep that equifem. Keep that litatric just till they are gone. Okay, so we have cytosine PTHPT beta plus calpenzp cormai equifem and litatric. I'm just gonna dosu caliperspor one two cytosine one two."
+      },
+      {
+        "path": "nrt.foundation.art_cns",
+        "quote": "central nervous system is clear",
+        "at_seconds": 90,
+        "turn": 2,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Pinky and thumb on your left hand. Add your ring finger. Good. Place all 10 of your fingertips together. Center of your chest with each hand. Got it, and we're going to pop the elbows out a little bit. Okay, so the central nervous system is clear, which is great. All right, see that there, like your elbow gets stuck, instead of where like here, it's nice and open. So here we're looking at some hormonal points in the brain, and we are finding some blocks. Not here. Stay there, but I'm going to keep your fingers in the belly button and really pop the elbow like out. Yep, there you go. You're here like that. Okay."
+      },
+      {
+        "path": "nrt.foundation.art_hormonal",
+        "quote": "we are finding some blocks",
+        "at_seconds": 90,
+        "turn": 2,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Pinky and thumb on your left hand. Add your ring finger. Good. Place all 10 of your fingertips together. Center of your chest with each hand. Got it, and we're going to pop the elbows out a little bit. Okay, so the central nervous system is clear, which is great. All right, see that there, like your elbow gets stuck, instead of where like here, it's nice and open. So here we're looking at some hormonal points in the brain, and we are finding some blocks. Not here. Stay there, but I'm going to keep your fingers in the belly button and really pop the elbow like out. Yep, there you go. You're here like that. Okay."
+      },
+      {
+        "path": "nrt.stressors.0.category",
+        "quote": "it is showing them to be food",
+        "at_seconds": 351,
+        "turn": 7,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Okay, so it is showing them to be food. Let's see if it's a specific food or just digestion overall. Please don't be coffee. Please don't"
+      },
+      {
+        "path": "nrt.stressors.0.body_area",
+        "quote": "we're just going to work on the gallbladder today",
+        "at_seconds": 326,
+        "turn": 6,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Nice. Okay, so we're just going to work on the gallbladder today. This should further help digestion, regulation, detoxification. But let's find that extras a minute."
+      },
+      {
+        "path": "nrt.stressors.0.detail",
+        "quote": "it's not anything specific",
+        "at_seconds": 374,
+        "turn": 9,
+        "unverified": false,
+        "verification": "span",
+        "turn_text": "Okay, so it's not anything specific. You can relax. So we're just gonna help the gallbladder overall, just with like emulsifying fats, smooth bile production, so this will only help your digestion even more. Okay, should feel pretty good."
+      }
+    ],
+    "extraction": {
+      "prompt_version": "2026-08-19.3",
+      "provider": "google",
+      "model": "gemini-3.6-flash",
+      "attribution_coverage": 0.8757725587144622,
+      "chunks": null
+    }
+  }
+}

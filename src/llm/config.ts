@@ -230,6 +230,18 @@ export const llmConfig = {
     process.env.EXTRACTION_CHUNK_TARGET_TOKENS ?? Math.max(1200, Math.floor(defaultChunkThreshold() * 0.7)),
   ),
   chunkOverlapTurns: Number(process.env.EXTRACTION_CHUNK_OVERLAP_TURNS ?? 2),
+  /**
+   * Window size for the stages that read in windows BY CHOICE rather than
+   * because a call would not fit.
+   *
+   * Deliberately independent of the provider's context limit and of
+   * chunkTargetTokens, which is derived from it: on a million-token model that
+   * derivation makes the whole session one window, which is exactly the reading
+   * the windowing is meant to avoid. This number answers "how much can be read
+   * closely at once", and the answer does not change when the context window
+   * does.
+   */
+  windowTokens: Number(process.env.EXTRACTION_WINDOW_TOKENS ?? 2500),
   /** Parallel chunk calls. Keeps a long session inside free-tier rate limits. */
   chunkConcurrency: Number(process.env.EXTRACTION_CHUNK_CONCURRENCY ?? 3),
   /** How many times to wait out a 429 before giving up on a chunk. On a small

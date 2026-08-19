@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
+  ASSESSMENTS_JSON_SCHEMA,
+  AssessmentsStageSchema,
   NARRATIVE_JSON_SCHEMA,
   NRT_JSON_SCHEMA,
   NarrativeStageSchema,
@@ -11,7 +13,8 @@ import {
   mapProtocolType,
 } from './schema';
 import { matchCatalog, nameSimilarity, normalizeSupplementName } from './supplementName';
-import { summarize, verifyEvidence } from './verifyEvidence';
+import { STAGE_FIELDS } from './extract';
+import { summarize, verifyEvidence, wordingFidelity } from './verifyEvidence';
 
 describe('supplement action mapping', () => {
   it('maps the words the practitioner actually uses', () => {
@@ -23,6 +26,24 @@ describe('supplement action mapping', () => {
       ['keep', 'continue'], ['refill', 'continue'],
     ] as const) {
       expect(mapChange(said).value, said).toBe(want);
+    }
+  });
+
+  it('maps the spoken phrasings, not just the written ones', () => {
+    // Every phrase here was said in a real session and used to fall through to
+    // the `continue` placeholder — which reads as "already on it" for a start
+    // and keeps the old dose for a decrease.
+    for (const [said, want] of [
+      ['putting in', 'start'], ['put in', 'start'], ['swapping to a different B vitamin', 'start'],
+      ['taking out', 'stop'], ['cut out', 'stop'], ['leave out', 'stop'],
+      ['came down', 'decrease'], ['cut back', 'decrease'], ['went down', 'decrease'],
+      ['back down to one', 'decrease'], ['taper', 'decrease'],
+      ['went up', 'increase'], ['bumping', 'increase'],
+      ['stay on', 'continue'],
+    ] as const) {
+      const m = mapChange(said);
+      expect(m.value, said).toBe(want);
+      expect(m.unresolved, said).toBe(false);
     }
   });
 
@@ -198,9 +219,30 @@ describe('evidence verification', () => {
   });
 });
 
+describe('wording fidelity', () => {
+  const turn =
+    "PRACTITIONER: so the gallbladder is showing stress, and the stressor is showing to be food.";
+
+  it('scores a trimmed span of the practitioner\'s speech as theirs', () => {
+    expect(wordingFidelity('the gallbladder is showing stress', turn)).toBe(1);
+  });
+
+  it('scores chart-note prose low even though the turn genuinely backs it', () => {
+    // The failure this measures: every provenance signal reads green — real
+    // turn, quote copied out of it — and the sentence Nicole reads is the
+    // model's, in language the practitioner never used.
+    expect(wordingFidelity('cholestatic pattern noted on assessment', turn)).toBeLessThan(0.5);
+  });
+
+  it('does not punish a faithful item for dropping filler words', () => {
+    expect(wordingFidelity('gallbladder showing stress', turn)).toBe(1);
+  });
+});
+
 describe('provider JSON schema', () => {
   const schemas = [
     ['narrative', NARRATIVE_JSON_SCHEMA],
+    ['assessments', ASSESSMENTS_JSON_SCHEMA],
     ['protocol', PROTOCOL_JSON_SCHEMA],
     ['nrt', NRT_JSON_SCHEMA],
   ] as const;
@@ -240,6 +282,9 @@ describe('provider JSON schema', () => {
 
     expect(wireKeys(NARRATIVE_JSON_SCHEMA)).toEqual(
       Object.keys(NarrativeStageSchema.shape).sort(),
+    );
+    expect(wireKeys(ASSESSMENTS_JSON_SCHEMA)).toEqual(
+      Object.keys(AssessmentsStageSchema.shape).sort(),
     );
     expect(wireKeys(PROTOCOL_JSON_SCHEMA)).toEqual(
       Object.keys(ProtocolStageSchema.shape).sort(),
@@ -373,5 +418,35 @@ describe('span-based evidence', () => {
     expect(s.spans).toBe(1);
     expect(s.unverified).toBe(1);
     expect(s.byStatus.misattributed).toBe(1);
+  });
+});
+
+describe('stage subsetting', () => {
+  it('assigns every extracted field to exactly one stage', () => {
+    // Subsetting decides which fields are "absent because nobody looked" rather
+    // than "absent because nothing was said". A field missing from this map
+    // would be scored as a total recall failure whenever its stage is skipped,
+    // and the eval would report a measurement that never happened.
+    const owned = Object.values(STAGE_FIELDS).flat();
+    const fields = Object.keys(SessionNoteSchema.shape).filter(
+      (f) => f !== 'evidence' && f !== 'extraction',
+    );
+    for (const f of fields) {
+      expect(owned.filter((o) => o === f), `${f} must be owned by exactly one stage`).toHaveLength(1);
+    }
+    for (const o of owned) expect(fields, `${o} is not a note field`).toContain(o);
+  });
+
+  it('keeps "skipped" apart from "partial" on the note', () => {
+    // partial means a stage tried and failed, which makes every number derived
+    // from the note a floor. skipped means nobody asked it to run, which says
+    // nothing about quality. Merging them would report a deliberate two-stage
+    // measurement as a broken four-stage extraction.
+    const note = SessionNoteSchema.parse({
+      concerns: [],
+      extraction: { skipped: ['protocol', 'nrt'], partial: ['narrative'] },
+    });
+    expect(note.extraction?.skipped).toEqual(['protocol', 'nrt']);
+    expect(note.extraction?.partial).toEqual(['narrative']);
   });
 });

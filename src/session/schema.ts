@@ -187,15 +187,29 @@ function compile<T extends string>(synonyms: Record<string, T>): [RegExp, T][] {
 
 const CHANGE_VALUES = ['start', 'stop', 'increase', 'decrease', 'continue'] as const;
 export type SupplementChange = (typeof CHANGE_VALUES)[number];
+// The spoken vocabulary, not the written one. Nicole does not say "initiate"
+// and "titrate down" — she says "we're putting in Beta Plus", "the Equifem came
+// down to one", "keep that till they're gone". Every phrase below was said in a
+// real session and previously fell through to the `continue` placeholder, which
+// is the one failure this map exists to prevent: an unresolved START reads as
+// "already on it", and an unresolved DECREASE keeps the old dose on the plan.
 const CHANGE_SYNONYMS: Record<string, SupplementChange> = {
   add: 'start', added: 'start', adding: 'start', new: 'start', introduce: 'start', begin: 'start', started: 'start',
+  'putting in': 'start', 'put in': 'start', 'putting you on': 'start', 'starting': 'start',
+  // A swap is two actions on two products; the model emits it against whichever
+  // one it is describing. Only the "to X" side names an addition — a bare
+  // "swap" does not say which end this is, so it stays unresolved.
+  'swap to': 'start', 'swapping to': 'start', 'swapped to': 'start', 'switch to': 'start', 'switching to': 'start',
   stop: 'stop', remove: 'stop', 'take out': 'stop', 'taking out': 'stop', discontinue: 'stop',
-  hold: 'stop', off: 'stop', drop: 'stop', pause: 'stop',
+  hold: 'stop', off: 'stop', drop: 'stop', pause: 'stop', 'cut out': 'stop', 'leave out': 'stop',
   increase: 'increase', increased: 'increase', upping: 'increase', 'up the': 'increase', raise: 'increase',
   more: 'increase', higher: 'increase', double: 'increase', doubling: 'increase',
+  'went up': 'increase', 'bump': 'increase', 'bumping': 'increase', 'bumped': 'increase',
   decrease: 'decrease', decreased: 'decrease', lower: 'decrease', reduce: 'decrease', less: 'decrease',
+  'came down': 'decrease', 'coming down': 'decrease', 'went down': 'decrease', 'cut back': 'decrease',
+  'back down': 'decrease', 'down to': 'decrease', taper: 'decrease', tapering: 'decrease',
   keep: 'continue', keeping: 'continue', maintain: 'continue', refill: 'continue', same: 'continue',
-  unchanged: 'continue', 'as needed': 'continue',
+  unchanged: 'continue', 'as needed': 'continue', 'stay on': 'continue', 'staying on': 'continue',
 };
 const CHANGE_COMPILED = compile(CHANGE_SYNONYMS);
 
@@ -632,6 +646,16 @@ export const ExtractionMetaSchema = z.object({
   model: z.string().optional(),
   /** Stages that failed; their fields are absent, not empty. */
   partial: z.array(z.string()).optional(),
+  /**
+   * Stages that were never asked to run, because the caller only wanted some.
+   *
+   * Kept apart from `partial` on purpose. `partial` means a stage tried and
+   * failed, which makes every number derived from the note a floor rather than a
+   * measurement; a stage that was deliberately skipped says nothing about the
+   * extraction's quality. Folding the two together would make an eval run that
+   * deliberately measures two stages look like a broken extraction of four.
+   */
+  skipped: z.array(z.string()).optional(),
   /** Field paths where chunks disagreed — surfaced for Nicole to resolve. */
   conflicts: z.array(
     z.object({
@@ -658,6 +682,21 @@ export const ExtractionMetaSchema = z.object({
         from_turn: num().optional(),
         to_turn: num().optional(),
         stage: z.string().optional(),
+      }),
+    )
+    .optional(),
+  /**
+   * Findings that state a figure the transcript never states — the residual
+   * fabrication the quote check cannot see, because the citation can be a real
+   * turn about the right subject while the number in the finding was never
+   * spoken. Computed by verifyNumbers; flagged for review, never removed.
+   */
+  unstated_numbers: z
+    .array(
+      z.object({
+        path: z.string(),
+        value: z.string(),
+        numbers: z.array(z.number()).default([]),
       }),
     )
     .optional(),
@@ -697,9 +736,30 @@ export function evidenceMap(note: Pick<SessionNote, 'evidence'>): Map<string, Ev
 export const NarrativeStageSchema = z.object({
   concerns: z.array(z.string()).default([]),
   goals: z.array(z.string()).nullish().transform((v) => v ?? []),
-  assessments: z.array(z.string()).default([]),
   follow_ups: z.array(z.union([z.string(), FollowUpSchema])).default([]),
   lifestyle: LifestyleSchema.optional(),
+  evidence: EvidenceListSchema.optional(),
+});
+
+/**
+ * Assessments extract on their own, away from the rest of the narrative.
+ *
+ * They are the highest-count field in a session by a wide margin — a full
+ * appointment states twenty-odd, scattered from the first minute to the last —
+ * and they were sharing one call with concerns, goals, follow-ups and the
+ * lifestyle log. A model asked for five things at once spends its attention
+ * unevenly, and what it economises on is the long list: recall on assessments
+ * sat at 22% while every other field in the same call scored far higher.
+ *
+ * They are also the only narrative field that is LOCAL. A concern is mentioned
+ * once, in passing, and a window that does not contain it cannot know it exists —
+ * which is why the narrative pass reads the whole session. An assessment is a
+ * sentence the practitioner says in one breath, so it survives being read a
+ * window at a time, and windows are what stop the middle of a long session from
+ * being skimmed.
+ */
+export const AssessmentsStageSchema = z.object({
+  assessments: z.array(z.string()).default([]),
   evidence: EvidenceListSchema.optional(),
 });
 
@@ -750,9 +810,13 @@ const SupplementWire = z.object({
 const NarrativeWire = z.object({
   concerns: z.array(z.string()),
   goals: z.array(z.string()),
-  assessments: z.array(z.string()),
   follow_ups: z.array(z.object({ text: z.string(), due_in_days: num() })),
   lifestyle: LifestyleObject,
+  evidence: z.array(EvidenceWire),
+});
+
+const AssessmentsWire = z.object({
+  assessments: z.array(z.string()),
   evidence: z.array(EvidenceWire),
 });
 
@@ -771,6 +835,7 @@ const NrtWire = z.object({
 
 export const STAGE_WIRE = {
   narrative: NarrativeWire,
+  assessments: AssessmentsWire,
   protocol: ProtocolWire,
   nrt: NrtWire,
 } as const;
@@ -864,5 +929,6 @@ export function jsonSchemaFor(schema: z.ZodTypeAny): unknown {
 }
 
 export const NARRATIVE_JSON_SCHEMA = jsonSchemaFor(STAGE_WIRE.narrative);
+export const ASSESSMENTS_JSON_SCHEMA = jsonSchemaFor(STAGE_WIRE.assessments);
 export const PROTOCOL_JSON_SCHEMA = jsonSchemaFor(STAGE_WIRE.protocol);
 export const NRT_JSON_SCHEMA = jsonSchemaFor(STAGE_WIRE.nrt);

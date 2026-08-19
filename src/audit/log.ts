@@ -21,7 +21,10 @@ export type AuditEntity =
   | 'lead'
   | 'office_hours'
   | 'customer_map'
-  | 'outlook';
+  | 'outlook'
+  // Approving or rejecting an automated email is a decision about what a client
+  // receives, so it is kept for the same reason a checkout decision is.
+  | 'outbound_email';
 
 export type Actor = 'nicole' | 'system';
 

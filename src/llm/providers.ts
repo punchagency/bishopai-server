@@ -9,6 +9,8 @@ import {
   ProviderError,
   RateLimitError,
   RequestTooLargeError,
+  TransientServerError,
+  isQuotaExhausted,
   SchemaViolationError,
   TruncatedOutputError,
 } from './errors';
@@ -25,6 +27,16 @@ export interface StructuredRequest {
   jsonSchema: unknown;
   /** Override the configured output budget — the truncation retry raises it. */
   maxTokens?: number;
+  /**
+   * Override the reasoning budget for this call.
+   *
+   * Sized per STAGE, because the stages ask for different work. Filling a fixed
+   * grid of test readings is lookup; recalling every clinical statement in a
+   * session, in order, without inventing one is not, and the pass that does it
+   * is the pass whose recall was failing. Providers that do not expose a
+   * reasoning budget ignore this.
+   */
+  thinkingBudget?: number;
 }
 
 export interface StructuredResponse {
@@ -62,6 +74,14 @@ const TRUNCATION_REASONS = new Set(['max_tokens', 'MAX_TOKENS', 'length', 'model
 function isRateLimit(err: unknown): boolean {
   const status = (err as { status?: number })?.status;
   return status === 429 || status === 529;
+}
+
+/** A server-side blip: the provider is up, this request just did not land. */
+function isTransient(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  if (status === 500 || status === 502 || status === 503 || status === 504) return true;
+  const msg = String((err as { message?: string })?.message ?? '');
+  return /currently unavailable|experiencing high demand|overloaded|try again later/i.test(msg);
 }
 
 /**
@@ -129,8 +149,21 @@ async function anthropicExtract(req: StructuredRequest): Promise<StructuredRespo
     });
   } catch (err) {
     if (isTooLarge(err)) throw new RequestTooLargeError({ provider: 'anthropic', cause: err });
+    if (isTransient(err)) {
+      throw new TransientServerError({
+        provider: 'anthropic',
+        status: (err as { status?: number })?.status,
+        retryAfterMs: retryAfterMs(err),
+        cause: err,
+      });
+    }
     if (isRateLimit(err)) {
-      throw new RateLimitError({ provider: 'anthropic', retryAfterMs: retryAfterMs(err), cause: err });
+      throw new RateLimitError({
+        provider: 'anthropic',
+        retryAfterMs: retryAfterMs(err),
+        exhausted: isQuotaExhausted(err),
+        cause: err,
+      });
     }
     throw new ProviderError('anthropic request failed', { provider: 'anthropic', cause: err });
   }
@@ -172,13 +205,28 @@ async function googleExtract(req: StructuredRequest): Promise<StructuredResponse
         maxOutputTokens: req.maxTokens ?? llmConfig.maxTokens,
         // Cap the thinking rather than letting it consume the answer's budget.
         // See llmConfig.google.thinkingBudget.
-        thinkingConfig: { thinkingBudget: llmConfig.google.thinkingBudget },
+        thinkingConfig: {
+          thinkingBudget: req.thinkingBudget ?? llmConfig.google.thinkingBudget,
+        },
       },
     });
   } catch (err) {
     if (isTooLarge(err)) throw new RequestTooLargeError({ provider: 'google', cause: err });
+    if (isTransient(err)) {
+      throw new TransientServerError({
+        provider: 'google',
+        status: (err as { status?: number })?.status,
+        retryAfterMs: retryAfterMs(err),
+        cause: err,
+      });
+    }
     if (isRateLimit(err)) {
-      throw new RateLimitError({ provider: 'google', retryAfterMs: retryAfterMs(err), cause: err });
+      throw new RateLimitError({
+        provider: 'google',
+        retryAfterMs: retryAfterMs(err),
+        exhausted: isQuotaExhausted(err),
+        cause: err,
+      });
     }
     throw new ProviderError('gemini request failed', { provider: 'google', cause: err });
   }
@@ -290,8 +338,21 @@ async function openrouterExtract(req: StructuredRequest): Promise<StructuredResp
     // Give the classifiers below the shape they expect from an SDK error.
     const err = Object.assign(new Error(`${res.status} ${body}`), { status: res.status, headers: hdrs(res) });
     if (isTooLarge(err)) throw new RequestTooLargeError({ provider: 'openrouter', cause: err });
+    if (isTransient(err)) {
+      throw new TransientServerError({
+        provider: 'openrouter',
+        status: (err as { status?: number })?.status,
+        retryAfterMs: retryAfterMs(err),
+        cause: err,
+      });
+    }
     if (isRateLimit(err)) {
-      throw new RateLimitError({ provider: 'openrouter', retryAfterMs: retryAfterMs(err), cause: err });
+      throw new RateLimitError({
+        provider: 'openrouter',
+        retryAfterMs: retryAfterMs(err),
+        exhausted: isQuotaExhausted(err),
+        cause: err,
+      });
     }
     if (isJsonValidateFailed(err)) {
       throw new TruncatedOutputError({ provider: 'openrouter', raw: null, finishReason: 'json_validate_failed' });
@@ -365,8 +426,21 @@ async function groqExtract(req: StructuredRequest): Promise<StructuredResponse> 
     });
   } catch (err) {
     if (isTooLarge(err)) throw new RequestTooLargeError({ provider: 'groq', cause: err });
+    if (isTransient(err)) {
+      throw new TransientServerError({
+        provider: 'groq',
+        status: (err as { status?: number })?.status,
+        retryAfterMs: retryAfterMs(err),
+        cause: err,
+      });
+    }
     if (isRateLimit(err)) {
-      throw new RateLimitError({ provider: 'groq', retryAfterMs: retryAfterMs(err), cause: err });
+      throw new RateLimitError({
+        provider: 'groq',
+        retryAfterMs: retryAfterMs(err),
+        exhausted: isQuotaExhausted(err),
+        cause: err,
+      });
     }
     if (isJsonValidateFailed(err)) {
       throw new TruncatedOutputError({ provider: 'groq', raw: null, finishReason: 'json_validate_failed' });

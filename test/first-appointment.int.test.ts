@@ -21,6 +21,9 @@ const FRESH = 'fresh-ftest@example.test'; // ineligible: session was yesterday (
 suite('first-appointment conversion (integration)', () => {
   const emails = [ONE, TWO, REBOOKED, FRESH];
   const cleanup = async () => {
+    // Queued mail outlives its lead by design (history), so clear it too — a
+    // stale pending row dedupes against the next run and the step returns 'none'.
+    await pool.query(`DELETE FROM outbound_emails WHERE lower(to_email) = ANY($1)`, [emails]).catch(() => {});
     await pool.query(`DELETE FROM leads WHERE lower(email) = ANY($1)`, [emails]).catch(() => {});
     await pool.query(`DELETE FROM appointments WHERE pb_id LIKE 'ftest-%'`).catch(() => {});
     await pool.query(`DELETE FROM clients WHERE pb_id LIKE 'ftest-%'`).catch(() => {});
@@ -75,18 +78,28 @@ suite('first-appointment conversion (integration)', () => {
     expect(byEmail.has(REBOOKED)).toBe(false);
     expect(byEmail.has(FRESH)).toBe(false);
 
-    // The cadence sends the 7-day nudge at day 8, then the 14-day incentive.
+    // The cadence QUEUES the 7-day nudge at day 8, then the 14-day one — held
+    // for approval rather than sent, like every automated client email.
     const lead = await pool.query<{ id: string }>(`SELECT id FROM leads WHERE lower(email) = lower($1)`, [ONE]);
     const leadId = lead.rows[0].id;
-    expect(await runReengagementForLead(leadId, new Date(Date.now() + 8 * 86_400_000))).toBe('sent');
-    expect(await runReengagementForLead(leadId, new Date(Date.now() + 15 * 86_400_000))).toBe('sent');
-    const sent = await pool.query<{ sequence_state: { sent?: string[] }; status: string }>(
-      `SELECT sequence_state, status FROM leads WHERE id = $1`,
-      [leadId],
-    );
-    expect(sent.rows[0].sequence_state.sent).toEqual(
+    expect(await runReengagementForLead(leadId, new Date(Date.now() + 8 * 86_400_000))).toBe('queued');
+    expect(await runReengagementForLead(leadId, new Date(Date.now() + 15 * 86_400_000))).toBe('queued');
+    const sent = await pool.query<{
+      sequence_state: { sent?: string[]; queued?: string[] };
+      status: string;
+    }>(`SELECT sequence_state, status FROM leads WHERE id = $1`, [leadId]);
+    expect(sent.rows[0].sequence_state.queued).toEqual(
       expect.arrayContaining(['first_appt_7d', 'first_appt_14d']),
     );
+    // Both wait in the normal list under "haven't rebooked".
+    const held = await pool.query<{ list: string; category: string }>(
+      `SELECT list, category FROM outbound_emails WHERE lead_id = $1`,
+      [leadId],
+    );
+    expect(held.rows).toHaveLength(2);
+    for (const row of held.rows) {
+      expect(row).toMatchObject({ list: 'normal', category: 'appointment_lapse' });
+    }
     expect(sent.rows[0].status).toBe('first_appointment'); // stays on track
 
     // Idempotent: re-running enrolls nobody new.
