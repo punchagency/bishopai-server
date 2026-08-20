@@ -22,6 +22,13 @@
  *   npm run eval:extract -- --replay     # re-score the kept extractions, no API calls
  *   npm run eval:extract -- --runs 3     # three extractions per fixture, with the spread
  *   npm run eval:extract -- --stages narrative,assessments
+ *   npm run eval:extract -- --ungraded  # include fixtures that have no gold set
+ *
+ * --ungraded adds the transcripts with no `.expected.json`. They cannot score
+ * recall, but `unstated numbers`, `coverage` and `wording` are all measured
+ * against the transcript and the model's own citations, so a session we have
+ * never written gold for is still worth running — and one of them is where the
+ * "172 lbs" fabrication was found.
  *
  * --stages runs only the stages a change touches, which halves the cost of a
  * measurement. On a free tier metered per day that is not thrift: an A/B at
@@ -152,6 +159,23 @@ interface FixtureReport {
   fixture: string;
   ok: boolean;
   error?: string;
+  /**
+   * This fixture has no gold set, so only the transcript-only metrics mean
+   * anything for it.
+   *
+   * Every gold-scored number needs a hand-built `.expected.json`, and building
+   * one is hours of reading — which is why the transcript that produced the
+   * "172 lbs" fabrication had no fixture and was therefore never measured
+   * again after the fix. But `unstated numbers`, `coverage`, `wording` and
+   * `provenance` are all scored against the transcript and the model's own
+   * citations. They need no gold at all, and withholding them from a session
+   * we already have on disk buys nothing.
+   *
+   * The gold-scored sections are not merely empty for these — they are not
+   * computed, because an empty gold list makes every extracted supplement
+   * "spurious" and would print a clean run as a page of inventions.
+   */
+  goldless: boolean;
   lists: Record<string, Score>;
   supplements: {
     matched: number;
@@ -497,10 +521,17 @@ async function extractAll(name: string, gold: Gold, runs: number): Promise<Sessi
   return notes;
 }
 
-function scoreNote(name: string, note: SessionNote, gold: Gold, transcript: string): FixtureReport {
+function scoreNote(
+  name: string,
+  note: SessionNote,
+  gold: Gold,
+  transcript: string,
+  goldless = false,
+): FixtureReport {
   const empty: FixtureReport = {
     fixture: name,
     ok: false,
+    goldless,
     lists: {},
     supplements: { matched: 0, expected: 0, extra: 0, wrongChange: [], missing: [] },
     stressors: { matched: 0, expected: 0, extra: 0, missingSource: [], inventedSource: [], missing: [] },
@@ -524,7 +555,10 @@ function scoreNote(name: string, note: SessionNote, gold: Gold, transcript: stri
   // would report a deliberate two-stage measurement as a catastrophic failure of
   // the other two.
   const off = new Set(skipped.flatMap((st) => STAGE_FIELDS[st as StageName] ?? []));
-  const scored = (field: string): boolean => !off.has(field);
+  // A gold-less fixture is scored on the transcript alone. `scored` still
+  // gates on which stages ran, so a stage the caller skipped stays unscored
+  // for the same reason it would with gold.
+  const scored = (field: string): boolean => !goldless && !off.has(field);
   const unstated = findUnstatedNumbers(note, transcript);
   const lists: Record<string, Score> = {};
   if (gold.concerns && scored('concerns')) {
@@ -542,6 +576,7 @@ function scoreNote(name: string, note: SessionNote, gold: Gold, transcript: stri
   return {
     fixture: name,
     ok: true,
+    goldless,
     lists,
     supplements: scored('supplements')
       ? scoreSupplements(note, gold)
@@ -591,6 +626,12 @@ function print(reports: FixtureReport[]): void {
           '      session was quiet. Every number below is a floor, not a score.',
       );
     }
+    if (r.goldless) {
+      console.log(
+        '   (no gold set — recall, slots and fabrication are not scored here.\n' +
+          '    What follows is checked against the transcript itself.)',
+      );
+    }
     for (const [field, s] of Object.entries(r.lists)) {
       console.log(
         `   ${field.padEnd(16)} recall ${pct(s.matched, s.expected)}` +
@@ -600,12 +641,14 @@ function print(reports: FixtureReport[]): void {
       for (const x of s.spurious) console.log(`       invented: ${x.slice(0, 90)}`);
     }
     const sup = r.supplements;
-    console.log(
-      `   ${'supplements'.padEnd(16)} recall ${pct(sup.matched, sup.expected)}` +
-        `  (${sup.matched}/${sup.expected})   spurious ${sup.extra}`,
-    );
-    for (const m of sup.missing) console.log(`       missed:   ${m}`);
-    for (const w of sup.wrongChange) console.log(`       WRONG ACTION: ${w}`);
+    if (!r.goldless) {
+      console.log(
+        `   ${'supplements'.padEnd(16)} recall ${pct(sup.matched, sup.expected)}` +
+          `  (${sup.matched}/${sup.expected})   spurious ${sup.extra}`,
+      );
+      for (const m of sup.missing) console.log(`       missed:   ${m}`);
+      for (const w of sup.wrongChange) console.log(`       WRONG ACTION: ${w}`);
+    }
 
     const st = r.stressors;
     if (st.expected || st.extra) {
@@ -619,18 +662,20 @@ function print(reports: FixtureReport[]): void {
       for (const m of st.inventedSource) console.log(`       FABRICATED: ${m}`);
     }
 
-    console.log(
-      `   ${'nrt/lifestyle'.padEnd(16)} slots  ${pct(r.slots.correct, r.slots.expected)}` +
-        `  (${r.slots.correct}/${r.slots.expected})`,
-    );
-    for (const w of r.slots.wrong) console.log(`       ${w.slice(0, 110)}`);
+    if (!r.goldless) {
+      console.log(
+        `   ${'nrt/lifestyle'.padEnd(16)} slots  ${pct(r.slots.correct, r.slots.expected)}` +
+          `  (${r.slots.correct}/${r.slots.expected})`,
+      );
+      for (const w of r.slots.wrong) console.log(`       ${w.slice(0, 110)}`);
 
-    const f = r.fabrication;
-    console.log(
-      `   ${'FABRICATION'.padEnd(16)}        ${pct(f.filled, f.total)}` +
-        `  (${f.filled}/${f.total} never-stated fields filled)`,
-    );
-    for (const field of f.fields) console.log(`       FABRICATED: ${field}`);
+      const f = r.fabrication;
+      console.log(
+        `   ${'FABRICATION'.padEnd(16)}        ${pct(f.filled, f.total)}` +
+          `  (${f.filled}/${f.total} never-stated fields filled)`,
+      );
+      for (const field of f.fields) console.log(`       FABRICATED: ${field}`);
+    }
 
     const u = r.unstated;
     console.log(
@@ -763,6 +808,17 @@ function printSpread(byFixture: FixtureReport[][]): void {
         `   ${''.padEnd(34)} (${lost} of ${runsForFixture.length} runs excluded: stage never ran)`,
       );
     }
+    // A gold-less fixture has no recall to spread. Printing one anyway would
+    // read as "0% (0–0%)" — a total failure — for a fixture that was never
+    // asked the question.
+    if (runsForFixture[0].goldless) {
+      const uns = usable.map((r) => r.unstated.fields);
+      console.log(
+        `   ${runsForFixture[0].fixture.padEnd(34)}` +
+          ` no gold — unstated numbers ${Math.min(...uns)}–${Math.max(...uns)}`,
+      );
+      continue;
+    }
     const recalls = usable.map(recallOf);
     const fabs = usable.map((r) => r.fabrication.filled);
     console.log(
@@ -779,7 +835,7 @@ function printSpread(byFixture: FixtureReport[][]): void {
   for (let i = 0; i < runCount; i++) {
     const runReports = byFixture
       .map((r) => r[i])
-      .filter((r): r is FixtureReport => !!r && r.ok && !r.degraded.length);
+      .filter((r): r is FixtureReport => !!r && r.ok && !r.degraded.length && !r.goldless);
     if (!runReports.length) continue;
     const m = runReports.reduce(
       (n, r) =>
@@ -823,6 +879,16 @@ const replay = args.includes('--replay');
  * `--runs 3` is the smallest number that shows a spread at all.
  */
 const runs = args.includes('--runs') ? Math.max(1, Number(args[args.indexOf('--runs') + 1])) : 1;
+/**
+ * Include the fixtures that have no gold set.
+ *
+ * Off by default because every fixture is metered provider quota and these
+ * cannot move the headline recall number — but on, they are the only way to
+ * measure a session we have never built gold for, which includes the one the
+ * "172 lbs" fabrication came from. Naming a gold-less fixture with --fixture
+ * implies this: asking for it by name is unambiguous.
+ */
+const ungraded = args.includes('--ungraded');
 /** Only these stages, halving the cost of measuring a change that touches two. */
 const stages: StageName[] | undefined = args.includes('--stages')
   ? (args[args.indexOf('--stages') + 1].split(',').map((x) => x.trim()) as StageName[])
@@ -831,14 +897,27 @@ const stages: StageName[] | undefined = args.includes('--stages')
 // and is what makes the next scoring change free to measure.
 const save = args.includes('--save') || !replay;
 
-const names = readdirSync(FIXTURE_DIR)
-  .filter((f) => f.endsWith('.expected.json'))
-  .map((f) => basename(f, '.expected.json'))
+const files = readdirSync(FIXTURE_DIR);
+const hasGold = (n: string): boolean => files.includes(`${n}.expected.json`);
+
+// Discovery keys off the TRANSCRIPT, not the gold file. It used to key off gold,
+// which silently made a transcript with no `.expected.json` invisible to the
+// harness — so the session that produced the "172 lbs" fabrication could not be
+// re-measured after the check that catches it was written.
+const names = files
+  .filter((f) => f.endsWith('.txt'))
+  .map((f) => basename(f, '.txt'))
   .filter((n) => !only || n === only)
+  // Asking for one by name is explicit enough; a full run needs --ungraded.
+  .filter((n) => hasGold(n) || ungraded || n === only)
   .sort();
 
 if (names.length === 0) {
-  console.error(`No fixtures found in ${FIXTURE_DIR}${only ? ` matching "${only}"` : ''}`);
+  const ungold = files.filter((f) => f.endsWith('.txt')).length;
+  console.error(
+    `No fixtures found in ${FIXTURE_DIR}${only ? ` matching "${only}"` : ''}` +
+      (ungold && !only ? ' — none have gold; pass --ungraded to score the transcript-only metrics' : ''),
+  );
   process.exit(1);
 }
 
@@ -852,16 +931,20 @@ const keepAlive = setInterval(() => {}, 1000);
 /** All runs, grouped by fixture — one entry per fixture, N reports inside. */
 const byFixture: FixtureReport[][] = [];
 for (const name of names) {
-  const gold: Gold = JSON.parse(readFileSync(join(FIXTURE_DIR, `${name}.expected.json`), 'utf8'));
+  const goldless = !hasGold(name);
+  const gold: Gold = goldless
+    ? {}
+    : JSON.parse(readFileSync(join(FIXTURE_DIR, `${name}.expected.json`), 'utf8'));
   const transcript = readFileSync(join(FIXTURE_DIR, `${name}.txt`), 'utf8');
   try {
     const notes = await extractAll(name, gold, runs);
-    byFixture.push(notes.map((n) => scoreNote(name, n, gold, transcript)));
+    byFixture.push(notes.map((n) => scoreNote(name, n, gold, transcript, goldless)));
   } catch (err) {
     byFixture.push([
       {
         fixture: name,
         ok: false,
+        goldless,
         error: err instanceof Error ? err.message : String(err),
         lists: {},
         supplements: { matched: 0, expected: 0, extra: 0, wrongChange: [], missing: [] },

@@ -32,6 +32,37 @@ describe('gold matching', () => {
     expect(matches(got, 'the thyroid is crashing')).toBe(true);
   });
 
+  it('finds a short gold phrase inside an item that kept its stated cause', () => {
+    // Real pair from the pocket fixture. The item carries the practitioner's
+    // cause clause — which the assessments prompt requires — and at 15 tokens
+    // against a 2-token gold phrase it blew the ratio guard and was reported as
+    // a missed finding, understating assessment recall by a ninth.
+    const got =
+      'a lot of those sugar cravings, those bread cravings too, could be coming from some parasitic activity';
+    expect(matches(got, 'parasitic activity')).toBe(true);
+  });
+
+  it('does not let one item claim a finding it never made', () => {
+    // The same item, against a DIFFERENT finding the practitioner stated in the
+    // same turn. It mentions sugar cravings; it does not say blood sugar is
+    // dysregulated, and that statement really was missed. Widening the guard
+    // must not turn a real miss into a hit.
+    const got =
+      'a lot of those sugar cravings, those bread cravings too, could be coming from some parasitic activity';
+    expect(matches(got, 'blood sugar dysregulation')).toBe(false);
+  });
+
+  it('still rejects a paragraph that merely contains the gold words', () => {
+    const paragraph =
+      'so working your blood sugar, pancreas, probably because that area is already stressed, ' +
+      'so it is not like it is actually sitting here, but it is mostly sitting in your brain, ' +
+      'which is where it loves to hide, and a lot of the reasons that antibiotics do not work ' +
+      'long term is because the antibiotics go into your blood and Lyme, which is also a lot of ' +
+      'times why testing is hard, because the Lyme does not stay in your blood, it goes into ' +
+      'joints and membranes and fleshy areas';
+    expect(matches(paragraph, 'parasitic activity')).toBe(false);
+  });
+
   it('counts one finding written two ways as one finding', () => {
     // Real pairs from the pocket fixture, each of which scored as a miss AND a
     // fabrication — punishing a correct extraction twice for choosing the other

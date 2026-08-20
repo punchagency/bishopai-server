@@ -191,6 +191,18 @@ function getGoogle(): GoogleGenAI {
   return google;
 }
 
+function extractGoogleRetryAfterMs(err: unknown): number | null {
+  const std = retryAfterMs(err);
+  if (std !== null) return std;
+  const msg = String((err as { message?: string })?.message ?? '');
+  const m = msg.match(/retry in ([0-9.]+)s/i);
+  if (m) {
+    const secs = Number.parseFloat(m[1]);
+    if (Number.isFinite(secs)) return Math.ceil(secs * 1000);
+  }
+  return null;
+}
+
 async function googleExtract(req: StructuredRequest): Promise<StructuredResponse> {
   let res;
   try {
@@ -221,9 +233,10 @@ async function googleExtract(req: StructuredRequest): Promise<StructuredResponse
       });
     }
     if (isRateLimit(err)) {
+      const waitMs = extractGoogleRetryAfterMs(err);
       throw new RateLimitError({
         provider: 'google',
-        retryAfterMs: retryAfterMs(err),
+        retryAfterMs: waitMs,
         exhausted: isQuotaExhausted(err),
         cause: err,
       });

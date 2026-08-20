@@ -107,7 +107,10 @@ export class RateLimitError extends ProviderError {
  */
 export function isQuotaExhausted(err: unknown): boolean {
   const msg = String((err as { message?: string })?.message ?? '');
-  return /per[-_ ]?day|daily (?:limit|quota)|insufficient_quota|billing details/i.test(msg);
+  if (/generate_content_free_tier_requests|limit: \d+|retry (?:in|after)|RetryInfo/i.test(msg)) {
+    return false;
+  }
+  return /per[-_ ]?day|daily (?:limit|quota)|insufficient_quota/i.test(msg);
 }
 
 /**

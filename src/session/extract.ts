@@ -141,20 +141,30 @@ const STAGES: Stage[] = [
     jsonSchema: ASSESSMENTS_JSON_SCHEMA,
     parse: (raw) => AssessmentsStageSchema.parse(raw),
     chunked: true,
-    // OFF by default, and the reason is a measurement rather than a preference.
+    // ON by default. The earlier A/B read "no effect at 56% either way" and
+    // turned this off; both sides of it were scored by a matcher that reported
+    // a caught finding as missed whenever the item kept the cause clause this
+    // prompt orders it to keep (see MAX_ITEM_TOKENS in evalMatch.ts). Re-run
+    // against the corrected matcher on the fixture long enough to engage
+    // windows at all — 6,960 tokens, four windows:
     //
-    // The theory is sound — a model reading 7,000 tokens for the twentieth
-    // finding skims the middle — and the A/B did not support it: with windows
-    // and without, on the same model and the same session, assessments recall
-    // came back at exactly 56%. What moved between those runs moved on the
-    // fixture short enough that windowing never engaged, which makes it
-    // run-to-run variance and not this.
+    //   windows off   67% recall (6/9),  6 findings, 1.00 per turn read
+    //   windows on    78% recall (7/9), 10 findings, 1.67 per turn read
     //
-    // At n=1 per fixture that is not proof of no effect; it is a refusal to
-    // charge three extra calls per long session for an effect nobody has seen.
-    // The mechanism stays, behind a switch, so the question can be settled
-    // properly once repeated runs are affordable.
-    alwaysWindow: process.env.EXTRACTION_WINDOW_ASSESSMENTS === 'true',
+    // The per-turn number is the mechanism, not the recall. Reading the whole
+    // session at once, the model emitted exactly ONE finding per turn it
+    // cited and moved on — including from turns that state three. It is not
+    // skimming the middle of the transcript, it is satisfying itself with one
+    // finding per place it looks, and a smaller window is what makes it look
+    // again. Nothing invented either way: the three items gold does not list
+    // are all verbatim practitioner statements, and wording fidelity held at
+    // 100%.
+    //
+    // The cost is real — four calls where there was one, on long sessions
+    // only, since a session under the window size still runs as one. Set
+    // EXTRACTION_WINDOW_ASSESSMENTS=false to buy the calls back at the
+    // measured cost of about eleven points of recall. Still n=1 per arm.
+    alwaysWindow: process.env.EXTRACTION_WINDOW_ASSESSMENTS !== 'false',
     // One field, but the longest list in the note: every clinical statement in
     // the window, each with its quote.
     maxTokens: Number(process.env.LLM_MAX_TOKENS_ASSESSMENTS ?? 4000),

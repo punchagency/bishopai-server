@@ -83,11 +83,33 @@ export function similarity(a: string, b: string): number {
  */
 const MAX_LENGTH_RATIO = 4;
 
+/**
+ * A finding-sized item, regardless of how short the gold phrase is.
+ *
+ * The ratio alone is unusable when the gold item is two or three words. Gold
+ * "parasitic activity" allows 8 tokens, so the extraction
+ *
+ *   "a lot of those sugar cravings, those bread cravings too, could be coming
+ *    from some parasitic activity"
+ *
+ * — which contains the gold phrase verbatim — was scored as a MISS at 15
+ * tokens. Worse, the extra length is the cause clause the assessments prompt
+ * explicitly orders the model to keep ("KEEP THE ATTRIBUTION"): the harness was
+ * marking down the exact behaviour the prompt asks for, on the field whose
+ * recall it is the harness's job to measure.
+ *
+ * So the allowance is the LARGER of the ratio and one sentence. A paragraph
+ * that merely happens to contain the gold words is still rejected — which is
+ * what the guard is for — but a single finding carrying its own attribution is
+ * not.
+ */
+const MAX_ITEM_TOKENS = 20;
+
 export function coverage(got: string, want: string): number {
   const tg = tokens(got);
   const tw = tokens(want);
   if (!tg.size || !tw.size) return 0;
-  if (tg.size > tw.size * MAX_LENGTH_RATIO) return 0;
+  if (tg.size > Math.max(tw.size * MAX_LENGTH_RATIO, MAX_ITEM_TOKENS)) return 0;
   return shared(tw, tg) / tw.size;
 }
 

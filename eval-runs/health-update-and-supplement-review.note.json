@@ -1,0 +1,704 @@
+{
+  "saved_at": "2026-08-20T08:12:12.663Z",
+  "notes": [
+    {
+      "concerns": [
+        "Hormonal migraine with visual floaters and half-vision aura",
+        "Nausea and loss of appetite",
+        "Frequent urination with low urine output",
+        "Lower abdominal bloating and cramping",
+        "Long menstrual periods lasting 7 to 8 days",
+        "Difficulty getting up and slow energy in the morning",
+        "Difficulty working out in the morning due to lack of energy and strength"
+      ],
+      "goals": [],
+      "assessments": [
+        "fungus is showing up for the small intestines",
+        "looking really like hormonally good",
+        "Looks like you thinned out a little bit too."
+      ],
+      "protocol_changes": [
+        {
+          "description": "Start Pro Symbiotic",
+          "type": "add",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Decrease GI Adsorb to one until gone",
+          "type": "adjust",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Discontinue Smart Metallic Burn",
+          "type": "remove",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Discontinue Sam E",
+          "type": "remove",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Discontinue Spanish Black Radish",
+          "type": "remove",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Discontinue Parotid",
+          "type": "remove",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Continue Iodine two drops until gone",
+          "type": "continue",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Continue NAC until gone",
+          "type": "continue",
+          "type_raw": null,
+          "type_unresolved": false
+        },
+        {
+          "description": "Continue MG Zyme",
+          "type": "continue",
+          "type_raw": null,
+          "type_unresolved": false
+        }
+      ],
+      "supplements": [
+        {
+          "name": "Pro Symbiotic",
+          "dose": null,
+          "quantity": null,
+          "change": "start",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": null,
+          "unit": null,
+          "doses_per_day": null
+        },
+        {
+          "name": "GI Adsorb",
+          "dose": "one until gone",
+          "quantity": null,
+          "change": "decrease",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": 1,
+          "unit": null,
+          "doses_per_day": null
+        },
+        {
+          "name": "Smart Metallic Burn",
+          "dose": null,
+          "quantity": null,
+          "change": "stop",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": null,
+          "unit": null,
+          "doses_per_day": null
+        },
+        {
+          "name": "Sam E",
+          "dose": null,
+          "quantity": null,
+          "change": "stop",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": null,
+          "unit": null,
+          "doses_per_day": null
+        },
+        {
+          "name": "Spanish Black Radish",
+          "dose": null,
+          "quantity": null,
+          "change": "stop",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": null,
+          "unit": null,
+          "doses_per_day": null
+        },
+        {
+          "name": "Parotid",
+          "dose": null,
+          "quantity": null,
+          "change": "stop",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": null,
+          "unit": null,
+          "doses_per_day": null
+        },
+        {
+          "name": "Iodine",
+          "dose": "two drops",
+          "quantity": null,
+          "change": "continue",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": 2,
+          "unit": "drops",
+          "doses_per_day": null
+        },
+        {
+          "name": "NAC",
+          "dose": null,
+          "quantity": null,
+          "change": "continue",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": null,
+          "unit": null,
+          "doses_per_day": null
+        },
+        {
+          "name": "MG Zyme",
+          "dose": null,
+          "quantity": null,
+          "change": "continue",
+          "change_raw": null,
+          "change_unresolved": false,
+          "schedule": {
+            "uponWaking": null,
+            "breakfast": null,
+            "midMorning": null,
+            "lunch": null,
+            "midAfternoon": null,
+            "dinner": null,
+            "beforeBed": null
+          },
+          "obtained_from": null,
+          "func": null,
+          "units_per_dose": null,
+          "unit": null,
+          "doses_per_day": null
+        }
+      ],
+      "follow_ups": [
+        {
+          "text": "Let practitioner know if you crash",
+          "due_in_days": null
+        },
+        {
+          "text": "Assess B12 supply at home",
+          "due_in_days": null
+        },
+        {
+          "text": "Bring B12 back in 30 days if you realize you have it at home",
+          "due_in_days": 30
+        },
+        {
+          "text": "Come in sooner if you are not feeling good",
+          "due_in_days": null
+        }
+      ],
+      "nrt": {
+        "pulse0": null,
+        "priority1": null,
+        "k27": null,
+        "stressors": [
+          {
+            "category": "immune",
+            "category_raw": null,
+            "category_unresolved": false,
+            "source": "fungus",
+            "body_area": "small intestines",
+            "detail": null
+          }
+        ],
+        "foundation": {
+          "laying1": null,
+          "standing": null,
+          "hta": null,
+          "hta_post_run": null,
+          "laying2": null,
+          "art_open": null,
+          "art_switch": null,
+          "art_cns": null,
+          "art_dental": null,
+          "art_hormonal": null,
+          "additional": null
+        },
+        "body_scan": {
+          "art_ectoderm": null,
+          "art_priority": null,
+          "art_matrix": null,
+          "art_cell": null,
+          "additional_art": null,
+          "scan_priority": null,
+          "scan_matrix": null,
+          "scan_cell": null,
+          "additional_nrt": null
+        }
+      },
+      "lifestyle": {
+        "bm": "not every day, soft",
+        "sleep": "Good",
+        "water": null,
+        "cycle": "7-8 days",
+        "exercise": "afternoons during naps",
+        "diet": null
+      },
+      "evidence": [
+        {
+          "path": "concerns.0",
+          "quote": "I got like that hormonal migraine that I got growing up, where like I could only see half of things",
+          "at_seconds": 22,
+          "turn": 6,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Yep, and I got like that hormonal migraine that I got growing up, where like I could only see half of things, like the floater, and then the migraine came like 30 minutes after that. But I got my period on Sunday, and then I I didn't get it, so I don't know if it was just like a one-off situation."
+        },
+        {
+          "path": "concerns.1",
+          "quote": "I was like to the point where I was like, I don't even feel like eating because I just feel sick.",
+          "at_seconds": 115,
+          "turn": 26,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Yeah. I was like to the point where I was like, I don't even feel like eating because I just feel sick."
+        },
+        {
+          "path": "concerns.2",
+          "quote": "And then sometimes with my bladder, I probably had to go pee all the time,",
+          "at_seconds": 116,
+          "turn": 28,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "And then sometimes with my bladder, I probably had to go pee all the time,"
+        },
+        {
+          "path": "concerns.3",
+          "quote": "I was having like bloating cramping here.",
+          "at_seconds": 133,
+          "turn": 34,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Yeah. I was having like bloating cramping here."
+        },
+        {
+          "path": "concerns.4",
+          "quote": "I have really long periods, like 778,",
+          "at_seconds": 165,
+          "turn": 42,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "pretty normal. I have really long periods, like 778,"
+        },
+        {
+          "path": "concerns.5",
+          "quote": "I have a hard time like getting up, going, like getting started.",
+          "at_seconds": 203,
+          "turn": 56,
+          "unverified": true,
+          "verification": "misattributed",
+          "turn_text": "little bit better. My mornings is like flipped. I don't have an afternoon crash. I have a hard time like"
+        },
+        {
+          "path": "concerns.6",
+          "quote": "Also found that I have a really hard time working out in the mornings.",
+          "at_seconds": 220,
+          "turn": 61,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Also found that I have a really hard time working out in the mornings."
+        },
+        {
+          "path": "follow_ups.0",
+          "quote": "So if you crash, let me know.",
+          "at_seconds": 727,
+          "turn": 141,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "All right, fungus is showing up for the small intestines, so we'll just try to get like maybe some pre or probiotics in, help balance out the yeast of the gut a little bit. Okay. But looking really like hormonally good. So if you crash, let me know. Like things are, you feel. You're feeling good, and things are looking really good. So that's great. And so it's been like"
+        },
+        {
+          "path": "follow_ups.1",
+          "quote": "Get home, assess how much B12 you have",
+          "at_seconds": 1155,
+          "turn": 179,
+          "unverified": false,
+          "verification": "exact",
+          "turn_text": "Okay. So then we'll hold on the B12 for now. Okay. We'll just refill the GI Adsorb and the prosynbiotic. Yeah. Get home, assess how much B12 you have, because then when you're with them, you can pick it up for yourself. Okay. Because for you, I'm going to push you out like a couple months.",
+          "turn_cited": 177
+        },
+        {
+          "path": "follow_ups.2",
+          "quote": "If you get home and you realize you have it, you can bring this one back in 30 days.",
+          "at_seconds": 1155,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "follow_ups.3",
+          "quote": "if you are not feeling good, come in sooner.",
+          "at_seconds": 1287,
+          "turn": 181,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Yeah, you're looking really good. So as long as you continue staying feeling good, if you are not feeling good, come in sooner."
+        },
+        {
+          "path": "lifestyle.bm",
+          "quote": "Not like every day. Okay. And it's not. It's not. It's like soft.",
+          "at_seconds": 143,
+          "turn": 36,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Not like every day. Okay. And it's not. It's not. It's like soft. Yeah. How's your sleep? Good. Yeah."
+        },
+        {
+          "path": "lifestyle.sleep",
+          "quote": "How's your sleep? Good.",
+          "at_seconds": 143,
+          "turn": 36,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Not like every day. Okay. And it's not. It's not. It's like soft. Yeah. How's your sleep? Good. Yeah."
+        },
+        {
+          "path": "lifestyle.cycle",
+          "quote": "I have really long periods, like 778,",
+          "at_seconds": 165,
+          "turn": 42,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "pretty normal. I have really long periods, like 778,"
+        },
+        {
+          "path": "lifestyle.exercise",
+          "quote": "I started working out during their naps in the afternoon",
+          "at_seconds": 229,
+          "turn": 65,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "No, I've kind of noticed it, but I've really noticed it this summer because I started working out during their naps in the afternoon, and I'm like, wow, I have a lot more"
+        },
+        {
+          "path": "assessments.0",
+          "quote": "fungus is showing up for the small intestines",
+          "at_seconds": 727,
+          "turn": 141,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "All right, fungus is showing up for the small intestines, so we'll just try to get like maybe some pre or probiotics in, help balance out the yeast of the gut a little bit. Okay. But looking really like hormonally good. So if you crash, let me know. Like things are, you feel. You're feeling good, and things are looking really good. So that's great. And so it's been like"
+        },
+        {
+          "path": "assessments.1",
+          "quote": "looking really like hormonally good",
+          "at_seconds": 727,
+          "turn": 141,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "All right, fungus is showing up for the small intestines, so we'll just try to get like maybe some pre or probiotics in, help balance out the yeast of the gut a little bit. Okay. But looking really like hormonally good. So if you crash, let me know. Like things are, you feel. You're feeling good, and things are looking really good. So that's great. And so it's been like"
+        },
+        {
+          "path": "assessments.2",
+          "quote": "Looks like you thinned out a little bit too.",
+          "at_seconds": 526,
+          "turn": 99,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Looks like you thinned out a little bit too. Do you feel"
+        },
+        {
+          "path": "supplements.0",
+          "quote": "and then we are just putting in something called pro symbiotic.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "supplements.1",
+          "quote": "Now one until gone.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "supplements.2",
+          "quote": "Smart my little ball comes out.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "supplements.3",
+          "quote": "The Sam E should be done with.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "supplements.4",
+          "quote": "The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "supplements.5",
+          "quote": "And the parrot end comes out.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "supplements.6",
+          "quote": "two drops of the I done so it's gone",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "supplements.7",
+          "quote": "Keep the neck just so it's gone.",
+          "at_seconds": 1056,
+          "turn": 170,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Keep the neck just so it's gone. Okay. Brothers on hold. Keep one hole. Like digital ads work. One little bomb. Sorry, Bob. Probably close to done. Is do you have any? No. Okay. So that's why I'm taking out. The team might we can also take out. You always like the item with your pinning. Yeah. If it comes back, let me know. Okay. But we'll put it on hold for now. Okay. If you decide that you can only get it too, just second to the two. Okay. Keep the energy sign in. Jonathan's gonna stay on hold. You can always use that for additional energy. Okay. You're not anything. So the neck will do to the bottom spine. I'm gonna get you another GI absorb, but does seem like that's moving things. Yeah. And I think like whatever we're detoxing from residual liver stuff will do that. Do you have like a lot of it, Nicole? No, I'm almost out. Okay, so what we call that?"
+        },
+        {
+          "path": "supplements.8",
+          "quote": "Keep the energy sign in.",
+          "at_seconds": 1056,
+          "turn": 170,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Keep the neck just so it's gone. Okay. Brothers on hold. Keep one hole. Like digital ads work. One little bomb. Sorry, Bob. Probably close to done. Is do you have any? No. Okay. So that's why I'm taking out. The team might we can also take out. You always like the item with your pinning. Yeah. If it comes back, let me know. Okay. But we'll put it on hold for now. Okay. If you decide that you can only get it too, just second to the two. Okay. Keep the energy sign in. Jonathan's gonna stay on hold. You can always use that for additional energy. Okay. You're not anything. So the neck will do to the bottom spine. I'm gonna get you another GI absorb, but does seem like that's moving things. Yeah. And I think like whatever we're detoxing from residual liver stuff will do that. Do you have like a lot of it, Nicole? No, I'm almost out. Okay, so what we call that?"
+        },
+        {
+          "path": "protocol_changes.0",
+          "quote": "and then we are just putting in something called pro symbiotic.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "protocol_changes.1",
+          "quote": "Now one until gone.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "protocol_changes.2",
+          "quote": "Smart my little ball comes out.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "protocol_changes.3",
+          "quote": "The Sam E should be done with.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "protocol_changes.4",
+          "quote": "The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "protocol_changes.5",
+          "quote": "And the parrot end comes out.",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "protocol_changes.6",
+          "quote": "two drops of the I done so it's gone",
+          "at_seconds": 1268,
+          "turn": 177,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "it. Okay. But we'll go through just that one instead of maybe refilling it. Okay. It's a smaller bottle. If you want to take one with you today, you can take it because I'm going to push you out like a couple months. Okay. And it might be good for you to stay on for a little. Yeah. Three knack one energy's done two. Nice, awesome. You can sit up. Okay, great. So liquid eye. Oh, sorry. sorry with the TMI not the I N yeah two drops do we need to refill it now okay so we'll two drops of the I done so it's gone okay okay yes okay cool you can sit up the G I adds were two I'm using two until gone. Now one until gone. Smart my little ball comes out. The Sam E should be done with. Yep. The sand mesh. Are you done with already? Yeah. Okay. Perfect. You're done with it anyway. And the parrot end comes out. It's really good for you and the girls. If like anything happens, yeah, you can always use that. We're bringing the catapults we talk back in, and then on the jungle germ you can use for energy. So if you feel like you're dipping, you can use that. So and then we are just putting in something called pro symbiotic. So only adding one thing. If you get home and you realize you have it, you can bring this one back in 30 days. Okay, it's totally fine. Do you want to wait till you get home? Because we have these here, so I was going to give you them."
+        },
+        {
+          "path": "protocol_changes.7",
+          "quote": "Keep the neck just so it's gone.",
+          "at_seconds": 1056,
+          "turn": 170,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Keep the neck just so it's gone. Okay. Brothers on hold. Keep one hole. Like digital ads work. One little bomb. Sorry, Bob. Probably close to done. Is do you have any? No. Okay. So that's why I'm taking out. The team might we can also take out. You always like the item with your pinning. Yeah. If it comes back, let me know. Okay. But we'll put it on hold for now. Okay. If you decide that you can only get it too, just second to the two. Okay. Keep the energy sign in. Jonathan's gonna stay on hold. You can always use that for additional energy. Okay. You're not anything. So the neck will do to the bottom spine. I'm gonna get you another GI absorb, but does seem like that's moving things. Yeah. And I think like whatever we're detoxing from residual liver stuff will do that. Do you have like a lot of it, Nicole? No, I'm almost out. Okay, so what we call that?"
+        },
+        {
+          "path": "protocol_changes.8",
+          "quote": "Keep the energy sign in.",
+          "at_seconds": 1056,
+          "turn": 170,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "Keep the neck just so it's gone. Okay. Brothers on hold. Keep one hole. Like digital ads work. One little bomb. Sorry, Bob. Probably close to done. Is do you have any? No. Okay. So that's why I'm taking out. The team might we can also take out. You always like the item with your pinning. Yeah. If it comes back, let me know. Okay. But we'll put it on hold for now. Okay. If you decide that you can only get it too, just second to the two. Okay. Keep the energy sign in. Jonathan's gonna stay on hold. You can always use that for additional energy. Okay. You're not anything. So the neck will do to the bottom spine. I'm gonna get you another GI absorb, but does seem like that's moving things. Yeah. And I think like whatever we're detoxing from residual liver stuff will do that. Do you have like a lot of it, Nicole? No, I'm almost out. Okay, so what we call that?"
+        },
+        {
+          "path": "nrt.stressors.0.category",
+          "quote": "All right, fungus is showing up for the small intestines",
+          "at_seconds": 727,
+          "turn": 141,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "All right, fungus is showing up for the small intestines, so we'll just try to get like maybe some pre or probiotics in, help balance out the yeast of the gut a little bit. Okay. But looking really like hormonally good. So if you crash, let me know. Like things are, you feel. You're feeling good, and things are looking really good. So that's great. And so it's been like"
+        },
+        {
+          "path": "nrt.stressors.0.source",
+          "quote": "All right, fungus is showing up for the small intestines",
+          "at_seconds": 727,
+          "turn": 141,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "All right, fungus is showing up for the small intestines, so we'll just try to get like maybe some pre or probiotics in, help balance out the yeast of the gut a little bit. Okay. But looking really like hormonally good. So if you crash, let me know. Like things are, you feel. You're feeling good, and things are looking really good. So that's great. And so it's been like"
+        },
+        {
+          "path": "nrt.stressors.0.body_area",
+          "quote": "All right, fungus is showing up for the small intestines",
+          "at_seconds": 727,
+          "turn": 141,
+          "unverified": false,
+          "verification": "span",
+          "turn_text": "All right, fungus is showing up for the small intestines, so we'll just try to get like maybe some pre or probiotics in, help balance out the yeast of the gut a little bit. Okay. But looking really like hormonally good. So if you crash, let me know. Like things are, you feel. You're feeling good, and things are looking really good. So that's great. And so it's been like"
+        }
+      ],
+      "extraction": {
+        "prompt_version": "2026-08-19.3",
+        "provider": "google",
+        "model": "gemini-3.6-flash",
+        "attribution_coverage": 0.8083623693379791,
+        "chunks": null
+      }
+    }
+  ]
+}
