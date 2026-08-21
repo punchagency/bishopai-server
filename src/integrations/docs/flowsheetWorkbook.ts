@@ -7,6 +7,7 @@ import {
   blockMergeRanges,
   blockHeaderRow,
   BLOCK_ROWS,
+  FIRST_DATA_BLOCK,
 } from './flowsheet';
 
 // Builds the client's whole Appointment Flow Sheet as an xlsx buffer, one block
@@ -20,8 +21,8 @@ const FLOW_TEMPLATE = join(__dirname, '../../../assets/templates/appointment-flo
 
 /**
  * Rebuild the entire Flow Sheet from an ordered list of sessions (oldest first).
- * Fills block `i` for `entries[i]`, growing past the template's pre-formatted
- * blocks when a client has more sessions than the template ships with.
+ * Fills block `i + FIRST_DATA_BLOCK` for `entries[i]` (leaving block 0 empty),
+ * growing past the template's pre-formatted blocks when a client has more sessions.
  */
 export async function buildFlowSheetXlsx(entries: FlowSheetEntry[]): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
@@ -32,14 +33,13 @@ export async function buildFlowSheetXlsx(entries: FlowSheetEntry[]): Promise<Buf
   const preformatted = Math.max(1, Math.floor(ws.rowCount / BLOCK_ROWS));
 
   entries.forEach((entry, i) => {
-    // Past the pre-formatted blocks we manufacture a new one (copying block 0's
-    // formatting), which arrives with block 0's content — so reset it to the
-    // blank scaffold before writing this session's values.
-    const grew = i >= preformatted;
-    if (grew) growFlowSheetBlock(ws, i);
+    // Start writing entries from FIRST_DATA_BLOCK (block 1), leaving block 0 empty.
+    const blockIndex = i + FIRST_DATA_BLOCK;
+    const grew = blockIndex >= preformatted;
+    if (grew) growFlowSheetBlock(ws, blockIndex);
     const writes = grew
-      ? [...blankBlockWrites(i, ws.name), ...buildFlowSheetBlock(entry, i, ws.name)]
-      : buildFlowSheetBlock(entry, i, ws.name);
+      ? [...blankBlockWrites(blockIndex, ws.name), ...buildFlowSheetBlock(entry, blockIndex, ws.name)]
+      : buildFlowSheetBlock(entry, blockIndex, ws.name);
     for (const w of writes) {
       const a1 = w.range.includes('!') ? w.range.split('!')[1] : w.range;
       ws.getCell(a1).value = w.value;
@@ -69,5 +69,8 @@ export function growFlowSheetBlock(ws: ExcelJS.Worksheet, blockIndex: number): v
     }
     dst.commit();
   }
-  for (const range of blockMergeRanges(blockIndex)) ws.mergeCells(range);
+  for (const range of blockMergeRanges(blockIndex)) {
+    try { ws.unMergeCells(range); } catch { /* not yet merged — fine */ }
+    ws.mergeCells(range);
+  }
 }

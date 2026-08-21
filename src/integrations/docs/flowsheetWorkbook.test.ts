@@ -26,38 +26,40 @@ const dateOf = (ws: ExcelJS.Worksheet, block: number): string => {
 const entry = (i: number): FlowSheetEntry => ({ date: `Session ${i}`, symptoms: `S${i}` });
 
 describe('buildFlowSheetXlsx', () => {
-  it('lays each session into its own block, in order', async () => {
+  it('lays each session into its own block starting from block 1 (block 0 stays empty)', async () => {
     const ws = await load(await buildFlowSheetXlsx([entry(0), entry(1), entry(2)]));
-    expect(dateOf(ws, 0)).toBe('Session 0');
-    expect(dateOf(ws, 1)).toBe('Session 1');
-    expect(dateOf(ws, 2)).toBe('Session 2');
+    expect(dateOf(ws, 0)).toBe(''); // block 0 kept empty
+    expect(dateOf(ws, 1)).toBe('Session 0');
+    expect(dateOf(ws, 2)).toBe('Session 1');
+    expect(dateOf(ws, 3)).toBe('Session 2');
     // Untouched template blocks stay blank.
-    expect(dateOf(ws, 3)).toBe('');
+    expect(dateOf(ws, 4)).toBe('');
   });
 
   it('grows past the template blocks instead of dropping later sessions', async () => {
     const entries = Array.from({ length: TEMPLATE_BLOCKS + 2 }, (_, i) => entry(i));
     const ws = await load(await buildFlowSheetXlsx(entries));
 
+    expect(dateOf(ws, 0)).toBe(''); // block 0 kept empty
     for (let i = 0; i < TEMPLATE_BLOCKS + 2; i++) {
-      expect(dateOf(ws, i)).toBe(`Session ${i}`);
+      expect(dateOf(ws, i + 1)).toBe(`Session ${i}`);
     }
     // The sheet actually grew by two blocks.
-    expect(ws.rowCount).toBeGreaterThanOrEqual(blockHeaderRow(TEMPLATE_BLOCKS + 1) + BLOCK_ROWS - 1);
+    expect(ws.rowCount).toBeGreaterThanOrEqual(blockHeaderRow(TEMPLATE_BLOCKS + 2) + BLOCK_ROWS - 1);
   });
 
   it('gives a grown block the blank scaffold, not block 0’s values', async () => {
-    const entries = Array.from({ length: TEMPLATE_BLOCKS + 1 }, (_, i) => entry(i));
+    const entries = Array.from({ length: TEMPLATE_BLOCKS }, (_, i) => entry(i));
     const ws = await load(await buildFlowSheetXlsx(entries));
-    const grown = TEMPLATE_BLOCKS; // first manufactured block
+    const grown = TEMPLATE_BLOCKS; // first manufactured block (index 7)
     const header = blockHeaderRow(grown);
 
     expect(String(ws.getCell(header, 1).value)).toBe('DATE');
     expect(String(ws.getCell(header, 5).value)).toBe('BODY SCAN');
     expect(String(ws.getCell(header + 1, 2).value)).toContain('BM:');
     expect(String(ws.getCell(header + 1, 4).value)).toContain('FOUNDATIONS');
-    // The session's own date still landed on the grown block.
-    expect(dateOf(ws, grown)).toBe(`Session ${grown}`);
+    // The session's own date still landed on the grown block (entry 6 -> block 7).
+    expect(dateOf(ws, grown)).toBe('Session 6');
   });
 
   it('is deterministic — same entries, same bytes', async () => {
@@ -68,7 +70,7 @@ describe('buildFlowSheetXlsx', () => {
     // carry timestamps); the content must match block-for-block.
     const wsa = await load(a);
     const wsb = await load(b);
-    expect(dateOf(wsa, 0)).toBe(dateOf(wsb, 0));
     expect(dateOf(wsa, 1)).toBe(dateOf(wsb, 1));
+    expect(dateOf(wsa, 2)).toBe(dateOf(wsb, 2));
   });
 });

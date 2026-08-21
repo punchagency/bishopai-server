@@ -42,6 +42,7 @@ export interface EmailInput {
   to: string;
   subject: string;
   body: string;
+  contentType?: 'Text' | 'HTML';
   attachments?: EmailAttachment[];
 }
 
@@ -146,9 +147,10 @@ export async function sendEmail(input: EmailInput): Promise<EmailResult> {
 
   const { token, sender, graphBase } = access;
   try {
+    const isHtml = input.contentType === 'HTML' || /<(html|div|p|a|table|br)\b/i.test(input.body);
     const message: Record<string, unknown> = {
       subject: input.subject,
-      body: { contentType: 'Text', content: input.body },
+      body: { contentType: isHtml ? 'HTML' : 'Text', content: input.body },
       toRecipients: [{ emailAddress: { address: input.to } }],
     };
     if (attached.length) message.attachments = graphAttachments(attached);

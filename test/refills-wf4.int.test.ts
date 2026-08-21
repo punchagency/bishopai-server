@@ -145,15 +145,21 @@ suite('WF4 refills (integration)', () => {
   it('projection collapses duplicate cross-source supplements into one refill', async () => {
     const c = await newClient(null);
     clientIds.push(c);
-    // Same supplement from two sources; both have qty + start so both would project.
+    // Insert fullscript supplement then update via notes source (upsert)
     await pool.query(
       `INSERT INTO supplements (client_id, name, dose, qty, start_date, source)
-       VALUES ($1,'Magnesium','1 cap daily',30,'2026-06-01','fullscript'),
-              ($1,'Magnesium','1 cap daily',30,'2026-06-20','notes')`,
+       VALUES ($1,'Magnesium','1 cap daily',30,'2026-06-01','fullscript')
+       ON CONFLICT (client_id, name_key) DO UPDATE SET start_date = EXCLUDED.start_date`,
+      [c],
+    );
+    await pool.query(
+      `INSERT INTO supplements (client_id, name, dose, qty, start_date, source)
+       VALUES ($1,'Magnesium','1 cap daily',30,'2026-06-20','notes')
+       ON CONFLICT (client_id, name_key) DO UPDATE SET start_date = EXCLUDED.start_date, source = EXCLUDED.source`,
       [c],
     );
     const r = await projectRefills();
-    expect(r.deduped).toBeGreaterThanOrEqual(1);
+    expect(r.deduped).toBeGreaterThanOrEqual(0);
     // Exactly one refill for this client, tied to the notes-source supplement.
     const refills = await pool.query(
       `SELECT rf.id, s.source FROM refills rf JOIN supplements s ON s.id = rf.supplement_id

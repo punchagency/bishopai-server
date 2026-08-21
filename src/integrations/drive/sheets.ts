@@ -1,10 +1,11 @@
 import { driveRequest } from './client';
 import type { FlowSheetEntry } from '../docs/types';
 import {
+  blockHeaderRow,
   buildFlowSheetBlock,
   blankBlockWrites,
-  blockHeaderRow,
   BLOCK_ROWS,
+  FIRST_DATA_BLOCK,
   type CellWrite,
 } from '../docs/flowsheet';
 
@@ -140,11 +141,11 @@ export async function appendFlowSheetEntry(
     return { blockIndex: existing, headerRow: blockHeaderRow(existing), cellsWritten: 0, alreadyPresent: true };
   }
 
-  // Next empty pre-formatted block, or — when they're all used — a brand new one.
-  let blockIndex = dates.findIndex((d) => d === undefined);
+  // Next empty pre-formatted block (starting from FIRST_DATA_BLOCK), or a new one.
+  let blockIndex = dates.findIndex((d, idx) => idx >= FIRST_DATA_BLOCK && d === undefined);
   let grew = false;
   if (blockIndex < 0) {
-    blockIndex = dates.length;
+    blockIndex = Math.max(FIRST_DATA_BLOCK, dates.length);
     await growBlock(spreadsheetId, meta, blockIndex);
     grew = true;
   }

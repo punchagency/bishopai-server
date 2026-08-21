@@ -31,8 +31,60 @@ function escapeHtml(s: string): string {
 }
 
 /** Minimal branded status page for the public booking flow (expired/unavailable/error). */
-function bookingErrorHtml(title: string, message: string, color = '#f43f5e'): string {
-  return `<!DOCTYPE html><html><head><title>${title}</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f12;color:#e4e4e7;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#18181b;border:1px solid #27272a;padding:2.5rem;border-radius:12px;text-align:center;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}h1{color:${color};margin-top:0}p{color:#a1a1aa;line-height:1.5}</style></head><body><div class="card"><h1>${title}</h1><p>${message}</p></div></body></html>`;
+function bookingErrorHtml(title: string, message: string, color = '#e08268'): string {
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <title>${title}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@700&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+      body {
+        font-family: 'Source Sans 3', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #1a120e;
+        color: #f3e9e2;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        margin: 0;
+        padding: 1rem;
+        box-sizing: border-box;
+      }
+      .card {
+        background: #241914;
+        border: 1px solid #3b2b23;
+        padding: 2.5rem 2rem;
+        border-radius: 16px;
+        text-align: center;
+        max-width: 440px;
+        width: 100%;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      }
+      h1 {
+        font-family: 'Libre Baskerville', Georgia, serif;
+        color: ${color};
+        margin-top: 0;
+        margin-bottom: 0.75rem;
+        font-size: 1.65rem;
+      }
+      p {
+        color: #b8a296;
+        line-height: 1.6;
+        font-size: 1rem;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>${title}</h1>
+      <p>${message}</p>
+    </div>
+  </body>
+</html>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,75 +457,83 @@ webhooksRouter.get('/appointments/book', async (req, res) => {
         <head>
           <title>Confirm Your Appointment</title>
           <meta name="viewport" content="width=device-width, initial-scale=1">
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@700&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
           <style>
             body {
-              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-              background: #0f0f12;
-              color: #e4e4e7;
+              font-family: 'Source Sans 3', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+              background: #1a120e;
+              color: #f3e9e2;
               display: flex;
               align-items: center;
               justify-content: center;
               min-height: 100vh;
               margin: 0;
+              padding: 1.5rem 1rem;
+              box-sizing: border-box;
             }
             .card {
-              background: #18181b;
-              border: 1px solid #27272a;
-              padding: 2.5rem;
+              background: #241914;
+              border: 1px solid #3b2b23;
+              padding: 2.5rem 2rem;
               border-radius: 16px;
               max-width: 450px;
-              width: 90%;
-              box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+              width: 100%;
+              box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
               text-align: center;
             }
             .icon {
-              font-size: 3rem;
-              margin-bottom: 1.5rem;
-              color: #a855f7;
+              font-size: 2.5rem;
+              margin-bottom: 1rem;
+              color: #c79b84;
             }
             h1 {
+              font-family: 'Libre Baskerville', Georgia, serif;
               font-size: 1.75rem;
               font-weight: 700;
               margin-top: 0;
               margin-bottom: 0.5rem;
-              color: #ffffff;
+              color: #f3e9e2;
             }
             .sub {
-              color: #a1a1aa;
-              margin-bottom: 2rem;
-              font-size: 0.95rem;
+              color: #b8a296;
+              margin-bottom: 1.75rem;
+              font-size: 0.98rem;
+              line-height: 1.5;
             }
             .slot-box {
-              background: #27272a;
-              border: 1px solid #3f3f46;
-              padding: 1.25rem;
-              border-radius: 8px;
-              margin-bottom: 2rem;
+              background: #2e211b;
+              border: 1px solid #3b2b23;
+              padding: 1.15rem 1rem;
+              border-radius: 10px;
+              margin-bottom: 1.75rem;
               font-weight: 600;
-              font-size: 1.1rem;
-              color: #f4f4f5;
+              font-size: 1.08rem;
+              color: #f3e9e2;
+              letter-spacing: 0.01em;
             }
             .btn {
-              background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);
-              color: white;
+              background: linear-gradient(135deg, #c79b84 0%, #aa7660 100%);
+              color: #1a120e;
               border: none;
-              padding: 1rem 2rem;
-              font-size: 1rem;
-              font-weight: 600;
+              padding: 0.95rem 1.75rem;
+              font-size: 1.05rem;
+              font-weight: 700;
+              font-family: 'Source Sans 3', sans-serif;
               border-radius: 8px;
               cursor: pointer;
               width: 100%;
-              transition: opacity 0.2s;
-              box-shadow: 0 4px 12px rgba(124, 58, 237, 0.3);
+              transition: all 0.2s ease;
+              box-shadow: 0 4px 14px rgba(170, 118, 96, 0.35);
             }
             .btn:hover {
-              opacity: 0.95;
+              background: linear-gradient(135deg, #d6b4a2 0%, #97634e 100%);
+              box-shadow: 0 6px 18px rgba(170, 118, 96, 0.45);
+              transform: translateY(-1px);
             }
-            .btn:disabled {
-              background: #3f3f46;
-              color: #71717a;
-              cursor: not-allowed;
-              box-shadow: none;
+            .btn:active {
+              transform: translateY(0);
             }
           </style>
         </head>
@@ -673,44 +733,50 @@ webhooksRouter.post('/appointments/book', async (req, res) => {
         <head>
           <title>Booking Confirmed!</title>
           <meta name="viewport" content="width=device-width, initial-scale=1">
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@700&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
           <style>
             body {
-              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-              background: #0f0f12;
-              color: #e4e4e7;
+              font-family: 'Source Sans 3', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+              background: #1a120e;
+              color: #f3e9e2;
               display: flex;
               align-items: center;
               justify-content: center;
               min-height: 100vh;
               margin: 0;
+              padding: 1.5rem 1rem;
+              box-sizing: border-box;
             }
             .card {
-              background: #18181b;
-              border: 1px solid #27272a;
-              padding: 2.5rem;
+              background: #241914;
+              border: 1px solid #3b2b23;
+              padding: 2.5rem 2rem;
               border-radius: 16px;
               max-width: 450px;
-              width: 90%;
-              box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+              width: 100%;
+              box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
               text-align: center;
             }
             .icon {
-              font-size: 3rem;
-              margin-bottom: 1.5rem;
-              color: #22c55e;
+              font-size: 2.75rem;
+              margin-bottom: 1rem;
+              color: #8fa383;
             }
             h1 {
+              font-family: 'Libre Baskerville', Georgia, serif;
               font-size: 1.75rem;
               font-weight: 700;
               margin-top: 0;
               margin-bottom: 0.5rem;
-              color: #ffffff;
+              color: #f3e9e2;
             }
             .sub {
-              color: #a1a1aa;
-              margin-bottom: 2rem;
-              font-size: 0.95rem;
-              line-height: 1.5;
+              color: #b8a296;
+              margin-bottom: 0;
+              font-size: 0.98rem;
+              line-height: 1.6;
             }
           </style>
         </head>
@@ -718,7 +784,7 @@ webhooksRouter.post('/appointments/book', async (req, res) => {
           <div class="card">
             <div class="icon">✓</div>
             <h1>Booking Confirmed!</h1>
-            <p class="sub">Your appointment has been scheduled and confirmed in our calendar. You will receive an email shortly.</p>
+            <p class="sub">Your appointment has been scheduled and confirmed in our calendar. You will receive a confirmation email shortly.</p>
           </div>
         </body>
       </html>

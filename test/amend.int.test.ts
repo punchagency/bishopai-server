@@ -164,15 +164,17 @@ suite('amending an approved note (integration, real Postgres)', () => {
 
   it('retracts a supplement the amendment removed, but keeps ones it only stopped changing', async () => {
     // A fresh client so the plan starts empty and the assertions are unambiguous.
+    const suffix = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const c = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id) VALUES ('AM Retract', 'amtest-retract') RETURNING id`,
+      `INSERT INTO clients (name, pb_id) VALUES ('AM Retract', $1) RETURNING id`,
+      [`amtest-retract-${suffix}`],
     );
     const cid = c.rows[0].id;
     const a = await pool.query<{ id: string }>(
       `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-retract-appt', now() - interval '3 days', now() - interval '3 days', 'completed')
+       VALUES ($1, $2, now() - interval '3 days', now() - interval '3 days', 'completed')
        RETURNING id`,
-      [cid],
+      [cid, `amtest-retract-appt-${suffix}`],
     );
     // Already on the plan from an earlier session.
     await pool.query(
@@ -223,15 +225,17 @@ suite('amending an approved note (integration, real Postgres)', () => {
   });
 
   it('reconciles tasks on amend: creates added follow-ups, dismisses removed ones', async () => {
+    const suffix = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const c = await pool.query<{ id: string }>(
-      `INSERT INTO clients (name, pb_id) VALUES ('AM Tasks', 'amtest-tasks') RETURNING id`,
+      `INSERT INTO clients (name, pb_id) VALUES ('AM Tasks', $1) RETURNING id`,
+      [`amtest-tasks-${suffix}`],
     );
     const cid = c.rows[0].id;
     const a = await pool.query<{ id: string }>(
       `INSERT INTO appointments (client_id, pb_id, starts_at, ends_at, status)
-       VALUES ($1, 'amtest-tasks-appt', now() - interval '3 days', now() - interval '3 days', 'completed')
+       VALUES ($1, $2, now() - interval '3 days', now() - interval '3 days', 'completed')
        RETURNING id`,
-      [cid],
+      [cid, `amtest-tasks-appt-${suffix}`],
     );
     const withFollowUps = {
       ...note('x'),

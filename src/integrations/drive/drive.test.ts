@@ -63,8 +63,9 @@ describe('publishFlowSheet', () => {
   it('writes into the first empty block via the Sheets API when configured', async () => {
     configureDrive();
 
-    // Block 0 (date cell A2) is filled; block 1 (A15) is empty → target block 1.
-    const colA = [['DATE', 'Jun 1, 2026', '', '', '', '', '', '', '', '', '', '', '', 'DATE', '']];
+    // Block 0 (A2) is left empty as template row; block 1 (A15) is target.
+    // colA[0]=DATE(header0), [1]=''(date0 empty), [13]=DATE(header1), [14]=''(date1 empty)
+    const colA = [['DATE', '', '', '', '', '', '', '', '', '', '', '', '', 'DATE', '']];
     let batchBody: unknown;
     const ok = (obj: unknown) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
     const fetchMock = vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
@@ -99,8 +100,8 @@ describe('publishFlowSheet', () => {
 
   it('is idempotent by date — a block already carrying the date is not re-written', async () => {
     configureDrive();
-    // Block 0's date cell (A2) already holds the entry's date.
-    const colA = [['DATE', 'Jul 9, 2026', '', '', '', '', '', '', '', '', '', '', '', 'DATE', '']];
+    // Block 1's date cell (A15) already holds the entry's date.
+    const colA = [['DATE', '', '', '', '', '', '', '', '', '', '', '', '', 'DATE', 'Jul 9, 2026']];
     const ok = (obj: unknown) => ({ ok: true, status: 200, text: async () => JSON.stringify(obj) });
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes('oauth2') || url.includes('/token')) return ok({ access_token: 't', expires_in: 3600 });
@@ -117,7 +118,7 @@ describe('publishFlowSheet', () => {
       entry: { date: 'Jul 9, 2026', symptoms: 'Fatigue' },
     });
     expect(res.alreadyPresent).toBe(true);
-    expect(res.blockIndex).toBe(0);
+    expect(res.blockIndex).toBe(1);
     // No batchUpdate was issued (the mock throws if one is attempted).
     expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('batchUpdate'))).toBe(false);
   });

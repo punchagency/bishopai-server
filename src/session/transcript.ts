@@ -50,9 +50,9 @@ export function indexTurns(turns: Turn[]): Turn[] {
   return turns.map((t, i) => ({ ...t, index: i }));
 }
 
-// "Speaker 1  0:02" / "Speaker 1:" / "Nicole 12:03" / "[00:12:03] Speaker 2"
+// "Speaker 1  0:02" / "Speaker 1:" / "#47 SPEAKER 02" / "Nicole 12:03" / "[00:12:03] Speaker 2"
 const SPEAKER_LINE =
-  /^[ \t]*(?:\[(?<lead>\d{1,2}:\d{2}(?::\d{2})?)\][ \t]*)?(?<name>[A-Za-z][\w .'-]{0,40}?)[ \t]*:?[ \t]*(?<time>\d{1,2}:\d{2}(?::\d{2})?)?[ \t]*$/;
+  /^[ \t]*(?<hash>#\d+[ \t]+)?(?:\[(?<lead>\d{1,2}:\d{2}(?::\d{2})?)\][ \t]*)?(?<name>[A-Za-z][\w .'()-]{0,40}?)[ \t]*:?[ \t]*(?<time>\d{1,2}:\d{2}(?::\d{2})?)?[ \t]*$/;
 
 // The other shape, and the one the live recorder actually produces:
 // "SPEAKER_00: And it flares up here and there." — label and utterance on ONE
@@ -64,7 +64,7 @@ const SPEAKER_LINE =
 // once. So candidates are gathered first and only accepted as labels if they
 // behave like labels across the whole document.
 const INLINE_SPEAKER =
-  /^[ \t]*(?:\[(?<lead>\d{1,2}:\d{2}(?::\d{2})?)\][ \t]*)?(?<name>[A-Za-z][\w .'-]{0,30}?)[ \t]*:[ \t]+(?<text>\S.*)$/;
+  /^[ \t]*(?:\[(?<lead>\d{1,2}:\d{2}(?::\d{2})?)\][ \t]*)?(?<name>[A-Za-z][\w .'()-]{0,30}?)[ \t]*:[ \t]+(?<text>\S.*)$/;
 
 /**
  * Does this look like a person's name rather than the start of a sentence?
@@ -75,8 +75,14 @@ const INLINE_SPEAKER =
  * are what give it away.
  */
 function looksLikeName(label: string): boolean {
-  const words = label.split(/\s+/).filter(Boolean);
-  if (words.length === 0 || words.length > 3) return false;
+  // Diarization tools bracket the raw channel onto the role — "CLIENT (SPEAKER
+  // 01)" — so the parens are part of the label, not prose. Strip them before
+  // the capitalisation test and allow the extra words they add.
+  const words = label
+    .replace(/[()]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0 || words.length > 4) return false;
   return words.every((w) => /^\d+$/.test(w) || /^[A-Z][\w.'-]*$/.test(w));
 }
 
@@ -184,7 +190,14 @@ export function parseTranscript(raw: string): Turn[] {
     const m = line.match(SPEAKER_LINE);
     // A header must have a timestamp OR be short and followed by content; a bare
     // sentence that happens to end in a colon is not a speaker change.
-    if (m?.groups && (m.groups.time || m.groups.lead) && m.groups.name) {
+    //
+    // The `#47 SPEAKER 02` shape carries no timestamp at all, so the turn number
+    // is what marks it as a header. That is only safe with the name test: "#5
+    // minutes later" fits the same regex and is prose, and lowercase interior
+    // words are what separate the two.
+    const hashHeader =
+      !!m?.groups?.hash && !!m.groups.name && looksLikeName(m.groups.name.trim());
+    if (m?.groups && (m.groups.time || m.groups.lead || hashHeader) && m.groups.name) {
       flush();
       current = {
         speaker: m.groups.name.trim(),
@@ -542,10 +555,24 @@ export interface PreparedTranscript {
 }
 
 /** One-shot preparation used by the extractor. */
-export function prepareTranscript(raw: string): PreparedTranscript {
+/**
+ * The canonical turn list for a transcript — the one thing that defines what
+ * "turn #12" means.
+ *
+ * Every consumer numbers turns through here. The segmenter used to run its own
+ * parser, which merged nothing and counted from 1, so its `from_turn` and the
+ * review pane's citations were two different coordinate systems over the same
+ * recording and the gap grew with every merged pair. Sharing the pipeline is
+ * what makes a turn number portable between them.
+ */
+export function prepareTurns(raw: string): Turn[] {
   // Index AFTER merging: merging collapses turns, so numbering before it would
   // leave gaps and point citations at turns that no longer exist.
-  const turns = attributeSpeakers(indexTurns(mergeAdjacentTurns(parseTranscript(raw))));
+  return attributeSpeakers(indexTurns(mergeAdjacentTurns(parseTranscript(raw))));
+}
+
+export function prepareTranscript(raw: string): PreparedTranscript {
+  const turns = prepareTurns(raw);
   const full = renderTurns(turns);
   return {
     raw,

@@ -27,6 +27,7 @@ import {
   amendSession,
   appointmentForItem,
 } from '../session/sessionService';
+import { detectSessionBoundaries, parseTurns, sliceTranscriptByTurnRange } from '../session/segmenter';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
 // session extraction, with edit + approve. (No auth yet — approved_by is a
@@ -458,6 +459,176 @@ reviewRouter.post('/unmatched/:id/assign-client', async (req, res) => {
     return res.status(500).json({ error: 'internal error' });
   } finally {
     db.release();
+  }
+});
+
+// GET /review/unmatched/:id/segments — detect multi-session boundaries for a recording.
+reviewRouter.get('/unmatched/:id/segments', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  try {
+    const conv = await pool.query<{ starts_at: string; ends_at: string; transcript: string | null }>(
+      `SELECT starts_at, ends_at, transcript FROM conversations WHERE id = $1`,
+      [req.params.id],
+    );
+    if (conv.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    const { starts_at: cs, ends_at: ce, transcript } = conv.rows[0];
+    const transcriptText = transcript ?? '';
+
+    const candRes = await pool.query<{
+      id: string;
+      starts_at: string;
+      ends_at: string;
+      client_id: string | null;
+      client_name: string | null;
+    }>(
+      `SELECT a.id, a.starts_at, a.ends_at, a.client_id, c.name AS client_name
+         FROM appointments a
+    LEFT JOIN clients c ON c.id = a.client_id
+        WHERE a.status <> 'cancelled'
+          AND NOT EXISTS (SELECT 1 FROM conversations cv WHERE cv.appointment_id = a.id)
+          AND a.starts_at <= ($2::timestamptz + INTERVAL '2 hours')
+          AND a.ends_at >= ($1::timestamptz - INTERVAL '2 hours')
+     ORDER BY abs(extract(epoch FROM (a.starts_at - $1::timestamptz)))
+        LIMIT 12`,
+      [cs, ce],
+    );
+
+    const candidates = candRes.rows.map((a) => {
+      const name = scoreNameMatch(transcriptText, a.client_name);
+      return {
+        id: a.id,
+        starts_at: a.starts_at,
+        ends_at: a.ends_at,
+        client_id: a.client_id,
+        client_name: a.client_name,
+        name_mentions: name.mentions,
+        name_matched_on: name.matchedOn,
+        overlap_seconds: overlapSeconds(cs, ce, a.starts_at, a.ends_at),
+      };
+    });
+
+    const candidateNames = candidates
+      .map((c) => c.client_name)
+      .filter((n): n is string => !!n);
+
+    const calendarAppointments = candidates.map((c) => ({
+      id: c.id,
+      starts_at: c.starts_at,
+      ends_at: c.ends_at,
+      client_name: c.client_name,
+      overlap_seconds: c.overlap_seconds,
+    }));
+    const recStartMs = new Date(cs).getTime();
+    const recEndMs = new Date(ce).getTime();
+
+    const segments = await detectSessionBoundaries(
+      transcriptText,
+      candidateNames,
+      calendarAppointments,
+      recStartMs,
+      recEndMs,
+    );
+    // The turns go back with the segments deliberately. The renderer used to
+    // parse the transcript itself to draw the boundary markers, which made a
+    // third turn-numbering scheme — its `turn.index` and the segmenter's
+    // `from_turn` were compared directly and only coincided by luck. Shipping
+    // the list the boundaries were computed from is what makes that comparison
+    // mean something.
+    const turns = parseTurns(transcriptText).map((t) => ({
+      index: t.index,
+      speaker: t.speaker,
+      role: t.role ?? 'UNKNOWN',
+      text: t.text,
+    }));
+    return res.json({ conversation_id: req.params.id, segments, candidates, turns });
+  } catch (err) {
+    logError('review.segments', 'failed to detect session segments', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+const splitSegmentSchema = z.object({
+  from_turn: z.number().int().positive(),
+  to_turn: z.number().int().positive(),
+  appointment_id: z.string().optional(),
+  client_id: z.string().optional(),
+});
+const splitSchema = z.object({
+  segments: z.array(splitSegmentSchema).min(1),
+});
+
+// POST /review/unmatched/:id/split — split a multi-session recording into separate child session conversations.
+reviewRouter.post('/unmatched/:id/split', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  const parsed = splitSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
+
+  try {
+    const parent = await pool.query<{
+      bee_id: string;
+      starts_at: string;
+      ends_at: string;
+      transcript: string | null;
+      source: string;
+    }>(
+      `SELECT bee_id, starts_at, ends_at, transcript, source FROM conversations WHERE id = $1`,
+      [req.params.id],
+    );
+    if (parent.rowCount === 0) return res.status(404).json({ error: 'parent conversation not found' });
+    const orig = parent.rows[0];
+    if (!orig.transcript) return res.status(400).json({ error: 'conversation has no transcript' });
+
+    const createdIds: string[] = [];
+    const totalTurns = parseTurns(orig.transcript).length || 1;
+    const pStartMs = new Date(orig.starts_at).getTime();
+    const pEndMs = new Date(orig.ends_at).getTime();
+    const totalDurMs = Math.max(0, pEndMs - pStartMs);
+
+    for (let i = 0; i < parsed.data.segments.length; i++) {
+      const seg = parsed.data.segments[i];
+      const slicedText = sliceTranscriptByTurnRange(orig.transcript, seg.from_turn, seg.to_turn);
+      const newBeeId = `${orig.bee_id}_slice_${i + 1}_${Date.now().toString(36)}`;
+
+      const childStartMs = pStartMs + Math.round(((seg.from_turn - 1) / totalTurns) * totalDurMs);
+      const childEndMs = pStartMs + Math.round((seg.to_turn / totalTurns) * totalDurMs);
+      const childStartsAt = new Date(childStartMs).toISOString();
+      const childEndsAt = new Date(childEndMs).toISOString();
+
+      const child = await pool.query<{ id: string }>(
+        `INSERT INTO conversations (bee_id, starts_at, ends_at, transcript, source, parent_conversation_id, turn_range, correlation_status, appointment_id, client_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+        [
+          newBeeId,
+          childStartsAt,
+          childEndsAt,
+          slicedText,
+          orig.source,
+          req.params.id,
+          JSON.stringify({ from_turn: seg.from_turn, to_turn: seg.to_turn }),
+          seg.appointment_id ? 'matched' : seg.client_id ? 'walk_in' : 'unmatched',
+          seg.appointment_id ?? null,
+          seg.client_id ?? null,
+        ],
+      );
+      const childId = child.rows[0].id;
+      createdIds.push(childId);
+
+      if (seg.appointment_id || seg.client_id) {
+        void processConversation(childId).catch((e) =>
+          logError('session.process', 'split segment processing failed', e, { conversation_id: childId }),
+        );
+      }
+    }
+
+    logEvent('info', 'review.split', 'split conversation into multi-session segments', {
+      parent_id: req.params.id,
+      child_ids: createdIds,
+    });
+
+    return res.status(201).json({ parent_id: req.params.id, split_conversations: createdIds });
+  } catch (err) {
+    logError('review.split', 'conversation split failed', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
   }
 });
 

@@ -331,14 +331,30 @@ async function appendSlotSuggestions(body: string, leadId: string): Promise<stri
 
     const { signBookingToken } = await import('./bookingToken');
     const baseUrl = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
-    const slotLines = slots.map((s) => {
-      const token = signBookingToken(leadId, s.starts_at);
-      const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
-      const bookUrl = `${baseUrl}/webhooks/appointments/book?leadId=${leadId}&slot=${encodeURIComponent(s.starts_at)}${tokenParam}`;
-      return `  • ${s.label} — Confirm & book: ${bookUrl}`;
-    }).join('\n');
+    const slotButtons = slots
+      .map((s) => {
+        const token = signBookingToken(leadId, s.starts_at);
+        const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+        const bookUrl = `${baseUrl}/webhooks/appointments/book?leadId=${leadId}&slot=${encodeURIComponent(s.starts_at)}${tokenParam}`;
+        return `
+          <div style="margin-bottom: 8px;">
+            <a href="${bookUrl}" style="display: inline-block; background: linear-gradient(135deg, #c79b84 0%, #aa7660 100%); color: #1a120e; text-decoration: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; font-size: 14px; font-family: 'Source Sans 3', -apple-system, sans-serif; box-shadow: 0 3px 10px rgba(170, 118, 96, 0.35);">
+              📅 Confirm &amp; Book ${s.label}
+            </a>
+          </div>`;
+      })
+      .join('');
 
-    return `${body}\n\nSome available times that work for me:\n${slotLines}\n\nClick one of the links above to confirm your booking, or reply with your preferred slot and I'll get you booked in!`;
+    const formattedBody = body.replace(/\n/g, '<br/>');
+
+    return `${formattedBody}
+<div style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #3b2b23; font-family: 'Source Sans 3', -apple-system, sans-serif;">
+  <p style="font-weight: 600; color: #f3e9e2; margin-bottom: 0.75rem;">Some available times that work for me:</p>
+  ${slotButtons}
+  <p style="font-size: 0.875rem; color: #b8a296; margin-top: 0.75rem;">
+    Click a button above to confirm your booking, or reply with your preferred slot and I'll get you booked in!
+  </p>
+</div>`;
   } catch (err) {
     logError('reengagement.slots', 'slot injection failed — sending without slots', err);
     return body;

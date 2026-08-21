@@ -14,6 +14,9 @@ import type { FlowSheetEntry } from './types';
 /** Rows per appointment block: 1 header + 12 data rows. */
 export const BLOCK_ROWS = 13;
 
+/** Index of the first block used for actual session entries (block 0 is kept empty). */
+export const FIRST_DATA_BLOCK = 1;
+
 // Column B carries pre-set lifestyle labels on merged 2-row cells. We prepend the
 // label so a written note reads e.g. "BM: regular" and matches the blank template.
 const NOTE_LABEL = {
