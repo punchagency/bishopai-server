@@ -4,6 +4,7 @@ import { logError, logEvent } from '../observability/logger';
 import { rawFromError } from '../llm/errors';
 import { markExtractionFailed, LEASE_MINUTES } from './reclaim';
 import { fetchSupplementVocabulary } from './supplements';
+import { verifyClientConsent } from './consent';
 
 /**
  * Keep a running extraction's lease fresh so the reclaim sweep only reclaims a
@@ -67,8 +68,24 @@ export async function processConversation(conversationId: string): Promise<void>
                   AS appointment_date`,
     [conversationId],
   );
+
   if (claim.rowCount === 0) return;
   const { appointment_id, client_id, transcript, client_name, appointment_date } = claim.rows[0];
+
+  // Verify client audio recording consent before processing
+  const hasConsent = await verifyClientConsent(client_id, 'audio_recording');
+  if (!hasConsent) {
+    await markExtractionFailed(
+      conversationId,
+      'Extraction held: Client audio recording consent missing or revoked',
+      null,
+    );
+    logEvent('warn', 'session.process', 'extraction held due to missing/revoked consent', {
+      conversation_id: conversationId,
+      client_id,
+    });
+    return;
+  }
 
   // Renew the lease while we actually work, so a long session isn't mistaken for
   // a dead process and reclaimed out from under itself. Stopped at every exit

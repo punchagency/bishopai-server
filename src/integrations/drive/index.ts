@@ -22,6 +22,7 @@ export const isDemoMode = (): boolean => demoDir() !== null;
 export { isDriveConfigured, driveConfig } from './config';
 export {
   findOrCreateFolder,
+  ensureClientFolder,
   upsertDoc,
   uploadBinary,
   resolveDocFolder,

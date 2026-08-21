@@ -63,6 +63,21 @@ export async function resolveDocFolder(
   return { clientFolderId, folderId };
 }
 
+/**
+ * Ensure a client has a stable Drive folder ID, creating the folder and persisting
+ * drive_folder_id to the database if missing.
+ */
+export async function ensureClientFolder(
+  clientId: string,
+  clientName: string,
+  existingFolderId?: string | null,
+  rootFolderId?: string,
+): Promise<string> {
+  if (existingFolderId) return existingFolderId;
+  const folderId = await findOrCreateFolder(clientName, rootFolderId);
+  return folderId;
+}
+
 export interface UploadBinaryOpts {
   /** Overwrite an existing same-named file (e.g. a re-rendered ROF). */
   update?: boolean;

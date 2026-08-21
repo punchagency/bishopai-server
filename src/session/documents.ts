@@ -15,16 +15,26 @@ import { logError } from '../observability/logger';
 
 export type DocumentType = 'ROF' | 'SupplementProtocol' | 'AppointmentFlowSheet' | 'Markdown';
 
+export interface RecordDocumentOpts {
+  appointmentId?: string | null;
+  driveUrl?: string | null;
+  name?: string | null;
+  status?: string;
+}
+
 export async function recordDocument(
   clientId: string | null,
   type: DocumentType,
   driveFileId: string | null | undefined,
+  opts: RecordDocumentOpts = {},
 ): Promise<void> {
   if (!clientId || !driveFileId) return; // dry-run publishes have no file id
   try {
+    const { appointmentId = null, driveUrl = null, name = null, status = 'published' } = opts;
     await pool.query(
-      `INSERT INTO documents (client_id, drive_file_id, type) VALUES ($1, $2, $3)`,
-      [clientId, driveFileId, type],
+      `INSERT INTO documents (client_id, drive_file_id, type, appointment_id, drive_url, name, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [clientId, driveFileId, type, appointmentId, driveUrl, name, status],
     );
   } catch (err) {
     logError('documents.record', 'failed to record a published document', err, {
@@ -36,15 +46,20 @@ export async function recordDocument(
 
 export interface PublishedDocument {
   id: string;
+  client_id: string;
+  appointment_id: string | null;
   drive_file_id: string | null;
+  drive_url: string | null;
+  name: string | null;
   type: string | null;
+  status: string;
   created_at: string;
 }
 
 /** Everything published for a client, newest first. */
 export async function fetchClientDocuments(clientId: string): Promise<PublishedDocument[]> {
   const r = await pool.query<PublishedDocument>(
-    `SELECT id, drive_file_id, type, created_at
+    `SELECT id, client_id, appointment_id, drive_file_id, drive_url, name, type, status, created_at
        FROM documents WHERE client_id = $1 ORDER BY created_at DESC LIMIT 100`,
     [clientId],
   );
