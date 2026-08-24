@@ -44,6 +44,16 @@ export async function syncProtocolsFromPb(): Promise<SyncResult> {
     try {
       const pbClientId = proto.clientRecord?.id;
       if (!pbClientId) continue;
+      // No PB id means no identity to upsert on, and inserting with a NULL
+      // pb_id would slip straight past the unique index and start accumulating
+      // duplicates again — the exact bug this row is here to prevent. Skip it
+      // and say so rather than storing something that cannot be reconciled.
+      if (!proto.id) {
+        logEvent('warn', 'pb.sync', 'protocol has no PB id — skipped', {
+          pb_client_id: String(pbClientId),
+        });
+        continue;
+      }
 
       const clientRes = await pool.query<{ id: string }>(
         `SELECT id FROM clients WHERE pb_id = $1`,
@@ -52,12 +62,30 @@ export async function syncProtocolsFromPb(): Promise<SyncResult> {
       if (clientRes.rowCount === 0) continue;
       const clientId = clientRes.rows[0].id;
 
-      // Upsert the protocol row (by PB id) so the dashboard can reference it.
+      // Upsert by PB id — which now actually happens.
+      //
+      // This used to be `ON CONFLICT DO NOTHING` with no conflict target, under
+      // this same comment. It never once did nothing: the only unique index on
+      // the table is on appointment_id, this insert leaves appointment_id NULL,
+      // and every NULL is distinct in a unique index, so no constraint was ever
+      // violated and each sync appended another copy. Production accumulated 17
+      // copies of every protocol before anyone looked.
+      //
+      // Naming the conflict target is what makes it an upsert. The DO UPDATE
+      // refreshes content so a protocol edited in PB is not frozen at whatever
+      // it looked like the first time we saw it.
+      //
+      // The status guard matters: a draft that Nicole has since approved is a
+      // document she signed off, and a background sync must not rewrite its
+      // contents underneath her.
       await pool.query(
-        `INSERT INTO protocols (client_id, content_json, status)
-         VALUES ($1, $2, 'draft')
-         ON CONFLICT DO NOTHING`,
-        [clientId, JSON.stringify(proto)],
+        `INSERT INTO protocols (client_id, pb_id, content_json, status)
+         VALUES ($1, $2, $3, 'draft')
+         ON CONFLICT (pb_id) WHERE pb_id IS NOT NULL
+         DO UPDATE SET content_json = EXCLUDED.content_json,
+                       updated_at = now()
+               WHERE protocols.status = 'draft'`,
+        [clientId, String(proto.id), JSON.stringify(proto)],
       );
       upserted++;
     } catch (err) {

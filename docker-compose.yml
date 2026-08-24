@@ -1,4 +1,16 @@
 # Local Postgres for development. Matches DATABASE_URL in .env.example.
+#
+# The project name is PINNED. Without it Compose derives the name from whatever
+# directory you happen to run from, and the volume is named after the project —
+# so `docker compose up` from server/ and from bishopai/ created two different
+# databases from this one file (server_pgdata and bishopai_pgdata), each looking
+# like a fresh install to the other.
+#
+# NOTE: this pins the NAME, not the DATA. Volumes are local to a machine, so a
+# second device running this file gets its own empty bishopai_pgdata. Moving
+# data between machines is a pg_dump/pg_restore, or a hosted database.
+name: bishopai
+
 services:
   db:
     image: postgres:16
