@@ -95,7 +95,14 @@ reviewRouter.get('/queue', async (req, res) => {
 reviewRouter.get('/unmatched', async (_req, res) => {
   try {
     const r = await pool.query(
+      // correlation_hold_reason is what separates the two things in this queue.
+      // Most rows are "we could not tell whose this is" and want Nicole to pick
+      // a client. A held row is "this audio may contain more than one client"
+      // and wants her to SPLIT it first — tagging it to one person is the exact
+      // mistake being prevented, and without the reason on screen the two look
+      // identical.
       `SELECT id, source_id, source, starts_at, ends_at, correlation_status,
+              correlation_hold_reason,
               left(coalesce(transcript, ''), 240) AS transcript_preview
          FROM conversations
         WHERE appointment_id IS NULL
@@ -124,12 +131,13 @@ reviewRouter.get('/unmatched/:id', async (req, res) => {
       starts_at: string;
       ends_at: string;
       correlation_status: string;
+      correlation_hold_reason: string | null;
       extraction_status: string;
       appointment_id: string | null;
       transcript: string | null;
     }>(
       `SELECT id, source_id, source, starts_at, ends_at, correlation_status,
-              extraction_status, appointment_id, transcript
+              correlation_hold_reason, extraction_status, appointment_id, transcript
          FROM conversations
         WHERE id = $1`,
       [req.params.id],
@@ -557,26 +565,44 @@ const splitSchema = z.object({
   segments: z.array(splitSegmentSchema).min(1),
 });
 
-// POST /review/unmatched/:id/split — split a multi-session recording into separate child session conversations.
-reviewRouter.post('/unmatched/:id/split', async (req, res) => {
+// POST /review/unmatched/:id/split & POST /review/conversations/:id/split
+// Split a multi-session recording into separate child session conversations.
+async function handleSplitConversation(req: any, res: any) {
   if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
   const parsed = splitSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
 
   try {
     const parent = await pool.query<{
-      bee_id: string;
+      source_id: string;
       starts_at: string;
       ends_at: string;
       transcript: string | null;
       source: string;
+      appointment_id: string | null;
     }>(
-      `SELECT bee_id, starts_at, ends_at, transcript, source FROM conversations WHERE id = $1`,
+      `SELECT source_id, starts_at, ends_at, transcript, source, appointment_id FROM conversations WHERE id = $1`,
       [req.params.id],
     );
     if (parent.rowCount === 0) return res.status(404).json({ error: 'parent conversation not found' });
     const orig = parent.rows[0];
     if (!orig.transcript) return res.status(400).json({ error: 'conversation has no transcript' });
+
+    // If parent was matched, unmatch it first and clear any unapproved draft notes for that appointment
+    if (orig.appointment_id) {
+      await pool.query(
+        `UPDATE conversations SET appointment_id = NULL, client_id = NULL, correlation_status = 'unmatched' WHERE id = $1`,
+        [req.params.id],
+      );
+      await pool.query(
+        `DELETE FROM appointment_sheets WHERE appointment_id = $1 AND status <> 'approved'`,
+        [orig.appointment_id],
+      );
+      await pool.query(
+        `DELETE FROM protocols WHERE appointment_id = $1 AND status <> 'approved'`,
+        [orig.appointment_id],
+      );
+    }
 
     const createdIds: string[] = [];
     const totalTurns = parseTurns(orig.transcript).length || 1;
@@ -587,7 +613,10 @@ reviewRouter.post('/unmatched/:id/split', async (req, res) => {
     for (let i = 0; i < parsed.data.segments.length; i++) {
       const seg = parsed.data.segments[i];
       const slicedText = sliceTranscriptByTurnRange(orig.transcript, seg.from_turn, seg.to_turn);
-      const newBeeId = `${orig.bee_id}_slice_${i + 1}_${Date.now().toString(36)}`;
+      // Derived from the PARENT's source_id so a re-poll of the same recording
+      // collides with the child on (source, source_id) instead of silently
+      // re-ingesting the unsplit original alongside its own segments.
+      const childSourceId = `${orig.source_id}_slice_${i + 1}_${Date.now().toString(36)}`;
 
       const childStartMs = pStartMs + Math.round(((seg.from_turn - 1) / totalTurns) * totalDurMs);
       const childEndMs = pStartMs + Math.round((seg.to_turn / totalTurns) * totalDurMs);
@@ -595,10 +624,10 @@ reviewRouter.post('/unmatched/:id/split', async (req, res) => {
       const childEndsAt = new Date(childEndMs).toISOString();
 
       const child = await pool.query<{ id: string }>(
-        `INSERT INTO conversations (bee_id, starts_at, ends_at, transcript, source, parent_conversation_id, turn_range, correlation_status, appointment_id, client_id)
+        `INSERT INTO conversations (source_id, starts_at, ends_at, transcript, source, parent_conversation_id, turn_range, correlation_status, appointment_id, client_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
         [
-          newBeeId,
+          childSourceId,
           childStartsAt,
           childEndsAt,
           slicedText,
@@ -630,7 +659,10 @@ reviewRouter.post('/unmatched/:id/split', async (req, res) => {
     logError('review.split', 'conversation split failed', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
   }
-});
+}
+
+reviewRouter.post('/unmatched/:id/split', handleSplitConversation);
+reviewRouter.post('/conversations/:id/split', handleSplitConversation);
 
 // POST /review/conversations/:id/unmatch — detach a recording from the wrong client.
 //

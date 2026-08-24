@@ -202,6 +202,20 @@ export const llmConfig = {
     process.env.LLM_MAX_TOKENS_CEILING ??
       (provider === 'openrouter' ? 96_000 : provider === 'google' ? 60_000 : 32_768),
   ),
+  /**
+   * How many times the truncation retry may double before giving up.
+   *
+   * One was not enough and the ceiling was never the reason. The narrative stage
+   * started at 20,000 (8,000 budget + 12,000 reasoning headroom), doubled once to
+   * 40,000, truncated again and threw — with `maxTokensCeiling` sitting at 96,000
+   * and more than half of it never asked for. The stage came back partial and the
+   * only lever anyone reached for was an env var and a manual re-run.
+   *
+   * Three rungs reach the ceiling from any sane starting budget. They cost
+   * requests, not tokens on a request-metered tier, and only on a session that
+   * has already demonstrated it needs the room.
+   */
+  truncationRetries: Number(process.env.LLM_TRUNCATION_RETRIES ?? 3),
 
   // Split a long transcript into chunks above this many input tokens. Below it a
   // single call sees the whole session and reads better; above it, long-context

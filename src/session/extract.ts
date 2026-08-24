@@ -30,7 +30,16 @@ import { protocolPrompt } from './prompts/protocol';
 import { nrtPrompt } from './prompts/nrt';
 import { PROMPT_VERSION, type PromptContext } from './prompts/shared';
 import { matchCatalog } from './supplementName';
-import { chunkTurns, formatStamp, prepareTranscript, renderTurns, type Chunk } from './transcript';
+import {
+  chunkTurns,
+  compactForNarrative,
+  formatStamp,
+  prepareTranscript,
+  renderTurns,
+  type Chunk,
+  type PreparedTranscript,
+  type Turn,
+} from './transcript';
 import { summarize, verifyEvidence } from './verifyEvidence';
 import { findUnstatedNumbers } from './verifyNumbers';
 
@@ -103,6 +112,20 @@ interface Stage {
    */
   alwaysWindow?: boolean;
   /**
+   * Which turns this stage's windows are cut from.
+   *
+   * Not every stage reads the same text. The narrative pass reads the session
+   * with boilerplate stripped — scheduling chatter, "can you hear me", the
+   * goodbyes — because none of it is a concern or a goal, and paying window
+   * budget for it means fewer real turns per window. The clinical stages read
+   * every turn, since a finding can be stated in the middle of small talk.
+   *
+   * Defaults to all turns. Whatever this returns, the turns keep their GLOBAL
+   * index, so a citation from a compacted window still resolves against the
+   * full transcript.
+   */
+  windowTurns?: (prepared: PreparedTranscript) => Turn[];
+  /**
    * Output budget for THIS stage, sized to what its schema can actually emit.
    *
    * A blanket budget is not free: providers bill requested completion tokens
@@ -125,13 +148,37 @@ const STAGES: Stage[] = [
     jsonSchema: NARRATIVE_JSON_SCHEMA,
     parse: (raw) => NarrativeStageSchema.parse(raw),
     chunked: false,
-    // The largest output by a wide margin: every concern, goal, assessment and
-    // follow-up in the session, each paired with a verbatim evidence quote — and
-    // it sees the WHOLE transcript, not a chunk of it. 3000 was not a budget,
-    // it was a recall cap: a full appointment states twenty-odd assessments, and
-    // a model that senses it cannot fit them all does not truncate loudly, it
-    // summarises quietly. Fewer, vaguer findings is the exact failure Nicole
-    // reported, and it left no trace in the logs.
+    // Reads in windows, for the same reason assessments does — and for one more.
+    //
+    // The recall argument first: concerns arrive scattered and in passing, and a
+    // model reading 8,000 tokens for the fifteenth one skims. That was the
+    // measured effect on assessments (67% -> 78% recall, 1.0 -> 1.67 findings per
+    // turn read), and this stage lists the same shape of thing.
+    //
+    // The one that forced it: this stage's output GREW WITH THE SESSION and
+    // nothing bounded it. Every concern, goal, follow-up and lifestyle slot in a
+    // full hour, each with a verbatim quote, in one response. A 6,600-token
+    // session fit; an 8,100-token one truncated, retried at double, and truncated
+    // again — so the stage came back `partial` and the fix was to raise a number
+    // and re-run by hand. That is not a fix, it is a standing chore, and it fails
+    // on whichever session is longest rather than on any session we tested.
+    //
+    // Windowing removes the treadmill: output per call is bounded by the WINDOW,
+    // which is a constant, so a two-hour session costs more calls rather than one
+    // call that cannot fit. `mergeChunkNotes` already unions every field this
+    // stage emits (concerns/goals as string arrays, follow_ups deduped, lifestyle
+    // slot-merged, evidence re-pathed), and the shared preamble already tells a
+    // window to extract only what it states and not to summarise the session.
+    //
+    // Set EXTRACTION_WINDOW_NARRATIVE=false to go back to one whole-session call.
+    alwaysWindow: process.env.EXTRACTION_WINDOW_NARRATIVE !== 'false',
+    // Windows are cut from the boilerplate-stripped turns: scheduling talk and
+    // goodbyes are never a concern, and spending window budget on them means
+    // fewer real turns read at a time.
+    windowTurns: (prepared) => compactForNarrative(prepared.turns),
+    // Sized for ONE window now, not for a whole session. Still generous — a
+    // 2,500-token window cannot state more findings than this holds — and
+    // truncation still ladders up from here.
     maxTokens: Number(process.env.LLM_MAX_TOKENS_NARRATIVE ?? 8000),
   },
   {
@@ -232,7 +279,8 @@ async function callStage(
   const ceiling = Math.min(explicitCap, Math.floor(llmConfig.tokensPerMinute / 2));
   let maxTokens = ceiling + llmConfig.reasoningHeadroomTokens;
   let rateLimitRetries = 0;
-  for (let attempt = 0; ; attempt++) {
+  let growthRetries = 0;
+  for (;;) {
     try {
       const { parsed } = await generateStructured({
         system,
@@ -262,12 +310,31 @@ async function callStage(
         await sleep(Math.min(waitMs, 60_000));
         continue;
       }
-      const canGrow = err instanceof TruncatedOutputError && maxTokens < llmConfig.maxTokensCeiling;
-      if (!canGrow || attempt >= 1) throw err;
+      // Truncation gets its OWN counter, not the shared loop counter.
+      //
+      // It used to test `attempt >= 1`, and `attempt` increments on the
+      // rate-limit path too — so a stage that waited out a single 429 arrived at
+      // its first truncation with the growth allowance already spent and threw
+      // without ever retrying bigger. The two failures are unrelated and must not
+      // share a budget.
+      //
+      // And it ladders more than once. One doubling put the narrative stage at
+      // 40,000 against a ceiling of 96,000: it gave up with more than half the
+      // allowed budget unused, and the operator's only recourse was to raise an
+      // env var and re-run by hand. Each rung costs one request and only happens
+      // on a session that has already proved it needs the room.
+      const canGrow =
+        err instanceof TruncatedOutputError &&
+        maxTokens < llmConfig.maxTokensCeiling &&
+        growthRetries < llmConfig.truncationRetries;
+      if (!canGrow) throw err;
+      growthRetries++;
       maxTokens = Math.min(maxTokens * 2, llmConfig.maxTokensCeiling);
       logEvent('warn', 'session.extract', 'output truncated — retrying with a larger budget', {
         stage: stage.name,
+        attempt: growthRetries,
         max_tokens: maxTokens,
+        ceiling: llmConfig.maxTokensCeiling,
       });
     }
   }
@@ -354,12 +421,24 @@ export async function extractSessionNote(
   // capacity: it is small because a model reading 7,000 tokens for the twentieth
   // finding skims, not because 7,000 tokens do not fit. So this is sized in
   // absolute terms and does not move when the provider does.
-  const windowPlan = STAGES.some((s) => s.alwaysWindow)
-    ? chunkTurns(prepared.turns, {
+  //
+  // Per stage, because stages do not all read the same turns: narrative reads the
+  // boilerplate-stripped set, the clinical stages read every turn. Memoised on
+  // the selector so two stages reading the same turns share one plan rather than
+  // re-cutting it.
+  const windowPlans = new Map<Stage['windowTurns'], Chunk[]>();
+  const windowPlanFor = (stage: Stage): Chunk[] => {
+    const key = stage.windowTurns;
+    let plan = windowPlans.get(key);
+    if (!plan) {
+      plan = chunkTurns(key ? key(prepared) : prepared.turns, {
         targetTokens: llmConfig.windowTokens,
         overlapTurns: llmConfig.chunkOverlapTurns,
-      })
-    : [];
+      });
+      windowPlans.set(key, plan);
+    }
+    return plan;
+  };
 
   const partial: string[] = [];
   const conflicts: { path: string; chosen: string | null; candidates: string[] }[] = [];
@@ -491,16 +570,11 @@ export async function extractSessionNote(
       // Not a fallback: this stage reads in windows by choice. Only when there
       // is more than one window, since a session short enough to be a single
       // window is already being read the way this asks for.
-      const wantsWindows = !!stage.alwaysWindow && windowPlan.length > 1;
-      if (mustChunk && !stage.chunked) {
-        logEvent('info', 'session.extract', 'transcript exceeds a single call — chunking up front', {
-          stage: stage.name,
-          tokens: prepared.tokens,
-          threshold: llmConfig.chunkThresholdTokens,
-          chunks: chunkPlan.length,
-        });
-        partial.push(`${stage.name}:chunked`);
-      }
+      const windowPlan = stage.alwaysWindow ? windowPlanFor(stage) : [];
+      const wantsWindows = windowPlan.length > 1;
+      // Windows first, and no `:chunked` marker with them. A windowed stage is
+      // not degrading to fit — windows ARE its reading — so labelling the note
+      // partial for it would cry wolf on every long session.
       if (wantsWindows) {
         logEvent('info', 'session.extract', 'reading in windows by design', {
           stage: stage.name,
@@ -509,6 +583,15 @@ export async function extractSessionNote(
           window_tokens: llmConfig.windowTokens,
         });
         return runChunked(windowPlan);
+      }
+      if (mustChunk && !stage.chunked) {
+        logEvent('info', 'session.extract', 'transcript exceeds a single call — chunking up front', {
+          stage: stage.name,
+          tokens: prepared.tokens,
+          threshold: llmConfig.chunkThresholdTokens,
+          chunks: chunkPlan.length,
+        });
+        partial.push(`${stage.name}:chunked`);
       }
       return (shouldChunk && stage.chunked) || mustChunk ? runChunked() : runWhole();
     }),

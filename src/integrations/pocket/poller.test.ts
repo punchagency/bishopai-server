@@ -77,7 +77,12 @@ describe('pollPocketRecordings', () => {
     const d = deps({
       ingest: vi.fn(async () => ({
         conversationId: 'conv-9',
-        correlation: { status: 'matched' as const, appointmentId: 'appt-1', clientId: 'client-1' },
+        correlation: {
+          status: 'matched' as const,
+          appointmentId: 'appt-1',
+          clientId: 'client-1',
+          overlapSeconds: 1800,
+        },
       })),
     });
     const r = await pollPocketRecordings(d, NOW);

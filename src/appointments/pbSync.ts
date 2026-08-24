@@ -6,6 +6,7 @@ import { clientRecordName } from '../integrations/pb/types';
 import type { PbSession } from '../integrations/pb/types';
 import { detectCheckout } from '../checkout/machine';
 import { enrollCancelledAppointment } from '../reengagement/cancellations';
+import { recorrelateOverlappingConversations } from '../correlation/correlate';
 
 // PB sessions poll — the localhost-safe substitute for PB's session/booking
 // webhooks (`/webhooks/pb/session`, `/webhooks/pb/booking`), which PB can only
@@ -150,6 +151,22 @@ export async function syncSessionsFromPb(now: Date = new Date()): Promise<Sessio
       );
       upserted++;
       const appointmentId = apptRes.rows[0].id;
+
+      // Re-evaluate any recent recordings that arrived before this appointment synced.
+      // Awaited so failures surface in the sync log rather than silently dropping
+      // a recording that could have been matched.
+      const dbClient = await pool.connect();
+      try {
+        await recorrelateOverlappingConversations(dbClient, s.sessionDate, endsAt);
+      } catch (e) {
+        logError('pbSync.recorrelate', 're-correlation failed', e, {
+          appointment_id: appointmentId,
+          starts_at: s.sessionDate,
+          ends_at: endsAt,
+        });
+      } finally {
+        dbClient.release();
+      }
 
       if (status !== prevStatus) {
         if (status === 'completed') {

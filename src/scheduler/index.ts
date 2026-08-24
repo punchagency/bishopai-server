@@ -2,7 +2,6 @@ import cron, { type ScheduledTask } from 'node-cron';
 import { logError, logEvent } from '../observability/logger';
 import type { Job } from './types';
 import { reengagementJob } from './jobs/reengagement';
-import { outboundDispatchJob } from './jobs/outboundDispatch';
 import { refillsJob } from './jobs/refills';
 import { maintenanceJob } from './jobs/maintenance';
 import { firstAppointmentJob } from './jobs/firstAppointment';
@@ -15,13 +14,13 @@ import { sessionsPollJob } from './jobs/sessionsPoll';
 import { extractionJob } from './jobs/extraction';
 import { pocketPollJob } from './jobs/pocketPoll';
 import { pocketPostSessionJob } from './jobs/pocketPostSession';
+import { correlationSweepJob } from './jobs/correlationSweep';
 
 // In-process scheduler for the WF3/WF4 cadences (§14). Opt-in via
 // SCHEDULER_ENABLED=true so dev/tests don't run background jobs. Each tick is
 // wrapped so one failing job never takes down the timer or the process.
 const jobs: Job[] = [
   reengagementJob,
-  outboundDispatchJob,
   refillsJob,
   maintenanceJob,
   firstAppointmentJob,
@@ -34,6 +33,7 @@ const jobs: Job[] = [
   extractionJob,
   pocketPollJob,
   pocketPostSessionJob,
+  correlationSweepJob,
 ];
 let tasks: ScheduledTask[] = [];
 
