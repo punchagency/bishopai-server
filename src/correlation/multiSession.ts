@@ -1,4 +1,4 @@
-import { parseTranscript } from '../session/transcript';
+import { findSessionRestart, parseTranscript } from '../session/transcript';
 
 /**
  * Does this recording look like it holds more than one client's consultation?
@@ -121,6 +121,17 @@ export function assessMultiSessionRisk(opts: {
   if (speakers >= SPEAKER_LABEL_HOLD_THRESHOLD) {
     reasons.push(
       `${speakers} distinct speakers in the audio — a two-person consultation diarizes to 2, occasionally 3`,
+    );
+  }
+
+  // The signal that does not depend on the calendar, on diarization, or on
+  // anyone's name being spoken. Two consecutive consultations reuse the same two
+  // speaker labels and may never name a client, but the handover is always
+  // audible: one client leaves and the next is greeted.
+  const restartTurn = findSessionRestart(transcript);
+  if (restartTurn !== null) {
+    reasons.push(
+      `a second consultation appears to begin at turn ${restartTurn} — one client is sent off and another is greeted`,
     );
   }
 

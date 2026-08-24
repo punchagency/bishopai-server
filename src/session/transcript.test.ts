@@ -6,9 +6,11 @@ import {
   attributionCoverage,
   chunkTurns,
   compactForNarrative,
+  findSessionRestart,
   mergeAdjacentTurns,
   parseTranscript,
   prepareTranscript,
+  prepareTurns,
   renderTurns,
 } from './transcript';
 
@@ -271,5 +273,100 @@ describe('turn numbering', () => {
     expect(kept).toHaveLength(1);
     expect(kept[0].index).toBe(1);
     expect(renderTurns(kept)).toContain('#1 ');
+  });
+});
+
+// The handover below is transcribed verbatim from recording 92f683ed
+// (2026-08-21, 180 turns). It is the case every other multi-session signal
+// misses: the diarizer reused SPEAKER_01 for BOTH clients, so the audio shows
+// two labels, and no client is ever named aloud. The only evidence that two
+// people were in the room is the handover itself.
+const filler = (n: number): string[] =>
+  Array.from({ length: n }, (_, i) =>
+    i % 2 === 0
+      ? `SPEAKER_00: Keep the magnesium going, and we will look at it again. Line ${i}.`
+      : `SPEAKER_01: Okay, that makes sense to me. Line ${i}.`,
+  );
+
+const realHandover = [
+  ...filler(160),
+  'SPEAKER_00: So five thirty the twenty-third.',
+  'SPEAKER_01: Five thirty. No problem. Thanks.',
+  'SPEAKER_00: Have fun. Hello.',
+  'SPEAKER_01: Hi.',
+  'SPEAKER_00: How are you?',
+  "SPEAKER_01: I'm good. Oh, you're struggling.",
+].join('\n');
+
+describe('findSessionRestart', () => {
+  it('finds the handover the diarizer and the calendar both miss', () => {
+    // Two speaker labels and no names spoken: the >=4-label signal and the
+    // foreign-name signal are both structurally blind here.
+    expect(new Set(parseTranscript(realHandover).map((t) => t.speaker)).size).toBe(2);
+    expect(findSessionRestart(realHandover)).toBe(163);
+  });
+
+  it('reports the turn in parseTurns numbering, not parseTranscript numbering', () => {
+    // parseTranscript does not merge adjacent same-speaker turns, so its indices
+    // drift from the ones the review UI renders and the splitter cuts on. A
+    // number in the wrong scheme silently moves the cut.
+    const merged = [
+      ...filler(160),
+      'SPEAKER_00: So five thirty the twenty-third.',
+      'SPEAKER_00: Have fun. Hello.',
+      'SPEAKER_01: Hi.',
+    ].join('\n');
+    const at = findSessionRestart(merged);
+    expect(at).not.toBeNull();
+    // The two consecutive SPEAKER_00 lines are ONE turn after merging.
+    expect(parseTranscript(merged).length).toBeGreaterThan(prepareTurns(merged).length);
+    expect(prepareTurns(merged)[at! - 1].text).toContain('Hello');
+  });
+
+  it('ignores the opening greeting of a normal consultation', () => {
+    const normal = [
+      'SPEAKER_00: Hi, come on in. How are you?',
+      "SPEAKER_01: I'm good, thanks for fitting me in.",
+      ...filler(80),
+    ].join('\n');
+    expect(findSessionRestart(normal)).toBeNull();
+  });
+
+  it('does not fire on a greeting nobody answers', () => {
+    // The practitioner waving someone through the door mid-session is not a
+    // handover; an arriving client always produces an exchange.
+    const unanswered = [
+      ...filler(80),
+      'SPEAKER_00: Hey, one second, let me grab that.',
+      'SPEAKER_00: So the magnesium is what I want you to keep.',
+      ...filler(20),
+    ].join('\n');
+    expect(findSessionRestart(unanswered)).toBeNull();
+  });
+
+  it('does not fire when the same speaker greets and continues', () => {
+    const solo = [
+      ...filler(80),
+      'SPEAKER_00: Hello, so as I was saying.',
+      'SPEAKER_00: How are you finding the drops?',
+      ...filler(20),
+    ].join('\n');
+    expect(findSessionRestart(solo)).toBeNull();
+  });
+
+  it('will not call a short recording two sessions', () => {
+    const short = [
+      'SPEAKER_00: Take care, see you in four weeks.',
+      'SPEAKER_00: Hello.',
+      'SPEAKER_01: Hi, how are you?',
+    ].join('\n');
+    expect(findSessionRestart(short)).toBeNull();
+  });
+
+  it('treats "how are you" as an answer but never as an opener', () => {
+    // Mid-session small talk is overwhelmingly the status form, so on its own it
+    // must not start a handover.
+    const smallTalk = [...filler(80), 'SPEAKER_00: How are you doing with all that?', 'SPEAKER_01: Fine, mostly.', ...filler(20)].join('\n');
+    expect(findSessionRestart(smallTalk)).toBeNull();
   });
 });

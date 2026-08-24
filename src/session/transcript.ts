@@ -482,6 +482,74 @@ export function compactForNarrative(turns: Turn[], threshold = 0.5): Turn[] {
   return turns.filter((t) => boilerplateRatio(t.text) < threshold);
 }
 
+// --- Session-restart detection ----------------------------------------------
+
+/**
+ * Words spoken when someone ARRIVES. A single consultation contains exactly one
+ * of these exchanges, at the top, so a second one deeper in the recording means
+ * a second person walked in.
+ *
+ * This exists because every other multi-session signal is blind to the case that
+ * actually happens most often here. Nicole records back-to-back clients
+ * continuously, and when two consultations are cleanly sequential the diarizer
+ * does NOT open new labels for them — it reuses SPEAKER_01 for the second
+ * client, because it is separating voices, not people. Measured on the
+ * 2026-08-21 recording (`92f683ed`, 180 turns, two clients): two speaker labels,
+ * so the >=4-label signal cannot fire, and no client name is ever spoken, so the
+ * foreign-name signal cannot fire either. What IS in the transcript, in plain
+ * words, is one client saying goodbye and the next saying hello.
+ */
+const ARRIVAL_GREETING =
+  /\b(hi|hello|hey|welcome|come on in|come in|have a seat|good to see you|nice to see you|what brings you|next patient)\b/i;
+
+/**
+ * Spoken in an arrival exchange, but also constantly in the middle of one
+ * ("how are you" is small talk as often as it is a greeting). It may ANSWER an
+ * arrival greeting; it may never open one on its own. Requiring the opener to
+ * be an ARRIVAL_GREETING is what keeps mid-session chat from scoring.
+ */
+const STATUS_GREETING = /\b(how are you|how are we|how(?:'ve| have) you been|how you doing)\b/i;
+
+/** Below this a recording is too short to plausibly hold two consultations. */
+const MIN_TURNS_FOR_RESTART = 30;
+/** The opening greeting is legitimate; only look past it. */
+const MIN_OPENING_TURNS = 8;
+const OPENING_SHARE = 0.1;
+/** A greeting is answered immediately or it was not a greeting. */
+const GREETING_REPLY_WINDOW = 2;
+
+/**
+ * The turn at which a NEW consultation appears to begin, or null.
+ *
+ * Deliberately requires a two-party EXCHANGE — an arrival greeting from one
+ * speaker answered by a different speaker within a turn or two — rather than a
+ * lone "hi". A practitioner greeting someone at the door mid-session, or a
+ * stray "hey" inside a sentence, does not produce an exchange; an arriving
+ * client does.
+ *
+ * Returns a 1-based index in `parseTurns` numbering, which is what the review
+ * UI renders and what the splitter's `from_turn`/`to_turn` mean. `parseTranscript`
+ * numbering is NOT the same (it does not merge adjacent same-speaker turns:
+ * 208 vs 180 on the recording above) and mixing the two silently moves a cut.
+ */
+export function findSessionRestart(raw: string): number | null {
+  const turns = prepareTurns(raw);
+  if (turns.length < MIN_TURNS_FOR_RESTART) return null;
+
+  const openingEnd = Math.max(MIN_OPENING_TURNS, Math.ceil(turns.length * OPENING_SHARE));
+  for (let i = openingEnd; i < turns.length - 1; i++) {
+    if (!ARRIVAL_GREETING.test(turns[i].text)) continue;
+    const limit = Math.min(i + GREETING_REPLY_WINDOW, turns.length - 1);
+    for (let j = i + 1; j <= limit; j++) {
+      if (turns[j].speaker === turns[i].speaker) continue;
+      if (ARRIVAL_GREETING.test(turns[j].text) || STATUS_GREETING.test(turns[j].text)) {
+        return turns[i].index + 1;
+      }
+    }
+  }
+  return null;
+}
+
 // --- Sizing + chunking -------------------------------------------------------
 
 /** Rough token estimate. ~4 chars/token is close enough to size a budget, and

@@ -153,3 +153,57 @@ describe('gate behaviour overall', () => {
     expect(risk.reasons).toHaveLength(3);
   });
 });
+
+describe('session-restart signal', () => {
+  // Recording 92f683ed (2026-08-21) is the case that motivated this signal: two
+  // consecutive clients, TWO diarized labels because the second client inherited
+  // SPEAKER_01, no client named aloud, and — on the day — a single overlapping
+  // appointment would have been enough to file it. Every other signal here is
+  // structurally blind to it.
+  const filler = (n: number): string[] =>
+    Array.from({ length: n }, (_, i) =>
+      i % 2 === 0
+        ? `SPEAKER_00: Keep the magnesium going and we will look again. Line ${i}.`
+        : `SPEAKER_01: Okay, that makes sense. Line ${i}.`,
+    );
+
+  const backToBack = [
+    ...filler(160),
+    'SPEAKER_00: So five thirty the twenty-third.',
+    'SPEAKER_01: Five thirty. No problem. Thanks.',
+    'SPEAKER_00: Have fun. Hello.',
+    'SPEAKER_01: Hi.',
+    'SPEAKER_00: How are you?',
+  ].join('\n');
+
+  it('holds a two-label, unnamed, single-appointment recording that no other signal catches', () => {
+    expect(speakerLabelCount(backToBack)).toBeLessThan(4);
+
+    const risk = assessMultiSessionRisk({
+      transcript: backToBack,
+      candidates: [{ appointmentId: 'a1', clientName: 'Amber Stack', overlapSeconds: 1259 }],
+      matchedClientName: 'Amber Stack',
+    });
+
+    expect(risk.hold).toBe(true);
+    expect(risk.reasons).toHaveLength(1);
+    expect(risk.reasons[0]).toMatch(/second consultation appears to begin at turn \d+/);
+  });
+
+  it('leaves an ordinary single consultation alone', () => {
+    const ordinary = [
+      'SPEAKER_00: Hi, come on in. How are you today?',
+      "SPEAKER_01: Good, thanks.",
+      ...filler(120),
+    ].join('\n');
+
+    const risk = assessMultiSessionRisk({
+      transcript: ordinary,
+      candidates: [{ appointmentId: 'a1', clientName: 'Amber Stack', overlapSeconds: 1500 }],
+      matchedClientName: 'Amber Stack',
+    });
+
+    expect(risk.hold).toBe(false);
+    expect(risk.reasons).toEqual([]);
+  });
+});

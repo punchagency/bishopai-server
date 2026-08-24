@@ -1,6 +1,6 @@
 import { logEvent } from '../observability/logger';
 import { generateStructured } from '../llm/providers';
-import { prepareTurns, type Role } from './transcript';
+import { estimateTokens, prepareTurns, type Role } from './transcript';
 import { z } from 'zod';
 
 export interface TurnSegment {
@@ -106,6 +106,53 @@ export function parseTurns(transcript: string): TurnSegment[] {
     text: t.text,
     role: bySpeaker.get(t.speaker) ?? t.role,
   }));
+}
+
+/**
+ * Per-turn character caps, widest first. Boundary detection needs every TURN,
+ * but it does not need every WORD of every turn: a handover is visible in
+ * "Have fun. Hello." / "Hi." — short lines by nature — while the budget is eaten
+ * by long clinical explanations, which is not where sessions change.
+ *
+ * So when a transcript is too large we shorten turns rather than drop them. The
+ * previous code did the opposite: it sent the first 50 and last 50 turns and
+ * discarded the middle, which makes a boundary anywhere in the middle of a long
+ * recording undetectable at any temperature — the model is never shown it.
+ */
+const TURN_TEXT_CAPS = [240, 160, 100, 60, 40] as const;
+
+/**
+ * Ceiling for the rendered transcript, in estimated tokens.
+ *
+ * Deliberately generous. Measured over the ten production recordings on
+ * 2026-08-24 the largest full-hour consultation rendered to ~8k tokens, so in
+ * practice every real transcript is sent whole at the widest cap and the ladder
+ * below never engages. It exists for the recording that is one day far longer
+ * than anything we have seen, not for the ones we have.
+ */
+const PROMPT_TOKEN_CEILING = Number(process.env.SEGMENTER_PROMPT_TOKENS ?? 120_000);
+
+/** A human is waiting on this, but a model call is not a 4-second operation. */
+const LLM_TIMEOUT_MS = Number(process.env.SEGMENTER_LLM_TIMEOUT_MS ?? 30_000);
+
+/**
+ * Render every turn for the boundary prompt, narrowing turn text until the whole
+ * thing fits. Never drops a turn.
+ */
+export function renderTurnsForBoundaryPrompt(
+  turns: readonly TurnSegment[],
+  ceiling: number = PROMPT_TOKEN_CEILING,
+): { lines: string[]; cap: number; fits: boolean } {
+  for (const cap of TURN_TEXT_CAPS) {
+    const lines = turns.map((t) => `#${t.index} ${t.speaker}: ${t.text.slice(0, cap)}`);
+    if (estimateTokens(lines.join('\n')) <= ceiling) return { lines, cap, fits: true };
+  }
+  const cap = TURN_TEXT_CAPS[TURN_TEXT_CAPS.length - 1];
+  return {
+    lines: turns.map((t) => `#${t.index} ${t.speaker}: ${t.text.slice(0, cap)}`),
+    cap,
+    fits: false,
+  };
 }
 
 /**
@@ -245,15 +292,14 @@ export async function detectSessionBoundaries(
   if (turns.length >= 20 && (boundaryTurns.length === 1 || heuristicsUndercount)) {
     let timerId: NodeJS.Timeout | undefined;
     try {
-      const headTurns = turns.slice(0, 50);
-      const tailTurns = turns.length > 50 ? turns.slice(-50) : [];
-      const omittedCount = turns.length - (headTurns.length + (turns.length > 50 ? tailTurns.length : 0));
-
-      const turnSummaryLines = [
-        ...headTurns.map((t) => `#${t.index} ${t.speaker}: ${t.text.slice(0, 100)}`),
-        ...(omittedCount > 0 ? [`... [${omittedCount} turns omitted] ...`] : []),
-        ...(turns.length > 50 ? tailTurns.map((t) => `#${t.index} ${t.speaker}: ${t.text.slice(0, 100)}`) : []),
-      ];
+      const rendered = renderTurnsForBoundaryPrompt(turns);
+      const turnSummaryLines = rendered.lines;
+      if (!rendered.fits) {
+        logEvent('warn', 'segmenter.prompt_narrowed', 'transcript exceeded the prompt ceiling at every cap', {
+          total_turns: turns.length,
+          turn_text_cap: rendered.cap,
+        });
+      }
 
       const calendarHint =
         calendarSessionCount >= 2
@@ -283,11 +329,11 @@ ${turnSummaryLines.join('\n')}`;
           },
           required: ['boundary_turns'],
         },
-        maxTokens: 300,
+        maxTokens: 1000,
       });
 
       const timeoutPromise = new Promise<null>((resolve) => {
-        timerId = setTimeout(() => resolve(null), 4000);
+        timerId = setTimeout(() => resolve(null), LLM_TIMEOUT_MS);
       });
 
       const res = await Promise.race([llmPromise, timeoutPromise]);

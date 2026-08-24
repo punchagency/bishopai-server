@@ -58,7 +58,6 @@ export const correlationSweepJob: Job = {
       for (const conv of rows) {
         try {
           const res = await correlateConversation(db, conv.starts_at, conv.ends_at);
-          if (res.status !== 'matched') continue;
 
           // The sweep gets the same veto the ingest path does. Without it this
           // job is a second, slower door to the identical bug: it re-runs the
@@ -66,12 +65,24 @@ export const correlationSweepJob: Job = {
           // holds three consultations is exactly the kind that sits unmatched
           // (its neighbours are ambiguous) until a late calendar sync leaves one
           // candidate standing and the matcher files the lot under that client.
+          //
+          // The gate runs BEFORE the matcher's verdict is acted on, and runs
+          // whether or not that verdict was 'matched'. Gating only would-be
+          // matches inverts the priority: a recording holding two clients is
+          // ambiguous almost by definition — two appointments overlap it and
+          // neither wins — so the matcher returns 'unmatched' and the recording
+          // that most needs a human sits in the queue labelled only 'unmatched',
+          // with nothing saying why. Measured on the six unmatched recordings in
+          // production on 2026-08-24, the matcher returned 'unmatched' for every
+          // one, so a gate placed after that check never executed at all.
           const candidates = await listOverlapCandidates(db, conv.starts_at, conv.ends_at);
+          const matchedAppointmentId = res.status === 'matched' ? res.appointmentId : null;
           const risk = assessMultiSessionRisk({
             transcript: conv.transcript,
             candidates,
-            matchedClientName:
-              candidates.find((c) => c.appointmentId === res.appointmentId)?.clientName ?? null,
+            matchedClientName: matchedAppointmentId
+              ? candidates.find((c) => c.appointmentId === matchedAppointmentId)?.clientName ?? null
+              : null,
           });
           if (risk.hold) {
             await db.query(
@@ -85,11 +96,19 @@ export const correlationSweepJob: Job = {
             held++;
             logEvent('warn', 'correlation.sweep', 'sweep declined to match — held for review', {
               conversation_id: conv.id,
-              would_have_matched: res.appointmentId,
+              // Null when the matcher had no verdict to veto. That is the
+              // common case for a multi-client recording, not an odd one:
+              // 'ambiguous' is what two overlapping appointments produce.
+              would_have_matched: matchedAppointmentId,
+              matcher_status: res.status === 'matched' ? 'matched' : res.reason,
               reasons: risk.reasons,
             });
             continue;
           }
+
+          // Not held, and the matcher found nothing to file it under: leave it
+          // in the unmatched queue for the next sweep.
+          if (res.status !== 'matched') continue;
 
           const updated = await db.query<{ id: string }>(
             `UPDATE conversations

@@ -90,20 +90,29 @@ async function ingestOnce(input: ConversationInput, retryOnTaken: boolean): Prom
                 -- would otherwise keep that match forever, even once the words
                 -- revealed three clients in it.
                 --
-                -- Only an AUTO match is demoted. 'manual' and 'walk_in' are a
+                -- Only an AUTO status is touched. 'manual' and 'walk_in' are a
                 -- human's decision about whose session this is, and a heuristic
                 -- does not get to overrule one.
+                --
+                -- 'unmatched' is included for the same reason 'matched' is, and
+                -- it is the commoner case. Audio arrives before words, and a
+                -- recording with no transcript reaches the gate with nothing to
+                -- read, so it lands in the queue as plain 'unmatched'. When the
+                -- transcript finally arrives this is the moment the gate can
+                -- see two clients in it — and demoting only from 'matched'
+                -- meant that recording kept a bare 'unmatched' label, with no
+                -- hold reason and nothing telling Nicole to split it.
                 correlation_status = CASE
-                  WHEN $10::boolean AND conversations.correlation_status = 'matched'
+                  WHEN $10::boolean AND conversations.correlation_status IN ('matched', 'unmatched')
                     THEN 'needs_review' ELSE conversations.correlation_status END,
                 appointment_id = CASE
-                  WHEN $10::boolean AND conversations.correlation_status = 'matched'
+                  WHEN $10::boolean AND conversations.correlation_status IN ('matched', 'unmatched')
                     THEN NULL ELSE conversations.appointment_id END,
                 client_id = CASE
-                  WHEN $10::boolean AND conversations.correlation_status = 'matched'
+                  WHEN $10::boolean AND conversations.correlation_status IN ('matched', 'unmatched')
                     THEN NULL ELSE conversations.client_id END,
                 correlation_hold_reason = CASE
-                  WHEN $10::boolean AND conversations.correlation_status = 'matched'
+                  WHEN $10::boolean AND conversations.correlation_status IN ('matched', 'unmatched')
                     THEN $11::text ELSE conversations.correlation_hold_reason END
          RETURNING id, appointment_id, client_id, correlation_overlap_seconds, correlation_status`,
       [

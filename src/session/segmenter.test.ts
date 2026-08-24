@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { parseTurns, detectSessionBoundaries, sliceTranscriptByTurnRange } from './segmenter';
+import {
+  parseTurns,
+  detectSessionBoundaries,
+  renderTurnsForBoundaryPrompt,
+  sliceTranscriptByTurnRange,
+} from './segmenter';
 import { prepareTurns } from './transcript';
 
 /** A stretch of ordinary consultation: alternating turns, clinical vocabulary
@@ -242,5 +247,50 @@ Nicole: See https://fullscript.com/x for the link.`);
       const sliced = sliceTranscriptByTurnRange(transcript, 10, 25);
       expect(parseTurns(sliced)).toHaveLength(16);
     });
+  });
+});
+
+describe('renderTurnsForBoundaryPrompt', () => {
+  const longTranscript = Array.from({ length: 200 }, (_, i) =>
+    i % 2 === 0
+      ? `SPEAKER_00: Let us keep the magnesium where it is and review it next time. Turn ${i}.`
+      : `SPEAKER_01: That sounds right to me, I have been taking it with food. Turn ${i}.`,
+  ).join('\n');
+
+  it('sends every turn, including the middle of a long recording', () => {
+    // The bug this replaces: head-50 + tail-50 with the middle discarded, which
+    // made a boundary anywhere in the middle undetectable — the model was never
+    // shown the turns it would have to point at.
+    const turns = parseTurns(longTranscript);
+    const { lines } = renderTurnsForBoundaryPrompt(turns);
+
+    expect(lines).toHaveLength(turns.length);
+    expect(lines.join('\n')).not.toContain('turns omitted');
+    for (const idx of [1, 60, 100, 140, turns.length]) {
+      expect(lines.some((l) => l.startsWith(`#${idx} `))).toBe(true);
+    }
+  });
+
+  it('uses the widest cap when the transcript fits, which is every real one', () => {
+    const { cap, fits } = renderTurnsForBoundaryPrompt(parseTurns(longTranscript));
+    expect(fits).toBe(true);
+    expect(cap).toBe(240);
+  });
+
+  it('narrows turn text rather than dropping turns when the ceiling is tight', () => {
+    const turns = parseTurns(longTranscript);
+    const tight = renderTurnsForBoundaryPrompt(turns, 900);
+
+    // Still every turn — a short handover line survives narrowing intact, which
+    // is the whole point: boundaries live in short turns, budget is eaten by long ones.
+    expect(tight.lines).toHaveLength(turns.length);
+    expect(tight.cap).toBeLessThan(240);
+  });
+
+  it('reports fits=false rather than silently dropping turns it cannot fit', () => {
+    const turns = parseTurns(longTranscript);
+    const impossible = renderTurnsForBoundaryPrompt(turns, 10);
+    expect(impossible.fits).toBe(false);
+    expect(impossible.lines).toHaveLength(turns.length);
   });
 });
