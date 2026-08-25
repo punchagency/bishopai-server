@@ -65,7 +65,7 @@ export async function processConversation(conversationId: string): Promise<void>
         -- above already blocks it; this states the rule the reader needs anyway,
         -- because "must never reach a chart" is the whole reason that state
         -- exists and it should not depend on a NULL two lines up staying NULL.
-        AND c.correlation_status <> 'needs_review'
+        AND c.correlation_status NOT IN ('needs_review', 'split')
         AND c.extraction_status IN ('pending', 'failed')
       RETURNING c.appointment_id, c.client_id, c.transcript,
                 (SELECT name FROM clients WHERE id = c.client_id) AS client_name,

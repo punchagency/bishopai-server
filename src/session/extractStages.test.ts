@@ -171,3 +171,53 @@ describe('truncation retry ladder', () => {
     expect(note.concerns).toEqual(['survived']);
   });
 });
+
+// Steve Broderick's session, 2026-08-24: all six stages dropped, evidence 0,
+// every field blank — and `extraction_status = 'done'`, 0 attempts, no error.
+// mergeStages had merged nothing into a valid empty note, so from the caller's
+// side it looked like a clean run and nothing ever retried it.
+describe('total stage failure', () => {
+  it('throws instead of returning a blank note when every stage fails', async () => {
+    // Exhausted rather than paced, so the retry ladder does not engage — this is
+    // the shape a spent Gemini free-tier quota actually arrives in.
+    generateStructured.mockRejectedValue(
+      new RateLimitError({ provider: 'test', exhausted: true }),
+    );
+
+    await expect(
+      extractSessionNote('Nicole: How have you been?\nClient: Tired.', { clientName: 'Steve' }),
+    ).rejects.toThrow(/quota exhausted/);
+  });
+
+  it('rethrows the original error so retryability survives', async () => {
+    // The distinction that matters downstream: a spent daily allowance must not
+    // be retried the way a transient blip is. Rethrowing the original instance —
+    // not a synthetic wrapper — is what keeps isRetryable() able to tell them
+    // apart, and what lets rawFromError() recover the model output.
+    const exhausted = new RateLimitError({ provider: 'test', exhausted: true });
+    generateStructured.mockRejectedValue(exhausted);
+
+    await expect(
+      extractSessionNote('Nicole: How have you been?\nClient: Tired.', { clientName: 'Steve' }),
+    ).rejects.toBe(exhausted);
+  });
+
+  it('still returns a note when only SOME stages fail', async () => {
+    // The rule is "learned nothing", not "learned less". A note covering most of
+    // a session with labelled gaps is worth having, and must not be thrown away.
+    generateStructured.mockImplementation(async ({ system }: { system: string }) => {
+      if (/concerns, goals, follow_ups/.test(system)) {
+        return { parsed: { concerns: ['afternoon tiredness'], goals: [], follow_ups: [] }, raw: '{}' };
+      }
+      throw new TruncatedOutputError('cut off mid-object');
+    });
+
+    const note = await extractSessionNote(
+      'Nicole: How have you been?\nClient: Tired in the afternoons.',
+      { clientName: 'Steve' },
+    );
+
+    expect(note.concerns).toContain('afternoon tiredness');
+    expect(note.extraction?.partial ?? []).not.toHaveLength(0);
+  });
+});

@@ -106,6 +106,10 @@ reviewRouter.get('/unmatched', async (_req, res) => {
               left(coalesce(transcript, ''), 240) AS transcript_preview
          FROM conversations
         WHERE appointment_id IS NULL
+          -- A split parent also has no appointment_id, but it is finished, not
+          -- waiting — its segments are already filed. Without this it sits here
+          -- forever looking exactly like a recording that needs identifying.
+          AND correlation_status <> 'split'
      ORDER BY starts_at DESC`,
     );
     res.json({ conversations: r.rows });
@@ -146,6 +150,12 @@ reviewRouter.get('/unmatched/:id', async (req, res) => {
     if (r.rows[0].appointment_id) {
       // It's been matched (perhaps in another tab) — send her to the session.
       return res.status(409).json({ error: 'already matched', detail: 'This recording is now tied to an appointment.' });
+    }
+    if (r.rows[0].correlation_status === 'split') {
+      return res.status(409).json({
+        error: 'already split',
+        detail: 'This recording was split into separate sessions. Open those instead.',
+      });
     }
     const { appointment_id: _drop, ...conv } = r.rows[0];
     return res.json({ conversation: conv });
@@ -648,6 +658,24 @@ async function handleSplitConversation(req: any, res: any) {
         );
       }
     }
+
+    // The parent is superseded now: its content lives in the children, each with
+    // a client a human picked. Marking it terminal is what keeps it out of the
+    // review queue and out of correlation — see migration 0038.
+    //
+    // Deliberately after the loop. A failure part-way through leaves the parent
+    // 'unmatched' and recoverable, rather than terminal with only half of its
+    // segments written; the NOT EXISTS guards in correlate/sweep cover that
+    // window so a half-split parent still cannot be matched to anyone.
+    await pool.query(
+      `UPDATE conversations
+          SET correlation_status = 'split',
+              appointment_id = NULL,
+              client_id = NULL,
+              updated_at = now()
+        WHERE id = $1`,
+      [req.params.id],
+    );
 
     logEvent('info', 'review.split', 'split conversation into multi-session segments', {
       parent_id: req.params.id,

@@ -57,13 +57,15 @@ describe('correlateConversation', () => {
     expect(r).toEqual({ status: 'unmatched', reason: 'no_candidates', candidateCount: 0 });
   });
 
-  it('never auto-guesses: multiple overlaps -> ambiguous', async () => {
+  it('never auto-guesses: two bookings at the same time are too close to call', async () => {
     const r = await correlateConversation(
       fakeDb([appt({ id: 'a1' }), appt({ id: 'a2', client_id: 'c2' })]),
       START,
       END,
     );
-    expect(r).toEqual({ status: 'unmatched', reason: 'ambiguous', candidateCount: 2 });
+    // Both start at 15:00, so neither is nearer — margin 0, well under the 15-min
+    // floor. Same abstention the overlap rule made, reached on the real reason.
+    expect(r).toEqual({ status: 'unmatched', reason: 'margin_too_tight', candidateCount: 2 });
   });
 
   it('passes the conversation window as the query parameters', async () => {
@@ -91,42 +93,48 @@ describe('correlateConversation', () => {
     expect(r).toEqual({ status: 'unmatched', reason: 'ambiguous', candidateCount: 1 });
   });
 
-  // ── Gap 5: minimum overlap guard ────────────────────────────────────────────
+  // ── Start-distance and margin guards ────────────────────────────────────────
 
-  it('blocks auto-match when actual overlap is less than 5 min (absolute floor)', async () => {
-    // Recording 20:55–21:30, appointment 19:00–20:58.
-    // Overlap = 3 minutes — below the 5-minute absolute floor.
+  it('blocks auto-match when the nearest booking starts too long ago', async () => {
+    // Recording 20:55–21:30, appointment 19:00–20:58 — they overlap by 3 minutes,
+    // but the recording starts 115 minutes after the booking did. No clinic runs
+    // that far behind; this is a different session that happens to touch the slot.
     const recStart  = '2026-07-01T20:55:00Z';
     const recEnd    = '2026-07-01T21:30:00Z';
     const candidate = appt({
       id: 'a1',
       starts_at: '2026-07-01T19:00:00Z',
       ends_at:   '2026-07-01T20:58:00Z', // 118-minute appointment
-      overlap_seconds: 180, // 3 minutes — below max(300, 118*60*0.25 = 1770)
+      overlap_seconds: 180,
     });
     const r = await correlateConversation(fakeDb([candidate]), recStart, recEnd);
-    expect(r).toEqual({ status: 'unmatched', reason: 'overlap_too_small', candidateCount: 1 });
+    expect(r).toEqual({ status: 'unmatched', reason: 'start_too_far', candidateCount: 0 });
   });
 
-  it('blocks auto-match when overlap is less than 25% of a short appointment', async () => {
-    // 30-min appointment: 25% = 7.5 min (450 s). Overlap of 360 s (6 min) should be rejected.
-    // Recording is 15:24–15:50 (26 min), appointment is 15:00–15:30 (30 min).
-    // Ratio = 26/30 = 0.87 — stays well below 1.5×, so only the overlap guard fires.
+  it('matches a late-running session that barely overlaps its own booking', async () => {
+    // Recording 15:24–15:50 (26 min) against a 15:00–15:30 booking: 6 minutes of
+    // overlap, which the old 25%-of-appointment floor rejected outright.
+    //
+    // The corpus says that rejection was wrong. This is the shape of a clinic
+    // running behind — Devin Brooks (+31 min, 26 min recording, 30 min booking)
+    // and Nell-Rose Foreman (+43 min) look exactly like this, overlap their true
+    // booking by zero seconds, and are still the right answer. With nothing else
+    // within three hours, 24 minutes late is a late start, not a different client.
     const recStart  = '2026-07-01T15:24:00Z';
     const recEnd    = '2026-07-01T15:50:00Z';
     const candidate = appt({
       id: 'a1',
       starts_at: '2026-07-01T15:00:00Z',
-      ends_at:   '2026-07-01T15:30:00Z', // 30-min appointment
-      overlap_seconds: 360, // 6 min — below max(300, 1800*0.25 = 450)
+      ends_at:   '2026-07-01T15:30:00Z',
+      overlap_seconds: 360,
     });
     const r = await correlateConversation(fakeDb([candidate]), recStart, recEnd);
-    expect(r).toEqual({ status: 'unmatched', reason: 'overlap_too_small', candidateCount: 1 });
+    expect(r).toMatchObject({ status: 'matched', appointmentId: 'a1' });
   });
 
-  it('accepts a match when overlap meets the 25% threshold', async () => {
-    // 30-min appointment: 25% = 7.5 min (450 s). Overlap of 480 s (8 min) should pass.
-    // Recording is 15:22–15:50 (28 min). Ratio = 28/30 = 0.93 — below 1.5×.
+  it('accepts a match that starts close to its booking', async () => {
+    // Recording 15:22–15:50 (28 min) against a 15:00–15:30 booking — 22 minutes
+    // late, ratio 0.93, nothing else nearby.
     const recStart  = '2026-07-01T15:22:00Z';
     const recEnd    = '2026-07-01T15:50:00Z';
     const candidate = appt({
@@ -138,6 +146,65 @@ describe('correlateConversation', () => {
     const r = await correlateConversation(fakeDb([candidate]), recStart, recEnd);
     expect(r).toMatchObject({ status: 'matched', appointmentId: 'a1' });
   });
+
+  // ── The case overlap arithmetic could never reach ────────────────────────────
+
+  it('matches a late-running session with ZERO overlap of its own booking', async () => {
+    // Steve Broderick, from the corpus: booked 15:00–15:30, recorder ran
+    // 15:35–16:09. The two windows do not intersect at all, so the old
+    // range-overlap query returned no rows and the recording came back
+    // `no_candidates` — not merely unmatched, but invisible. Start distance is
+    // 35 minutes, which is an ordinary amount for a clinic running behind.
+    const recStart  = '2026-07-01T15:35:00Z';
+    const recEnd    = '2026-07-01T16:09:00Z';
+    const candidate = appt({
+      id: 'a1',
+      starts_at: '2026-07-01T15:00:00Z',
+      ends_at:   '2026-07-01T15:30:00Z',
+      overlap_seconds: 0,
+    });
+    const r = await correlateConversation(fakeDb([candidate]), recStart, recEnd);
+    expect(r).toEqual({
+      status: 'matched',
+      appointmentId: 'a1',
+      clientId: 'c1',
+      overlapSeconds: 0, // reported honestly; it no longer decides anything
+    });
+  });
+
+  it('picks the nearer booking when one clearly wins on start distance', async () => {
+    // 15:32 recording against 15:30 and 16:30 bookings: 2 minutes vs 58, a
+    // 56-minute margin. The old rule would have abstained the moment both
+    // appointments overlapped the window.
+    const near = appt({
+      id: 'near',
+      starts_at: '2026-07-01T15:30:00Z',
+      ends_at:   '2026-07-01T16:00:00Z',
+      overlap_seconds: 1680,
+    });
+    const far = appt({
+      id: 'far',
+      client_id: 'c2',
+      starts_at: '2026-07-01T16:30:00Z',
+      ends_at:   '2026-07-01T17:00:00Z',
+      overlap_seconds: 0,
+    });
+    const r = await correlateConversation(
+      fakeDb([near, far]),
+      '2026-07-01T15:32:00Z',
+      '2026-07-01T16:00:00Z',
+    );
+    expect(r).toMatchObject({ status: 'matched', appointmentId: 'near', clientId: 'c1' });
+  });
+
+  it('refuses a sub-minute recording before querying at all', async () => {
+    // A 0-minute artefact is not a consultation. Checked first so a stub cannot
+    // consume a real booking, and cheaply enough to skip the query entirely.
+    const db = fakeDb([appt({ id: 'a1' })]);
+    const r = await correlateConversation(db, START, '2026-07-01T15:00:30Z');
+    expect(r).toEqual({ status: 'unmatched', reason: 'recording_too_short', candidateCount: 0 });
+    expect(db.query).not.toHaveBeenCalled();
+  });
 });
 
 // ─── recorrelateOverlappingConversations ─────────────────────────────────────
@@ -145,6 +212,41 @@ describe('correlateConversation', () => {
 describe('recorrelateOverlappingConversations', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('never re-correlates a split parent', async () => {
+    // A split parent keeps correlation_status 'unmatched' forever: its content
+    // now lives in its children, each attached to a client by a human. Matching
+    // the parent would file the same consultation a second time, under whichever
+    // booking the parent's window happened to sit near.
+    //
+    // The old overlap rule made this safe by accident — a parent's own
+    // appointments are already taken by its children, and nothing else
+    // overlapped, so it returned no_candidates. Start-proximity ranking reaches
+    // a neighbouring booking happily, so the exclusion has to be explicit.
+    //
+    // Asserted against the SQL because the guard IS the query: a fake client
+    // returns whatever rows it is given regardless of the WHERE clause.
+    let selectSql = '';
+    const db = {
+      query: vi.fn().mockImplementation(async (sql: string) => {
+        if (!selectSql) selectSql = sql;
+        return { rows: [], rowCount: 0 };
+      }),
+    } as unknown as PoolClient;
+
+    await recorrelateOverlappingConversations(db, START, END);
+
+    const normalised = selectSql.replace(/\s+/g, ' ');
+    expect(normalised).toContain('parent_conversation_id IS NULL');
+    // Structural guard: catches a half-written split (children exist, parent
+    // status update never ran) as well as any row predating migration 0038.
+    expect(normalised).toMatch(
+      /NOT EXISTS \( SELECT 1 FROM conversations child WHERE child\.parent_conversation_id = conversations\.id \)/,
+    );
+    // Status guard: a split parent has appointment_id NULL, so without this it
+    // slips through the `appointment_id IS NULL` branch and becomes matchable.
+    expect(normalised).toContain("correlation_status <> 'split'");
   });
 
   it('triggers processConversation after a successful re-match', async () => {

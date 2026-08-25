@@ -441,6 +441,11 @@ export async function extractSessionNote(
   };
 
   const partial: string[] = [];
+  // Why each dropped stage dropped. `partial` records THAT a stage produced
+  // nothing; without the cause, a spent quota and a malformed response are
+  // indistinguishable once the run is over — which is exactly how a note ends up
+  // marked extracted with every field blank and no error anywhere to explain it.
+  const stageErrors: unknown[] = [];
   const conflicts: { path: string; chosen: string | null; candidates: string[] }[] = [];
   const gaps: {
     from: number | null;
@@ -463,6 +468,7 @@ export async function extractSessionNote(
     active.map(async (stage): Promise<Partial<SessionNote> | null> => {
       const fail = (err: unknown, note: string): null => {
         partial.push(stage.name);
+        stageErrors.push(err);
         logEvent('warn', 'session.extract', note, {
           stage: stage.name,
           error: err instanceof Error ? err.message : String(err),
@@ -540,6 +546,10 @@ export async function extractSessionNote(
       // would hide a broken extraction behind a plausible-looking draft.
       if (ok.length === 0 || ok.length * 2 < plan.length) {
         partial.push(stage.name);
+        const firstRejection = settled.find(
+          (r): r is PromiseRejectedResult => r.status === 'rejected',
+        );
+        if (firstRejection) stageErrors.push(firstRejection.reason);
         logEvent('warn', 'session.extract', 'too many chunks failed — stage dropped', {
           stage: stage.name,
           ok: ok.length,
@@ -596,6 +606,30 @@ export async function extractSessionNote(
       return (shouldChunk && stage.chunked) || mustChunk ? runChunked() : runWhole();
     }),
   );
+
+  // Every stage failing is a failed extraction, not an empty one.
+  //
+  // mergeStages happily merges nothing into a valid, entirely blank note, and
+  // the caller then records `extraction_status = 'done'` with zero attempts and
+  // no error — terminal by accident. Steve Broderick's session did exactly this
+  // on 2026-08-24: all six stages dropped, evidence 0, every field blank, and
+  // nothing to retry it because from the outside it looked like a clean run.
+  //
+  // Rethrowing the first stage error rather than a synthetic one is deliberate:
+  // it preserves the type, so isRetryable() still distinguishes a spent daily
+  // allowance from a transient blip, and rawFromError() can still recover the
+  // model output. process.ts turns that into 'failed', which IS retried.
+  //
+  // A partial extraction still returns — a note covering most of a session with
+  // labelled gaps is worth having. Only learning nothing at all is fatal.
+  if (active.length > 0 && stageResults.every((r) => r === null)) {
+    logEvent('error', 'session.extract', 'every stage failed — no note to write', {
+      stages: active.map((st) => st.name),
+      partial,
+      errors: stageErrors.map((e) => (e instanceof Error ? e.message : String(e))),
+    });
+    throw stageErrors[0] ?? new Error('extraction produced no content: every stage failed');
+  }
 
   const note = mergeStages(stageResults.filter((s): s is Partial<SessionNote> => s !== null));
 

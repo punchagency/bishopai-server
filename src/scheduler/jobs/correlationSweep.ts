@@ -42,7 +42,14 @@ export const correlationSweepJob: Job = {
         WHERE correlation_status = 'unmatched'
           AND transcript IS NOT NULL
           AND starts_at >= now() - ($1 || ' days')::interval
+          -- Skip split children (their client was chosen by a human) AND split
+          -- parents (already superseded by their children; re-matching one would
+          -- duplicate the consultation under the wrong client).
           AND parent_conversation_id IS NULL
+          AND NOT EXISTS (
+                SELECT 1 FROM conversations child
+                 WHERE child.parent_conversation_id = conversations.id
+              )
         ORDER BY starts_at DESC
         LIMIT 50`,
       [String(SWEEP_DAYS)],
