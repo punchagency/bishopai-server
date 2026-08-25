@@ -46,6 +46,16 @@ describe('scoreNameMatch', () => {
     expect(scoreNameMatch('Nicole: Jo is doing well.', 'Jo Ng')).toEqual({ mentions: 0, matchedOn: null });
   });
 
+  it('detects direct address greetings and ranks them above casual mentions', () => {
+    const greetingHit = scoreNameMatch('Nicole: Hi Steve, welcome in. Steve, how is your back?', 'Steve Broderick');
+    const casualHit = scoreNameMatch('Nicole: I talked to Steve yesterday. Steve mentioned Steve is busy.', 'Steve Broderick');
+
+    expect(greetingHit.isDirectAddress).toBe(true);
+    expect(casualHit.isDirectAddress).toBe(false);
+
+    expect(nameSignalRank(greetingHit)).toBeGreaterThan(nameSignalRank(casualHit));
+  });
+
   it('handles missing input without throwing', () => {
     expect(scoreNameMatch(null, 'Marta Reyes').mentions).toBe(0);
     expect(scoreNameMatch(TRANSCRIPT, null).mentions).toBe(0);

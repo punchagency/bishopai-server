@@ -1,11 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   parseTurns,
   detectSessionBoundaries,
   renderTurnsForBoundaryPrompt,
   sliceTranscriptByTurnRange,
+  type CalendarAppointment,
 } from './segmenter';
 import { prepareTurns } from './transcript';
+
+vi.mock('../llm/providers', () => ({
+  generateStructured: vi.fn(async () => ({ parsed: { boundary_turns: [] } })),
+}));
 
 /** A stretch of ordinary consultation: alternating turns, clinical vocabulary
  *  that deliberately includes the words a looser farewell regex used to trip on
@@ -222,6 +227,46 @@ Nicole: See https://fullscript.com/x for the link.`);
         ['Ann Bartholomew'],
       );
       expect(segments[0].client_name_hint).toBeFalsy();
+    });
+
+    it('uses multi-signal transcript evidence to assign appointments and flag time disagreement', async () => {
+      const transcript = [
+        '#1 PRACTITIONER\nHi Steve, welcome in! Good to see you today.',
+        '#2 CLIENT\nThanks Nicole, my back has been feeling much better.',
+      ].join('\n\n');
+
+      const appts: CalendarAppointment[] = [
+        {
+          id: 'appt_mary',
+          starts_at: '2026-08-25T10:00:00Z',
+          ends_at: '2026-08-25T10:30:00Z',
+          client_name: 'Mary Waters',
+          overlap_seconds: 1200,
+        },
+        {
+          id: 'appt_steve',
+          starts_at: '2026-08-25T10:30:00Z',
+          ends_at: '2026-08-25T11:00:00Z',
+          client_name: 'Steve Broderick',
+          overlap_seconds: 300,
+        },
+      ];
+
+      // Recording window overlaps Mary's slot (20m) more than Steve's (5m), but transcript directly addresses Steve.
+      const recStartMs = new Date('2026-08-25T10:00:00Z').getTime();
+      const recEndMs = new Date('2026-08-25T10:35:00Z').getTime();
+
+      const segments = await detectSessionBoundaries(
+        transcript,
+        ['Mary Waters', 'Steve Broderick'],
+        appts,
+        recStartMs,
+        recEndMs,
+      );
+
+      expect(segments[0].suggested_appointment_id).toBe('appt_steve');
+      expect(segments[0].client_name_hint).toBe('Steve Broderick');
+      expect(segments[0].time_disagreement_note).toMatch(/Transcript evidence strongly points to Steve Broderick/i);
     });
 
     it('treats a client who shares the practitioner name as the client', async () => {

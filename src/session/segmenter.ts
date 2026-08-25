@@ -1,6 +1,7 @@
 import { logEvent } from '../observability/logger';
 import { generateStructured } from '../llm/providers';
 import { estimateTokens, prepareTurns, type Role } from './transcript';
+import { scoreNameMatch, nameSignalRank } from '../correlation/nameMatch';
 import { z } from 'zod';
 
 export interface TurnSegment {
@@ -369,11 +370,12 @@ ${turnSummaryLines.join('\n')}`;
 
   const segments: SessionBoundarySegment[] = [];
 
-  // Build raw segments first so we can do overlap-maximising appointment assignment.
+  // Build raw segments first so we can do multi-signal appointment assignment.
   const rawSegments: Array<{
     fromTurn: number;
     toTurn: number;
     turnShare: number;
+    sliceText: string;
     clientHint: string | null;
     snippet: string;
     confidenceScore: number;
@@ -387,19 +389,14 @@ ${turnSummaryLines.join('\n')}`;
     const sliceText = turnSlice.map((t) => `${t.speaker}: ${t.text}`).join('\n');
 
     let clientHint: string | null = null;
-    let maxMentions = 0;
+    let maxRank = 0;
 
     for (const name of candidateClientNames) {
-      const firstName = name.split(' ')[0];
-      if (firstName && firstName.length >= 2) {
-        const safeName = escapeRegExp(firstName);
-        const nameWordRegex = new RegExp(`\\b${safeName}\\b`, 'gi');
-        const matches = sliceText.match(nameWordRegex);
-        const count = matches ? matches.length : 0;
-        if (count > maxMentions) {
-          maxMentions = count;
-          clientHint = name;
-        }
+      const sig = scoreNameMatch(sliceText, name);
+      const rank = nameSignalRank(sig);
+      if (rank > maxRank) {
+        maxRank = rank;
+        clientHint = name;
       }
     }
 
@@ -407,17 +404,16 @@ ${turnSummaryLines.join('\n')}`;
       fromTurn,
       toTurn,
       turnShare: turns.length > 0 ? (toTurn - fromTurn + 1) / turns.length : 0,
+      sliceText,
       clientHint,
       snippet: sliceText.slice(0, 300),
       confidenceScore: turnScores.get(fromTurn) ?? (fromTurn === 1 ? (uniqueBoundaries.length > 1 ? 85 : 95) : 50),
     });
   }
 
-  // Overlap-maximising appointment assignment.
-  // Each segment gets the unassigned overlapping appointment whose window best
-  // matches the segment's interpolated time window, in chronological order.
-  // Chronological order is enforced by processing segments left-to-right and
-  // only considering appointments not yet taken.
+  // Multi-signal appointment assignment.
+  // Combines (1) direct identity evidence from transcript name match (with direct address priority)
+  // and (2) overlap-maximising appointment time window arithmetic.
   const assignedApptIds = new Set<string>();
   const segmentApptIds: (string | null)[] = rawSegments.map(() => null);
   const segmentDisagreementNotes: (string | null)[] = rawSegments.map(() => null);
@@ -433,30 +429,57 @@ ${turnSummaryLines.join('\n')}`;
 
   for (let si = 0; si < rawSegments.length; si++) {
     const seg = rawSegments[si];
-    const segStartMs = recStartMs + Math.round((seg.fromTurn - 1) / Math.max(1, turns.length) * recDurMs);
-    const segEndMs = recStartMs + Math.round(seg.toTurn / Math.max(1, turns.length) * recDurMs);
+    const segStartMs = recStartMs + Math.round(((seg.fromTurn - 1) / Math.max(1, turns.length)) * recDurMs);
+    const segEndMs = recStartMs + Math.round((seg.toTurn / Math.max(1, turns.length)) * recDurMs);
 
     let bestAppt: CalendarAppointment | null = null;
-    let bestOverlap = 0;
+    let bestScore = -1;
+    let timeOverlapWinner: CalendarAppointment | null = null;
+    let maxOverlapMs = 0;
 
     for (const appt of assignableAppts) {
       if (assignedApptIds.has(appt.id)) continue;
-      if (recStartMs === 0 && recEndMs === 0) break; // no time data, skip
+
       const apptStartMs = new Date(appt.starts_at).getTime();
       const apptEndMs = new Date(appt.ends_at).getTime();
-      const overlapMs = Math.max(0, Math.min(segEndMs, apptEndMs) - Math.max(segStartMs, apptStartMs));
-      if (overlapMs > bestOverlap) {
-        bestOverlap = overlapMs;
+      const overlapMs =
+        recStartMs > 0 || recEndMs > 0
+          ? Math.max(0, Math.min(segEndMs, apptEndMs) - Math.max(segStartMs, apptStartMs))
+          : 0;
+
+      if (overlapMs > maxOverlapMs) {
+        maxOverlapMs = overlapMs;
+        timeOverlapWinner = appt;
+      }
+
+      const nameSig = scoreNameMatch(seg.sliceText, appt.client_name);
+      const nameRank = nameSignalRank(nameSig);
+      const timeScore = recDurMs > 0 ? (overlapMs / recDurMs) * 1000 : 0;
+      const compositeScore = nameRank + timeScore;
+
+      if (compositeScore > bestScore && compositeScore > 0) {
+        bestScore = compositeScore;
         bestAppt = appt;
       }
+    }
+
+    if (!bestAppt && timeOverlapWinner) {
+      bestAppt = timeOverlapWinner;
     }
 
     if (bestAppt) {
       assignedApptIds.add(bestAppt.id);
       segmentApptIds[si] = bestAppt.id;
 
-      // Flag disagreement: segment turn-share vs appointment calendar overlap share.
-      if (recDurMs > 0 && bestAppt.overlap_seconds > 0) {
+      if (
+        timeOverlapWinner &&
+        timeOverlapWinner.id !== bestAppt.id &&
+        timeOverlapWinner.client_name &&
+        bestAppt.client_name
+      ) {
+        segmentDisagreementNotes[si] =
+          `Transcript evidence strongly points to ${bestAppt.client_name}, but calendar overlap suggested ${timeOverlapWinner.client_name}.`;
+      } else if (recDurMs > 0 && bestAppt.overlap_seconds > 0) {
         const apptOverlapShare = (bestAppt.overlap_seconds * 1000) / recDurMs;
         const diff = Math.abs(seg.turnShare - apptOverlapShare);
         if (diff > 0.25) {
