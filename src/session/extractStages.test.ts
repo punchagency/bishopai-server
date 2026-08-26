@@ -209,7 +209,7 @@ describe('total stage failure', () => {
       if (/concerns, goals, follow_ups/.test(system)) {
         return { parsed: { concerns: ['afternoon tiredness'], goals: [], follow_ups: [] }, raw: '{}' };
       }
-      throw new TruncatedOutputError('cut off mid-object');
+      throw new TruncatedOutputError({ provider: 'test', finishReason: 'MAX_TOKENS' });
     });
 
     const note = await extractSessionNote(

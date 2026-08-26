@@ -1,6 +1,7 @@
 import { pool } from '../db/pool';
 import { logEvent } from '../observability/logger';
 import { processConversation } from './process';
+import { RateLimitError } from '../llm/errors';
 
 // Extraction crash recovery + retry, modelled on the WF2 reconciliation outbox
 // (checkout/reconcile.ts) because the failure mode is the same shape: durable
@@ -114,28 +115,75 @@ export async function processDueExtractions(limit = 20): Promise<RetryResult> {
   return { retried, deadLettered };
 }
 
-/** Record a failure with its backoff. Called by processConversation. */
+/**
+ * Where a spent daily allowance parks until it is worth trying again.
+ *
+ * Google's free tier resets at midnight Pacific, not at midnight UTC and not on
+ * a rolling 24h window, so the wait is "until the next local midnight" rather
+ * than any fixed interval. Postgres does the timezone arithmetic; this is only
+ * the zone to do it in.
+ */
+const QUOTA_RESET_TZ = process.env.LLM_QUOTA_RESET_TZ ?? 'America/Los_Angeles';
+
+/**
+ * Record a failure with its backoff. Called by processConversation.
+ *
+ * `cause` is the original typed error, and it is what separates two failures
+ * that look identical once flattened to a string:
+ *
+ *   - A stage that broke — retry it, on the usual ladder, and count the attempt
+ *     so four of them dead-letter to needs_review for a human.
+ *   - A day's allowance that is simply spent — nothing was extracted, nothing
+ *     was even attempted in the sense that matters, and the provider will
+ *     refuse identically for the rest of the day.
+ *
+ * The second one must not burn attempts. Counting it means a quota outage
+ * dead-letters healthy sessions to needs_review having never once reached the
+ * model, and the 1/5/15/60-minute ladder spends four more requests against the
+ * cap that refused — the same amplification that produced seven blank notes on
+ * 2026-08-24, moved one layer out. So it parks until the reset instead, with
+ * the counter untouched.
+ */
 export async function markExtractionFailed(
   conversationId: string,
   error: string,
   raw: string | null,
+  cause?: unknown,
 ): Promise<void> {
+  const spent = cause instanceof RateLimitError && cause.exhausted;
+  if (spent) {
+    logEvent('warn', 'session.extract', 'daily model allowance spent — parked until it resets', {
+      conversation_id: conversationId,
+      reset_tz: QUOTA_RESET_TZ,
+    });
+  }
   await pool
     .query(
-      `UPDATE conversations
-          SET extraction_status = 'failed',
-              extraction_attempts = extraction_attempts + 1,
-              extraction_error = $2,
-              extraction_raw = $3,
-              extraction_next_attempt_at =
-                now() + (CASE
-                  WHEN extraction_attempts + 1 >= 4 THEN 60
-                  WHEN extraction_attempts + 1 = 3 THEN 15
-                  WHEN extraction_attempts + 1 = 2 THEN 5
-                  ELSE 1 END || ' minutes')::interval,
-              updated_at = now()
-        WHERE id = $1`,
-      [conversationId, error.slice(0, 2000), raw?.slice(0, 4096) ?? null],
+      spent
+        ? `UPDATE conversations
+              SET extraction_status = 'failed',
+                  extraction_error = $2,
+                  extraction_raw = $3,
+                  extraction_next_attempt_at =
+                    (date_trunc('day', now() AT TIME ZONE $4) + interval '1 day') AT TIME ZONE $4,
+                  updated_at = now()
+            WHERE id = $1`
+        : `UPDATE conversations
+              SET extraction_status = 'failed',
+                  extraction_attempts = extraction_attempts + 1,
+                  extraction_error = $2,
+                  extraction_raw = $3,
+                  extraction_next_attempt_at =
+                    now() + (CASE
+                      WHEN extraction_attempts + 1 >= 4 THEN 60
+                      WHEN extraction_attempts + 1 = 3 THEN 15
+                      WHEN extraction_attempts + 1 = 2 THEN 5
+                      ELSE 1 END || ' minutes')::interval,
+                  updated_at = now()
+            WHERE id = $1`,
+      spent
+        ? [conversationId, error.slice(0, 2000), raw?.slice(0, 4096) ?? null, QUOTA_RESET_TZ]
+        : [conversationId, error.slice(0, 2000), raw?.slice(0, 4096) ?? null],
     )
     .catch(() => {
       /* best-effort; the original error is already logged */

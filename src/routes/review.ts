@@ -28,6 +28,7 @@ import {
   appointmentForItem,
 } from '../session/sessionService';
 import { detectSessionBoundaries, parseTurns, sliceTranscriptByTurnRange } from '../session/segmenter';
+import { listUnprocessed } from '../session/unprocessed';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
 // session extraction, with edit + approve. (No auth yet — approved_by is a
@@ -84,6 +85,105 @@ reviewRouter.get('/queue', async (req, res) => {
   } catch (err) {
     logError('review.queue', 'queue query failed', err);
     res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /review/unprocessed — matched recordings with no readable note.
+//
+// The opposite failure to /unmatched: we know whose session this is, the
+// transcript is right there, and the extraction still produced nothing. Blank
+// notes filed as 'done' had no home in the app at all — they sat in Awaiting
+// review looking like a session where nothing clinical was said.
+// ---------------------------------------------------------------------------
+reviewRouter.get('/unprocessed', async (_req, res) => {
+  try {
+    const sessions = await listUnprocessed();
+    res.json({ sessions });
+  } catch (err) {
+    logError('review.unprocessed', 'unprocessed query failed', err);
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /review/conversations/:id — one MATCHED recording, transcript and all.
+//
+// The other half of the list above. A session with no note is not a session
+// with no content: the transcript is sitting in the row, fully readable, and
+// until now nothing in the app would show it — the only transcript viewer was
+// on /unmatched/:id, which refuses outright once a recording has an appointment
+// (409 "already matched"). So the practitioner whose extraction is waiting on
+// tomorrow's allowance could see that her session existed and not one word of
+// what was said in it, which is the wrong way round: the recording is the
+// primary record and the note is derived from it.
+//
+// Deliberately not folded into /unmatched/:id. That route's refusals are the
+// point of it — a matched recording must not be re-assigned through the
+// unmatched flow — and loosening them to serve a read would put the assign and
+// split actions in reach of a session already filed against a client.
+// ---------------------------------------------------------------------------
+reviewRouter.get('/conversations/:id', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  try {
+    const r = await pool.query<{
+      id: string;
+      source_id: string;
+      source: string;
+      starts_at: string;
+      ends_at: string;
+      correlation_status: string;
+      extraction_status: string;
+      extraction_error: string | null;
+      appointment_id: string | null;
+      appointment_at: string | null;
+      client_name: string | null;
+      transcript: string | null;
+    }>(
+      `SELECT c.id, c.source_id, c.source, c.starts_at, c.ends_at,
+              c.correlation_status, c.extraction_status, c.extraction_error,
+              c.appointment_id,
+              a.starts_at AS appointment_at,
+              -- Same precedence as listUnprocessed: the appointment names whose
+              -- session this is, the recording is the fallback. Never the
+              -- sheet's client_id, which can disagree with both.
+              cl.name AS client_name,
+              c.transcript
+         FROM conversations c
+    LEFT JOIN appointments a ON a.id = c.appointment_id
+    LEFT JOIN clients cl     ON cl.id = COALESCE(a.client_id, c.client_id)
+        WHERE c.id = $1`,
+      [req.params.id],
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    const row = r.rows[0];
+
+    // Parsed HERE, through the same pipeline the extractor used — see
+    // fetchTranscript. A second parse in the renderer would number the turns
+    // differently, and a drifted "#133" points a reader at the wrong sentence
+    // while looking perfectly correct.
+    let turns: TranscriptTurn[] = [];
+    if (row.transcript) {
+      try {
+        turns = prepareTranscript(row.transcript).turns.map((t) => ({
+          index: t.index,
+          role: t.role,
+          speaker: t.speaker,
+          at_seconds: t.startSeconds,
+          text: t.text,
+        }));
+      } catch (err) {
+        // The raw text is still worth showing; the pane degrades to plain lines.
+        logError('review.conversation.turns', 'turn parsing failed', err, { id: row.id });
+      }
+    }
+
+    return res.json({ conversation: { ...row, turns } });
+  } catch (err) {
+    logError('review.conversation.detail', 'conversation detail query failed', err, {
+      id: req.params.id,
+    });
+    return res.status(500).json({ error: 'internal error' });
   }
 });
 

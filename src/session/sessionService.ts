@@ -6,6 +6,7 @@ import { syncClientSupplements, removeSupplementsDroppedByAmendment } from './su
 import { createTasksFromNote, reconcileTasksAfterAmend } from '../tasks/service';
 import { snapshotRevision } from './revisions';
 import { recordAudit } from '../audit/log';
+import { listUnprocessed } from './unprocessed';
 
 // A session is ONE clinical note, not two documents.
 //
@@ -154,7 +155,20 @@ export async function listSessions(
   const all = r.rows.map(toSession);
   const wanted = scope === 'approved' ? 'approved' : null;
   const filtered = all.filter((x) => (wanted ? x.status === 'approved' : x.status !== 'approved'));
-  return scope === 'approved' ? filtered.slice(0, q ? SEARCH_SCAN_LIMIT : limit) : filtered;
+  if (scope === 'approved') return filtered.slice(0, q ? SEARCH_SCAN_LIMIT : limit);
+
+  // A session with no readable note is not awaiting approval — there is nothing
+  // to approve. It belongs in "Not extracted", where the reason it is empty is
+  // on screen next to it, and it must not ALSO sit here looking like a draft of
+  // a quiet appointment. That is precisely how seven blank notes went unnoticed:
+  // they were in this list, indistinguishable from a real one, right up until
+  // someone opened one.
+  //
+  // Subtracting the other list by id, rather than re-deriving "is it empty?"
+  // here, is what guarantees the two can never disagree — every session lands in
+  // exactly one of them, and a row can never fall out of both.
+  const unreadable = new Set((await listUnprocessed()).map((u) => u.appointment_id));
+  return filtered.filter((x) => !unreadable.has(x.appointment_id));
 }
 
 export async function getSession(appointmentId: string): Promise<SessionRow | null> {

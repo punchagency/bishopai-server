@@ -104,13 +104,35 @@ export class RateLimitError extends ProviderError {
  * Deliberately narrow. Reading an ordinary per-minute limit as exhausted would
  * abandon a session the provider was willing to serve thirty seconds later,
  * which is the more expensive mistake of the two.
+ *
+ * Decide on the NAME OF THE QUOTA, never on the retry hint attached to it.
+ *
+ * This used to bail out to `false` on sight of `generate_content_free_tier_requests`,
+ * `limit: \d+`, `retry in`, or `RetryInfo` — on the theory that those mark a
+ * per-minute refusal. A real per-day refusal carries all four:
+ *
+ *   Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests,
+ *   limit: 20, model: gemini-3.6-flash
+ *   Please retry in 58.690269291s.
+ *   ... "quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier" ... RetryInfo
+ *
+ * so the guard fired on exactly the case it was meant to catch, and the
+ * paragraph above — "Google offers 'retry in 8s' on a cap that resets at
+ * midnight" — described the bug sitting two lines below it. On 2026-08-24 that
+ * turned a spent daily allowance into a retry ladder plus a chunked fallback on
+ * every stage of seven sessions, each of which spends MORE requests against the
+ * cap that just refused, and all seven were filed as extracted with every field
+ * blank.
+ *
+ * `quotaId` states the period outright, so when the provider names the quota
+ * that name is the whole answer and the prose is not consulted. The prose
+ * fallback is for providers that don't name one (OpenAI-compatible tiers).
  */
 export function isQuotaExhausted(err: unknown): boolean {
   const msg = String((err as { message?: string })?.message ?? '');
-  if (/generate_content_free_tier_requests|limit: \d+|retry (?:in|after)|RetryInfo/i.test(msg)) {
-    return false;
-  }
-  return /per[-_ ]?day|daily (?:limit|quota)|insufficient_quota/i.test(msg);
+  const named = msg.match(/"?quota(?:Id|_id)"?\s*:\s*"([^"]+)"/gi);
+  if (named?.length) return named.some((q) => /per[-_ ]?day/i.test(q));
+  return /per[-_ ]?day|daily[\s_-]*(?:limit|quota)|insufficient_quota/i.test(msg);
 }
 
 /**

@@ -113,10 +113,13 @@ export async function processConversation(conversationId: string): Promise<void>
   } catch (err) {
     // Keep the raw model output: without it, truncation, a schema violation and
     // a refusal all look identical in the logs after the fact.
+    // The error itself, not just its message: a spent daily allowance and a
+    // broken stage are the same string to a log and want opposite scheduling.
     await markExtractionFailed(
       conversationId,
       err instanceof Error ? err.message : String(err),
       rawFromError(err),
+      err,
     );
     await logError('session.extract', 'transcript extraction failed', err, {
       conversation_id: conversationId,
