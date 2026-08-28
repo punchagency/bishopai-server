@@ -1,5 +1,7 @@
 import { pool } from '../db/pool';
 import { isQuotaExhausted } from '../llm/errors';
+import { MAX_ATTEMPTS } from './extractionPolicy';
+import { queuePositions } from './queue';
 
 // Matched recordings that never became a readable note.
 //
@@ -48,6 +50,26 @@ export interface UnprocessedSession {
   /** Findings the note does hold — 0 for a blank one. */
   findings: number;
   sheet_id: string | null;
+  /** 1-based place in line, or null when this row is not waiting for a turn —
+   *  it is running, parked until the allowance resets, or already finished
+   *  badly. The UI says "3rd in line" from this; a wrong number here is a
+   *  promise about when a note arrives, so it is computed from the same query
+   *  the drain uses rather than from this list's own ordering. */
+  queue_position: number | null;
+  /** Tries used, and the ceiling before it dead-letters to needs_review. Shown
+   *  as "attempt 2 of 4" — a retry ladder nobody can see is indistinguishable
+   *  from nothing happening. */
+  attempts: number;
+  max_attempts: number;
+  /** How long the appointment was booked for. Null when it has no end time. */
+  appointment_seconds: number | null;
+  /** This recording is far too short to be the session it is filed against.
+   *
+   *  Computed on every row, in every state, and deliberately NOT folded into
+   *  `reason`: a recording can be too short AND queued, too short AND failed,
+   *  too short AND blank, and the reason field can only say one thing. This is
+   *  the fact; the reason is the story. */
+  too_short_for_appointment: boolean;
 }
 
 export type UnprocessedReason =
@@ -61,8 +83,11 @@ export type UnprocessedReason =
   | 'queued'
   /** In flight right now. */
   | 'running'
-  /** Extraction "succeeded" and produced a note with nothing in it. */
+  /** Read end to end, and there was nothing clinical in it. Not a fault. */
   | 'blank'
+  /** Stages dropped and nothing came back from the ones that ran, so the note
+   *  is empty because the reading failed — not because the session was quiet. */
+  | 'unread'
   /** Some stages landed, others were dropped — the note is real but half-read. */
   | 'incomplete';
 
@@ -110,8 +135,42 @@ export function countFindings(note: unknown): number {
   return n;
 }
 
-/** Why this recording has no readable note, in the words the UI shows. */
-function classify(
+/**
+ * When a recording is too short to be the session it is filed against.
+ *
+ * Found the hard way. A 27-minute Amber Stack recording was split into a
+ * 16,882-character session and a 695-character tail — "Have fun. Hello." then
+ * two minutes of gym chat and a bathroom break — and the tail was promoted to a
+ * session of its own on a separate 60-minute appointment. Nothing anywhere said
+ * it was 3% of a booking. It sat in the list looking like a fourth session
+ * waiting to be read, and telling it apart took reading the transcript by hand
+ * and diffing it against the parent recording.
+ *
+ * Both conditions must hold, because either alone has honest counter-examples:
+ * a consultation that ran twenty minutes short still says plenty, and a
+ * recorder started late can produce a short file of a real session. Even
+ * together this is a question worth putting to Nicole, never a verdict — so
+ * nothing acts on it and nothing is skipped because of it. It is only shown.
+ */
+const THIN_COVERAGE = 0.25;
+const THIN_CHARS = 2000;
+
+export function tooShortForAppointment(
+  recordingSeconds: number | null,
+  appointmentSeconds: number | null,
+  transcriptChars: number,
+): boolean {
+  if (!recordingSeconds || !appointmentSeconds || appointmentSeconds <= 0) return false;
+  if (transcriptChars >= THIN_CHARS) return false;
+  return recordingSeconds / appointmentSeconds < THIN_COVERAGE;
+}
+
+/** Why this recording has no readable note, in the words the UI shows.
+ *
+ *  Exported for tests: the branch below decides whether Nicole is told a session
+ *  failed or told it was simply quiet, and those send her in opposite
+ *  directions. It is worth pinning directly rather than through a database. */
+export function classify(
   status: string,
   error: string | null,
   findings: number,
@@ -127,7 +186,23 @@ function classify(
     return status === 'needs_review' ? 'needs_review' : 'failed';
   }
   // status === 'done'
-  if (findings === 0) return 'blank';
+  //
+  // An empty note has two completely different causes and they want opposite
+  // responses from the reader, so `partial` decides which one this is.
+  //
+  // The distinction was missed at first because of when this was written: the
+  // four blank notes it was built to explain were all quota casualties from
+  // 2026-08-24, every stage dropped, and "nothing was read" was true of every
+  // one of them. So the copy asserted that as THE explanation for an empty note.
+  //
+  // It is now close to the only case that can no longer happen. extract.ts
+  // throws when every stage fails, so a total loss lands in `failed` and is
+  // retried; it never reaches `done`. Which means the empty notes arriving from
+  // here on are overwhelmingly the other kind — read end to end, nothing
+  // clinical in them — and telling Nicole that a session she remembers as brief
+  // and uneventful "was never read" sends her to re-run an extraction that will
+  // correctly produce nothing again, on an allowance of twenty requests a day.
+  if (findings === 0) return partial.length > 0 ? 'unread' : 'blank';
   if (partial.length > 0) return 'incomplete';
   return null; // a real note — belongs in the review queue, not here
 }
@@ -140,6 +215,7 @@ interface Row {
   appointment_at: string | null;
   recorded_at: string;
   duration_seconds: number | null;
+  appointment_seconds: number | null;
   transcript_chars: number;
   extraction_status: string;
   extraction_attempts: number;
@@ -168,6 +244,7 @@ export async function listUnprocessed(): Promise<UnprocessedSession[]> {
             a.starts_at             AS appointment_at,
             c.starts_at             AS recorded_at,
             EXTRACT(EPOCH FROM (c.ends_at - c.starts_at))::int AS duration_seconds,
+            EXTRACT(EPOCH FROM (a.ends_at - a.starts_at))::int AS appointment_seconds,
             length(c.transcript)    AS transcript_chars,
             c.extraction_status,
             c.extraction_attempts,
@@ -205,6 +282,12 @@ export async function listUnprocessed(): Promise<UnprocessedSession[]> {
       ORDER BY COALESCE(a.starts_at, c.starts_at) DESC`,
   );
 
+  // Read after the rows, not before: a drain running alongside this can finish
+  // a session between the two queries, and a stale position that is too SMALL
+  // would tell Nicole a note is nearly ready when it has already arrived
+  // elsewhere. Too large is the harmless direction to be wrong in.
+  const positions = await queuePositions();
+
   const out: UnprocessedSession[] = [];
   for (const row of r.rows) {
     const note = (row.content_json ?? null) as Record<string, unknown> | null;
@@ -230,7 +313,26 @@ export async function listUnprocessed(): Promise<UnprocessedSession[]> {
       partial,
       findings,
       sheet_id: row.sheet_id,
+      queue_position: positions.get(row.conversation_id) ?? null,
+      appointment_seconds: row.appointment_seconds ?? null,
+      too_short_for_appointment: tooShortForAppointment(
+        row.duration_seconds ?? null,
+        row.appointment_seconds ?? null,
+        row.transcript_chars ?? 0,
+      ),
+      attempts: row.extraction_attempts,
+      max_attempts: MAX_ATTEMPTS,
     });
   }
-  return out;
+
+  // Queue order first, then everything else by session date.
+  //
+  // The SQL sorts by date because that is the only order it can know; place in
+  // line is computed above, from a different query. A tab whose job is "here is
+  // the queue" that opens on the fourth item because it happens to be the most
+  // recent session is not showing a queue, it is showing a list that also
+  // contains one.
+  const rank = (u: UnprocessedSession): number =>
+    u.reason === 'running' ? 0 : u.queue_position != null ? u.queue_position : Infinity;
+  return out.sort((a, b) => rank(a) - rank(b));
 }
