@@ -54,8 +54,8 @@ suite('session assignment (integration, real Postgres)', () => {
 
   async function makeConversation(transcript: string, s: string, e: string): Promise<string> {
     const r = await pool.query<{ id: string }>(
-      `INSERT INTO conversations (source_id, starts_at, ends_at, transcript, correlation_status)
-       VALUES ($1, $2, $3, $4, 'unmatched') RETURNING id`,
+      `INSERT INTO conversations (source_id, source, starts_at, ends_at, transcript, correlation_status)
+       VALUES ($1, 'pocket', $2, $3, $4, 'unmatched') RETURNING id`,
       [`asgn-${Math.random().toString(36).slice(2)}`, s, e, transcript],
     );
     return r.rows[0].id;

@@ -13,7 +13,21 @@ export type ConversationSource = 'bee' | 'pocket' | 'manual';
 export interface ConversationInput {
   /** The recorder's own id for this recording (Pocket: `rec_…`, manual: `manual:<sha256>`). */
   source_id: string;
-  source?: ConversationSource; // defaults to 'pocket'
+  /**
+   * Required, with no default, because guessing it is a provenance lie.
+   *
+   * This used to fall back to 'pocket'. Nothing reached the fallback — every
+   * writer names its source — but the cost of one that ever did is not a
+   * mislabel. 0027 replaced the global unique on the id with `(source,
+   * source_id)` precisely because two recorders' id namespaces can collide, so
+   * a row that guesses 'pocket' is placed INTO the Pocket namespace, where an
+   * unrelated recording can overwrite its transcript. And 0028 asks that a note
+   * built from a hand-pasted transcript stay traceable as one. A required field
+   * makes the next ingress path state which recorder it speaks for, at compile
+   * time, instead of inheriting an answer from the recorder we happened to use
+   * when the column was added.
+   */
+  source: ConversationSource;
   starts_at: string; // ISO 8601
   ends_at: string; // ISO 8601
   transcript?: string | null;
@@ -117,7 +131,7 @@ async function ingestOnce(input: ConversationInput, retryOnTaken: boolean): Prom
          RETURNING id, appointment_id, client_id, correlation_overlap_seconds, correlation_status`,
       [
         input.source_id,
-        input.source ?? 'pocket',
+        input.source,
         input.starts_at,
         input.ends_at,
         input.transcript ?? null,

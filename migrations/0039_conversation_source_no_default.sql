@@ -1,0 +1,25 @@
+-- Drop the column default on conversations.source.
+--
+-- 0027 added `source` as NOT NULL DEFAULT 'pocket'. The default did a real job
+-- exactly once — it let that migration add a NOT NULL column to a table that
+-- already had rows, which the very next statement then backfilled to 'bee'.
+-- Since then it has been unreachable: the webhook and the poller both go
+-- through `toConversationInput`, which sets 'pocket'; manual import sets
+-- 'manual'; split children inherit the parent's `orig.source`.
+--
+-- Unreachable is not the same as harmless, because of what the column feeds.
+-- 0027 dropped the global unique on the recording id and replaced it with
+-- `(source, source_id)` on the grounds that two recorders' id namespaces can
+-- collide, and that a transcript overwritten by an unrelated recording is
+-- clinical-data loss. So a row that takes the default is not merely
+-- mislabelled — it is filed INTO the Pocket id namespace, where exactly that
+-- collision becomes possible. 0028 adds the second reason: a note built from a
+-- hand-pasted transcript should stay traceable as one.
+--
+-- The rows this protects are the hand-written ones — a recovery INSERT run
+-- against production at midnight. With a default, forgetting `source` yields a
+-- plausible-looking Pocket recording. Without one, it yields an error, which is
+-- the correct outcome for a field nothing can infer after the fact.
+--
+-- Metadata-only: no table rewrite, no scan, and no existing row changes.
+ALTER TABLE conversations ALTER COLUMN source DROP DEFAULT;

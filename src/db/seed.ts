@@ -178,6 +178,11 @@ async function main(): Promise<void> {
     // → extraction (mock) → draft sheet + protocol land in the review queue.
     if (apptStart < 0 && c.transcript) {
       const { conversationId, correlation } = await ingestConversation({
+        // Seed rows pose as device captures, which is what they were when
+        // `source` had a default. Keeping them 'pocket' holds `(source,
+        // source_id)` stable, so re-seeding an existing dev DB upserts the same
+        // rows instead of laying down a second copy under a new namespace.
+        source: 'pocket',
         source_id: `seed-${clientId}`,
         starts_at: iso(apptStart + 5 * 60 * 1000),
         ends_at: iso(apptEnd - 5 * 60 * 1000),
@@ -293,6 +298,7 @@ async function main(): Promise<void> {
   // A full multi-turn transcript, well past the 240-char list preview, so the
   // detail pane visibly shows the whole recording rather than the same snippet.
   await ingestConversation({
+    source: 'pocket',
     source_id: 'seed-unmatched-1',
     starts_at: iso(-9 * DAY),
     ends_at: iso(-9 * DAY + 40 * 60 * 1000),
