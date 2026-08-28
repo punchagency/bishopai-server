@@ -6,7 +6,7 @@ import { syncClientSupplements, removeSupplementsDroppedByAmendment } from './su
 import { createTasksFromNote, reconcileTasksAfterAmend } from '../tasks/service';
 import { snapshotRevision } from './revisions';
 import { recordAudit } from '../audit/log';
-import { listUnprocessed } from './unprocessed';
+import { listUnprocessed, tooShortForAppointment } from './unprocessed';
 
 // A session is ONE clinical note, not two documents.
 //
@@ -37,6 +37,23 @@ export interface SessionRow {
   sheet_id: string | null;
   protocol_id: string | null;
   content_json: unknown;
+  /** Seconds of recording filed against this appointment, summed. */
+  recording_seconds: number | null;
+  /** Seconds the appointment was booked for. */
+  appointment_seconds: number | null;
+  transcript_chars: number;
+  /**
+   * This recording cannot plausibly be this appointment — shown, never acted on.
+   *
+   * The check lived only in `listUnprocessed`, which is the one list where it
+   * adds nothing: those rows already say the extraction produced no note. The
+   * row that needs it is here. A fragment that yields one or two findings is not
+   * claimed by `classify`, so it falls out of that list and arrives in this one
+   * as an ordinary draft with a client name and a date on it — a note built from
+   * two minutes of a sixty-minute booking, indistinguishable from a session that
+   * simply ran short. That is the shape of thing that gets approved.
+   */
+  too_short_for_appointment: boolean;
 }
 
 /**
@@ -69,12 +86,24 @@ const SESSION_SELECT = `
          -- The sheet is the fuller record (it keeps assessments), so it is the
          -- canonical copy when both exist.
          COALESCE(s.content_json, p.content_json) AS content_json,
+         -- How much recording actually stands behind this note.
+         --
+         -- A plain join, with no aggregate and no status filter, because
+         -- migration 0022 makes conversations(appointment_id) unique: an
+         -- appointment holds at most ONE recording, so there is nothing to sum
+         -- and no fan-out to guard against. A split PARENT is not a second
+         -- recording here either — the split releases its appointment_id in the
+         -- same statement that marks it terminal, so it cannot reach this join.
+         EXTRACT(EPOCH FROM (a.ends_at - a.starts_at))::int AS appointment_seconds,
+         EXTRACT(EPOCH FROM (cv.ends_at - cv.starts_at))::int AS recording_seconds,
+         length(cv.transcript) AS transcript_chars,
          GREATEST(COALESCE(s.updated_at, 'epoch'::timestamptz),
                   COALESCE(p.updated_at, 'epoch'::timestamptz)) AS updated_at
     FROM appointments a
     LEFT JOIN appointment_sheets s ON s.appointment_id = a.id
     LEFT JOIN protocols p          ON p.appointment_id = a.id
-    LEFT JOIN clients c            ON c.id = a.client_id`;
+    LEFT JOIN clients c            ON c.id = a.client_id
+    LEFT JOIN conversations cv     ON cv.appointment_id = a.id`;
 
 interface RawSession {
   appointment_id: string;
@@ -86,6 +115,9 @@ interface RawSession {
   sheet_status: string | null;
   protocol_status: string | null;
   content_json: unknown;
+  appointment_seconds: number | null;
+  recording_seconds: number | null;
+  transcript_chars: number | null;
   updated_at: string;
 }
 
@@ -99,6 +131,14 @@ const toSession = (r: RawSession): SessionRow => ({
   sheet_id: r.sheet_id,
   protocol_id: r.protocol_id,
   content_json: r.content_json,
+  recording_seconds: r.recording_seconds ?? null,
+  appointment_seconds: r.appointment_seconds ?? null,
+  transcript_chars: r.transcript_chars ?? 0,
+  too_short_for_appointment: tooShortForAppointment(
+    r.recording_seconds ?? null,
+    r.appointment_seconds ?? null,
+    r.transcript_chars ?? 0,
+  ),
 });
 
 /** Escape LIKE wildcards so a client name with % or _ is matched literally. */
