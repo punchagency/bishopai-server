@@ -4,7 +4,7 @@ import { logEvent } from '../observability/logger';
 import { coerceSessionNote } from './render';
 import { syncClientSupplements, removeSupplementsDroppedByAmendment } from './supplements';
 import { createTasksFromNote, reconcileTasksAfterAmend } from '../tasks/service';
-import { snapshotRevision } from './revisions';
+import { snapshotRevision, snapshotExtractionBaseline, type NoteTable } from './revisions';
 import { recordAudit } from '../audit/log';
 import { listUnprocessed, tooShortForAppointment } from './unprocessed';
 
@@ -266,6 +266,25 @@ export async function patchSession(
         error: 'already approved',
         detail: 'This session has been approved and its documents published. Use amend to correct it.',
       };
+    }
+    // Capture what the extractor produced, before this edit overwrites it.
+    //
+    // Inside the same transaction as the write, because the pair only exists in
+    // the instant between them: once writeBoth runs, the model's version of this
+    // note is gone and nothing recovers it. A baseline filed outside the
+    // transaction could survive a rolled-back edit and claim to be a pair with
+    // an edit that never happened.
+    //
+    // One copy, on the canonical row. The sheet and the protocol hold identical
+    // content, so filing both would double every training pair and teach the
+    // same correction twice.
+    const canonical: [NoteTable, string] | null = cur.sheet_id
+      ? ['appointment_sheets', cur.sheet_id]
+      : cur.protocol_id
+        ? ['protocols', cur.protocol_id]
+        : null;
+    if (canonical && cur.content_json != null) {
+      await snapshotExtractionBaseline(db, canonical[0], canonical[1], cur.content_json);
     }
     await writeBoth(db, appointmentId, note);
     await db.query('COMMIT');
