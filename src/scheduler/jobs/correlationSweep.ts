@@ -3,7 +3,7 @@ import { pool } from '../../db/pool';
 import { logEvent, logError } from '../../observability/logger';
 import { correlateConversation, listOverlapCandidates } from '../../correlation/correlate';
 import { assessMultiSessionRisk } from '../../correlation/multiSession';
-import { processConversation } from '../../session/process';
+import { enqueueExtraction } from '../../session/queue';
 
 // Periodic catch-all for unmatched conversations that now have a matching
 // appointment.
@@ -137,18 +137,13 @@ export const correlationSweepJob: Job = {
               appointment_id: res.appointmentId,
               overlap_seconds: res.overlapSeconds,
             });
-            // Awaited, not fire-and-forget: an unhandled rejection here used
-            // to leave the row matched with nothing extracted and nothing in
-            // the log, which reads in the dashboard as a session Nicole simply
-            // never got a note for.
-            try {
-              await processConversation(conv.id);
-            } catch (err) {
-              logEvent('warn', 'correlation.sweep', 'processConversation failed after sweep match', {
-                conversation_id: conv.id,
-                error: String(err),
-              });
-            }
+            // Queued rather than run inline. The sweep matches conversations
+            // in a loop, and extracting each one where it is found means the
+            // sweep's runtime is however long N sessions take to read — with
+            // every one of them holding the sweep open against a provider that
+            // may be rate-limiting. The queue drains them one at a time on its
+            // own, and does it having first checked the day's allowance.
+            enqueueExtraction(conv.id);
           }
         } catch (err) {
           failed++;

@@ -249,10 +249,12 @@ describe('recorrelateOverlappingConversations', () => {
     expect(normalised).toContain("correlation_status <> 'split'");
   });
 
-  it('triggers processConversation after a successful re-match', async () => {
-    // Import the actual module so we can spy on processConversation.
-    const { processConversation } = await import('../session/process');
-    const processSpy = vi.spyOn({ processConversation }, 'processConversation').mockResolvedValue();
+  it('queues extraction after a successful re-match', async () => {
+    // Queued, not run. The sweep used to call processConversation directly and
+    // let the promise float, which meant a re-match could kick off an LLM call
+    // from inside a database transaction the caller still had open, unordered
+    // against every other conversation the same sweep re-matched. What it owes
+    // the conversation is a place in line; the drain decides when.
 
     // Fake DB: first SELECT returns an unmatched conversation; correlateConversation
     // is called with the conv's window, which needs a separate mock.
@@ -292,18 +294,14 @@ describe('recorrelateOverlappingConversations', () => {
       }),
     } as unknown as PoolClient;
 
-    // Module spy: patch processConversation in the module the sweep imports it from.
-    const processModule = await import('../session/process');
-    const spy = vi.spyOn(processModule, 'processConversation').mockResolvedValue();
+    // Spy on the queue module the sweep imports it from.
+    const queueModule = await import('../session/queue');
+    const spy = vi.spyOn(queueModule, 'enqueueExtraction').mockReturnValue();
 
     await recorrelateOverlappingConversations(db, '2026-07-01T15:00:00Z', '2026-07-01T16:00:00Z');
 
-    // Give the void promise a tick to resolve
-    await new Promise((r) => setTimeout(r, 10));
-
     expect(spy).toHaveBeenCalledWith('conv-1');
     spy.mockRestore();
-    processSpy.mockRestore();
   });
 
   it('skips conversations that are already matched to the correct appointment', async () => {

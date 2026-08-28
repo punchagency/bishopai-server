@@ -1,6 +1,6 @@
 import { ingestConversation, type ConversationInput, type IngestResult } from '../../conversations/ingest';
 import { existingWithTranscript } from '../../conversations/known';
-import { processConversation } from '../../session/process';
+import { enqueueExtraction } from '../../session/queue';
 import { logError, logEvent, logWarn } from '../../observability/logger';
 import { getRecording, listRecordings } from './client';
 import { isPocketConfigured, pocketPollConfig } from './config';
@@ -34,7 +34,10 @@ export interface PollDeps {
   getRecording: typeof getRecording;
   existingWithTranscript: typeof existingWithTranscript;
   ingest: (input: ConversationInput) => Promise<IngestResult>;
-  process: (conversationId: string) => Promise<unknown>;
+  /** Hand a matched recording to the extraction queue. Returns immediately —
+   *  see the call site for why this is no longer allowed to be the extraction
+   *  itself. */
+  enqueue: (conversationId: string) => void;
 }
 
 const defaultDeps: PollDeps = {
@@ -42,7 +45,7 @@ const defaultDeps: PollDeps = {
   getRecording,
   existingWithTranscript,
   ingest: ingestConversation,
-  process: processConversation,
+  enqueue: enqueueExtraction,
 };
 
 /** `YYYY-MM-DD` in UTC — the format Pocket's date filters expect. */
@@ -103,9 +106,16 @@ export async function pollPocketRecordings(
       result.ingested++;
       if (correlation.status === 'matched') {
         result.matched++;
-        await deps.process(conversationId).catch((err) =>
-          logError('session.process', 'processing failed', err, { conversation_id: conversationId }),
-        );
+        // Queued, not extracted here.
+        //
+        // This is the busiest ingest path in production, and it used to await a
+        // full extraction inside the sweep loop — which made the poll as long as
+        // however many sessions Pocket had just handed us, and put a second
+        // extractor in flight alongside whatever the retry drain was already
+        // running. Two concurrent extractions, each fanning out to four parallel
+        // stages, against a cap of twenty requests a day: precisely the shape
+        // the queue exists to prevent.
+        deps.enqueue(conversationId);
       }
     } catch (err) {
       // One unreadable recording must not abandon the rest of the sweep — the

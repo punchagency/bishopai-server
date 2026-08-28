@@ -4,6 +4,7 @@ import { GoogleGenAI } from '@google/genai';
 import Groq from 'groq-sdk';
 import type { z } from 'zod';
 import { llmConfig } from './config';
+import { assertAllowance, noteProviderError } from './allowance';
 import { llmLimiter } from './rateLimiter';
 import {
   ProviderError,
@@ -46,6 +47,12 @@ export interface StructuredResponse {
 }
 
 export async function generateStructured(req: StructuredRequest): Promise<StructuredResponse> {
+  // Refuse before the network if the day's allowance is already known to be
+  // spent. This is ahead of the token limiter on purpose: pacing a call we are
+  // certain will be refused just makes the refusal slower, and on a fanned-out
+  // stage it makes three more of them wait their turn to be refused too.
+  assertAllowance();
+
   // Pace under the provider's per-minute token budget before dispatching. Cost is
   // the prompt (~4 chars/token) plus the requested output budget, which is what
   // Groq's free tier bills against the TPM ceiling.
@@ -53,17 +60,27 @@ export async function generateStructured(req: StructuredRequest): Promise<Struct
     Math.ceil((req.system.length + req.user.length) / 4) + (req.maxTokens ?? llmConfig.maxTokens);
   await llmLimiter.acquire(estimatedCost);
 
-  switch (llmConfig.provider) {
-    case 'openrouter':
-      return openrouterExtract(req);
-    case 'anthropic':
-      return anthropicExtract(req);
-    case 'google':
-      return googleExtract(req);
-    case 'groq':
-      return groqExtract(req);
-    default:
-      throw new Error(`unknown LLM_PROVIDER: ${llmConfig.provider}`);
+  // Every provider funnels its failures through here, so one catch closes the
+  // gate for all four rather than each of them having to remember to.
+  try {
+    switch (llmConfig.provider) {
+      case 'openrouter':
+        return await openrouterExtract(req);
+      case 'anthropic':
+        return await anthropicExtract(req);
+      case 'google':
+        return await googleExtract(req);
+      case 'groq':
+        return await groqExtract(req);
+      default:
+        throw new Error(`unknown LLM_PROVIDER: ${llmConfig.provider}`);
+    }
+  } catch (err) {
+    // `await` above rather than bare `return` is what makes this reachable:
+    // returning the promise unawaited would settle it in the caller's frame and
+    // this catch would never see a rejection.
+    noteProviderError(err);
+    throw err;
   }
 }
 

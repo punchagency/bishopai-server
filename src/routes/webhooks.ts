@@ -5,7 +5,7 @@ import { pool } from '../db/pool';
 import { isPbConfigured } from '../integrations/pb/config';
 import { verifyBookingToken } from '../reengagement/bookingToken';
 import { ingestConversation } from '../conversations/ingest';
-import { processConversation } from '../session/process';
+import { enqueueExtraction } from '../session/queue';
 import { logError, logEvent, logWarn } from '../observability/logger';
 import { requireWebhookSecret, requirePbSignature, requirePocketSignature } from './webhookAuth';
 import { toConversationInput } from '../integrations/pocket/normalize';
@@ -258,9 +258,7 @@ webhooksRouter.post('/pocket', requirePocketSignature('POCKET_WEBHOOK_SECRET'), 
     // Extraction runs off the request path so the webhook returns inside
     // Pocket's 30s delivery timeout.
     if (correlation.status === 'matched') {
-      void processConversation(conversationId).catch((err) =>
-        logError('session.process', 'processing failed', err, { conversation_id: conversationId }),
-      );
+      enqueueExtraction(conversationId);
     }
     res.status(200).json({ conversation_id: conversationId, correlation });
   } catch (err) {

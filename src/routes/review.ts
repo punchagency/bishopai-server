@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { pool } from '../db/pool';
 import { logError, logEvent } from '../observability/logger';
 import { coerceSessionNote, renderAppointmentSheet, renderProtocol } from '../session/render';
-import { processConversation } from '../session/process';
+import { enqueueExtraction } from '../session/queue';
 import { ingestConversation } from '../conversations/ingest';
 import { manualSourceId, normalizeManualTranscript } from '../conversations/manualImport';
 import { publishApproved } from '../session/publish';
@@ -382,9 +382,7 @@ reviewRouter.post('/import', async (req, res) => {
     // Same off-request-path extraction as the webhook/match paths: only when the
     // synthetic window happened to correlate to a real appointment.
     if (correlation.status === 'matched') {
-      void processConversation(conversationId).catch((e) =>
-        logError('session.process', 'manual-import processing failed', e, { conversation_id: conversationId }),
-      );
+      enqueueExtraction(conversationId);
     }
     logEvent('info', 'review.import', 'imported a transcript by hand', {
       conversation_id: conversationId,
@@ -466,9 +464,7 @@ reviewRouter.post('/unmatched/:id/match', async (req, res) => {
     if (r.rowCount === 0) return res.status(409).json({ error: 'already matched or not found' });
 
     if (r.rows[0].transcript) {
-      void processConversation(r.rows[0].id).catch((e) =>
-        logError('session.process', 'post-match processing failed', e, { conversation_id: r.rows[0].id }),
-      );
+      enqueueExtraction(r.rows[0].id);
     }
     await recordAudit({
       entityType: 'session',
@@ -566,9 +562,7 @@ reviewRouter.post('/unmatched/:id/assign-client', async (req, res) => {
     });
 
     if (conv.rows[0].transcript) {
-      void processConversation(req.params.id).catch((e) =>
-        logError('session.process', 'walk-in processing failed', e, { conversation_id: req.params.id }),
-      );
+      enqueueExtraction(req.params.id);
     }
     return res.json({ appointment_id: appt.rows[0].id, client_id: parsed.data.client_id, status: 'walk_in' });
   } catch (err) {
@@ -753,9 +747,7 @@ async function handleSplitConversation(req: any, res: any) {
       createdIds.push(childId);
 
       if (seg.appointment_id || seg.client_id) {
-        void processConversation(childId).catch((e) =>
-          logError('session.process', 'split segment processing failed', e, { conversation_id: childId }),
-        );
+        enqueueExtraction(childId);
       }
     }
 
@@ -804,7 +796,12 @@ reviewRouter.post('/conversations/:id/split', handleSplitConversation);
 // session. That needs a deliberate amendment, not a re-assignment.
 type UnmatchOutcome = { code: number; body: Record<string, unknown> };
 
-async function unmatchByConversation(conversationId: string): Promise<UnmatchOutcome> {
+// Exported so operational scripts detach a recording through the SAME path the
+// UI does — the approved-note refusal, the draft cleanup, the audit entry. A
+// one-off script that reproduces this in hand-written SQL is a second
+// implementation of a destructive operation, and the copy is the one that
+// forgets the guard.
+export async function unmatchByConversation(conversationId: string): Promise<UnmatchOutcome> {
   const db = await pool.connect();
   try {
     await db.query('BEGIN');
@@ -1450,9 +1447,7 @@ async function reextractByConversation(
   // Off the request path, like every other extraction trigger here: a long
   // transcript on a small tier takes minutes, far longer than any sensible HTTP
   // timeout.
-  void processConversation(c.id).catch((e) =>
-    logError('session.process', 're-extraction failed', e, { conversation_id: c.id }),
-  );
+  enqueueExtraction(c.id);
 
   logEvent('info', 'review.reextract', 're-running extraction on an existing recording', {
     conversation_id: c.id,

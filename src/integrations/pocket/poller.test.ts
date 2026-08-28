@@ -20,7 +20,7 @@ function deps(over: Partial<PollDeps> = {}): PollDeps {
       conversationId: 'conv-1',
       correlation: { status: 'unmatched' as const, reason: 'no_candidates' as const, candidateCount: 0 },
     })),
-    process: vi.fn(async () => undefined),
+    enqueue: vi.fn(),
     ...over,
   };
 }
@@ -90,14 +90,17 @@ describe('pollPocketRecordings', () => {
     expect(d.ingest).toHaveBeenCalledWith(
       expect.objectContaining({ source_id: 'rec_1', source: 'pocket', transcript: 'Nicole: hello' }),
     );
-    expect(d.process).toHaveBeenCalledWith('conv-9');
+    // Queued, not extracted inline: the sweep must not hold itself open for
+    // however long N sessions take to read, nor run an extractor alongside the
+    // drain's.
+    expect(d.enqueue).toHaveBeenCalledWith('conv-9');
     expect(r).toMatchObject({ scanned: 1, fetched: 1, ingested: 1, matched: 1, failed: 0 });
   });
 
   it('does not fire extraction for an unmatched recording', async () => {
     const d = deps();
     const r = await pollPocketRecordings(d, NOW);
-    expect(d.process).not.toHaveBeenCalled();
+    expect(d.enqueue).not.toHaveBeenCalled();
     expect(r.matched).toBe(0);
   });
 

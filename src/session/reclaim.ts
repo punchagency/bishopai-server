@@ -1,7 +1,8 @@
 import { pool } from '../db/pool';
 import { logEvent } from '../observability/logger';
-import { processConversation } from './process';
+import { drainExtractionQueue } from './queue';
 import { RateLimitError } from '../llm/errors';
+import { MAX_ATTEMPTS, LEASE_MINUTES } from './extractionPolicy';
 
 // Extraction crash recovery + retry, modelled on the WF2 reconciliation outbox
 // (checkout/reconcile.ts) because the failure mode is the same shape: durable
@@ -14,18 +15,10 @@ import { RateLimitError } from '../llm/errors';
 // sheet. `failed` was barely better: retried only if a human happened to
 // re-match the conversation.
 
-/** How long a claim may go unfinished before we assume its owner died. A live
- *  extraction renews its lease (see startLeaseHeartbeat in process.ts), so this
- *  bounds crash-recovery latency, not how long a legitimate extraction may run. */
-export const LEASE_MINUTES = Number(process.env.EXTRACTION_LEASE_MINUTES ?? 10);
-/** Attempts before a conversation stops retrying and asks for a human. */
-const MAX_ATTEMPTS = Number(process.env.EXTRACTION_MAX_ATTEMPTS ?? 4);
-/** Capped backoff. Index by attempt count; past the end, use the last. */
-const BACKOFF_MINUTES = [1, 5, 15, 60];
-
-export function backoffMinutes(attempts: number): number {
-  return BACKOFF_MINUTES[Math.min(attempts, BACKOFF_MINUTES.length - 1)];
-}
+// Re-exported so the many existing importers of `./reclaim` keep working; the
+// numbers themselves now live in ./extractionPolicy, where the queue can read
+// them without importing this file.
+export { LEASE_MINUTES, MAX_ATTEMPTS, backoffMinutes } from './extractionPolicy';
 
 export interface ReclaimResult {
   reclaimed: number;
@@ -73,7 +66,7 @@ export interface RetryResult {
  * surfaces it, because "this recording never extracted" is something Nicole must
  * see rather than discover when an appointment sheet is missing.
  */
-export async function processDueExtractions(limit = 20): Promise<RetryResult> {
+export async function processDueExtractions(): Promise<RetryResult> {
   const dead = await pool.query(
     `UPDATE conversations
         SET extraction_status = 'needs_review', updated_at = now()
@@ -91,27 +84,26 @@ export async function processDueExtractions(limit = 20): Promise<RetryResult> {
     });
   }
 
-  // Only rows that are actually processable: matched, transcribed, and due.
-  const due = await pool.query<{ id: string }>(
-    `SELECT id FROM conversations
-      WHERE extraction_status = 'failed'
-        AND extraction_attempts < $1
-        AND appointment_id IS NOT NULL
-        AND transcript IS NOT NULL
-        AND (extraction_next_attempt_at IS NULL OR extraction_next_attempt_at <= now())
-      ORDER BY extraction_next_attempt_at NULLS FIRST
-      LIMIT $2`,
-    [MAX_ATTEMPTS, limit],
-  );
-
-  let retried = 0;
-  for (const row of due.rows) {
-    // Sequential on purpose: these are paid LLM calls and a backlog should drain
-    // steadily rather than stampede the provider after an outage.
-    await processConversation(row.id);
-    retried++;
+  // Drain through the queue rather than re-deriving "what is due" here.
+  //
+  // This used to run its own SELECT over `failed` rows only, which is how
+  // `pending` came to have no sweeper at all: the one status every conversation
+  // starts in was invisible to the one job whose purpose is rescuing stranded
+  // work. A row whose fire-and-forget call never fired — the process died on the
+  // line after the INSERT — sat `pending` forever, matched and transcribed and
+  // never once looked at.
+  //
+  // `limit` is no longer a row cap. The queue drains until it is empty or the
+  // allowance is spent, and stopping after twenty rows with the twenty-first
+  // sitting due would just mean waiting five minutes to do the obvious thing.
+  const { processed, parked } = await drainExtractionQueue();
+  const retried = processed;
+  if (retried > 0) logEvent('info', 'session.extract', 'drained due extractions', { retried });
+  if (parked) {
+    logEvent('info', 'session.extract', 'extraction paused until the allowance resets', {
+      drained_first: retried,
+    });
   }
-  if (retried > 0) logEvent('info', 'session.extract', 'retried failed extractions', { retried });
   return { retried, deadLettered };
 }
 

@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg';
 import { logEvent } from '../observability/logger';
-import { processConversation } from '../session/process';
+import { enqueueExtraction } from '../session/queue';
 import type { OverlapCandidate } from './multiSession';
 
 export type CorrelationResult =
@@ -323,15 +323,11 @@ export async function recorrelateOverlappingConversations(
         appointment_id: res.appointmentId,
         overlap_seconds: res.overlapSeconds,
       });
-      // Trigger extraction now that the conversation has a home. Fire-and-forget
-      // is fine here: the extraction job (reclaim.ts) will retry on failure, and
-      // we must not block the caller's transaction on a long LLM call.
-      void processConversation(conv.id).catch((err) => {
-        logEvent('warn', 'correlate.recorrelate', 'processConversation failed after re-match', {
-          conversation_id: conv.id,
-          error: String(err),
-        });
-      });
+      // The conversation has a home now, so it joins the queue. Returning
+      // immediately is the point: we must not block the caller's transaction on
+      // a long LLM call, and the row is already `pending` in the database, so
+      // the request survives this process dying on the next line.
+      enqueueExtraction(conv.id);
     }
   }
 }
