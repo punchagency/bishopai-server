@@ -266,7 +266,10 @@ Nicole: See https://fullscript.com/x for the link.`);
 
       expect(segments[0].suggested_appointment_id).toBe('appt_steve');
       expect(segments[0].client_name_hint).toBe('Steve Broderick');
-      expect(segments[0].time_disagreement_note).toMatch(/Transcript evidence strongly points to Steve Broderick/i);
+      // "strongly" was dropped from the wording: the note now fires only when
+      // name evidence actually outranked the calendar, and a single surname
+      // mention winning that comparison is not a strong claim.
+      expect(segments[0].time_disagreement_note).toMatch(/Transcript evidence points to Steve Broderick/i);
     });
 
     it('treats a client who shares the practitioner name as the client', async () => {
@@ -337,5 +340,130 @@ describe('renderTurnsForBoundaryPrompt', () => {
     const impossible = renderTurnsForBoundaryPrompt(turns, 10);
     expect(impossible.fits).toBe(false);
     expect(impossible.lines).toHaveLength(turns.length);
+  });
+});
+
+// Regressions from the 2026-08-27 review. Each of these reproduced a real
+// misbehaviour before the fix in the same commit; the comments say what.
+describe('segmenter regressions (2026-08-27)', () => {
+  const REC_START = Date.parse('2026-08-27T10:00:00Z');
+  const REC_END = Date.parse('2026-08-27T11:00:00Z');
+  const APPTS = [
+    {
+      id: 'appt-steve',
+      starts_at: '2026-08-27T10:00:00Z',
+      ends_at: '2026-08-27T10:30:00Z',
+      client_name: 'Steve Broderick',
+      overlap_seconds: 1800,
+    },
+    {
+      id: 'appt-jodi',
+      starts_at: '2026-08-27T10:30:00Z',
+      ends_at: '2026-08-27T11:00:00Z',
+      client_name: 'Jodi Hess',
+      overlap_seconds: 1800,
+    },
+  ];
+
+  /** Two back-to-back consultations where the practitioner speaks both halves
+   *  of the handover — no client says anything between the goodbye and the
+   *  hello. This is the ordinary shape of a back-to-back recording. */
+  function backToBack(): string {
+    const t: string[] = ['NICOLE: Hi Steve, come on in and have a seat.', 'STEVE: Thanks, good to be back.'];
+    for (let i = 0; i < 8; i++) {
+      t.push(`NICOLE: Let's review your magnesium dose, point ${i}.`);
+      t.push(`STEVE: That sounds right to me, point ${i}.`);
+    }
+    // Passing mentions of the OTHER client, by full name — a referral, say.
+    t.push('NICOLE: Jodi Hess mentioned the same reflux issue last week.');
+    t.push('STEVE: Oh, Jodi Hess? Small world.');
+    t.push('NICOLE: All right Steve, see you next month. Take care.');
+    t.push('NICOLE: Hi Jodi, welcome, have a seat.');
+    t.push('JODI: Hi, thanks.');
+    for (let i = 0; i < 10; i++) {
+      t.push(`NICOLE: And how has the sleep been, week ${i}?`);
+      t.push(`JODI: Better, week ${i}.`);
+    }
+    t.push('NICOLE: Great. Take care, bye.');
+    return t.join('\n');
+  }
+
+  it('puts the incoming client\'s greeting in the incoming client\'s segment', async () => {
+    // mergeAdjacentTurns used to fuse "see you next month" and "Hi Jodi" into a
+    // single turn, because both are NICOLE. A boundary is a turn index, so once
+    // they are one turn there is no index between them: the greeting — a direct
+    // address, and the strongest identity signal there is — ended up inside the
+    // OUTGOING client's segment.
+    const segments = await detectSessionBoundaries(
+      backToBack(), ['Steve Broderick', 'Jodi Hess'], APPTS, REC_START, REC_END, 'Nicole',
+    );
+    expect(segments).toHaveLength(2);
+    expect(segments[1].snippet).toMatch(/Hi Jodi/);
+    expect(segments[0].snippet).not.toMatch(/Hi Jodi/);
+  });
+
+  it('does not swap the two clients', async () => {
+    // The end-to-end symptom of the merge above, compounded by a greedy
+    // assignment: BOTH segments came back on the other client's appointment,
+    // and the disagreement note argued confidently for the wrong one.
+    const segments = await detectSessionBoundaries(
+      backToBack(), ['Steve Broderick', 'Jodi Hess'], APPTS, REC_START, REC_END, 'Nicole',
+    );
+    expect(segments[0].suggested_appointment_id).toBe('appt-steve');
+    expect(segments[1].suggested_appointment_id).toBe('appt-jodi');
+    expect(segments[0].client_name_hint).toBe('Steve Broderick');
+    expect(segments[1].client_name_hint).toBe('Jodi Hess');
+  });
+
+  it('declines to assign an appointment there is no evidence for', async () => {
+    // A single session, and a second appointment that merely brushes the end of
+    // the recording. That appointment used to be handed to whichever segment
+    // was left over, on a composite score of ~17 out of a possible ~9000.
+    const t = ['NICOLE: Hi Steve, come on in.', 'STEVE: Thanks.'];
+    for (let i = 0; i < 14; i++) {
+      t.push(`NICOLE: How is the magnesium going, week ${i}?`);
+      t.push(`STEVE: Fine, week ${i}.`);
+    }
+    const brushing = [
+      APPTS[0],
+      {
+        id: 'appt-stranger',
+        starts_at: '2026-08-27T10:59:00Z',
+        ends_at: '2026-08-27T11:30:00Z',
+        client_name: 'Someone Else',
+        overlap_seconds: 60,
+      },
+    ];
+    const segments = await detectSessionBoundaries(
+      t.join('\n'), ['Steve Broderick', 'Someone Else'], brushing, REC_START, REC_END, 'Nicole',
+    );
+    expect(segments).toHaveLength(1);
+    expect(segments[0].suggested_appointment_id).toBe('appt-steve');
+    // And nothing anywhere claims the stranger.
+    expect(segments.map((s) => s.suggested_appointment_id)).not.toContain('appt-stranger');
+  });
+
+  it('lets the better-evidenced segment win an appointment both want', async () => {
+    // Best match, never first match. Segment 1 names Jodi in passing; segment 2
+    // is addressed to her directly. Ordered assignment gave it to segment 1
+    // because segment 1 asked first.
+    const segments = await detectSessionBoundaries(
+      backToBack(), ['Steve Broderick', 'Jodi Hess'], APPTS, REC_START, REC_END, 'Nicole',
+    );
+    // Segment 1 mentions "Jodi Hess" twice by full name; segment 2 is greeted
+    // as "Hi Jodi". The direct address must win.
+    expect(segments[1].suggested_appointment_id).toBe('appt-jodi');
+  });
+
+  it('does not let a segment run shorter than the stated minimum', async () => {
+    // `turns.length - turnIdx >= MIN_SEGMENT_TURNS` was off by one: a segment
+    // from `turnIdx` to the last turn holds `length - turnIdx + 1` turns, so a
+    // 12-turn floor quietly demanded 13.
+    const segments = await detectSessionBoundaries(
+      backToBack(), ['Steve Broderick', 'Jodi Hess'], APPTS, REC_START, REC_END, 'Nicole',
+    );
+    for (const s of segments) {
+      expect(s.to_turn - s.from_turn + 1).toBeGreaterThanOrEqual(12);
+    }
   });
 });

@@ -256,6 +256,37 @@ export function parseTranscript(raw: string): Turn[] {
  * speaker attribution richer turns to score, and it gets that from a paragraph
  * just as well as from a page.
  */
+/**
+ * A goodbye to one client followed by a hello to the next — the seam between two
+ * consultations in a back-to-back recording.
+ *
+ * These live here, in the turn layer, rather than in the segmenter that needs
+ * them, because the merge below has to know about them too and the dependency
+ * only runs one way. Two copies of "what a handover looks like" would drift, and
+ * the drift would be invisible: the merge would fuse a seam the segmenter was
+ * still looking for.
+ *
+ * Anchored to the EDGES rather than searched across the whole turn. A farewell
+ * belongs at the end of what someone was saying and a greeting at the start of
+ * what they say next; a "take care" in the middle of a sentence about a client's
+ * mother is not a handover, and matching it anywhere would split sessions apart
+ * on ordinary conversation.
+ */
+const HANDOVER_EDGE_CHARS = 80;
+const FAREWELL_RE = /\b(all right.*see you|see you|bye|take care|have a good day|goodbye)\b/i;
+const GREETING_RE = /\b(hi|hello|welcome|introduce yourself|good to see you|how are you|hey|come on in|have a seat|what brings you|next patient)\b/i;
+
+/** True when `before` ends by saying goodbye and `after` opens by saying hello. */
+export function looksLikeHandover(before: string, after: string): boolean {
+  const tail = before.slice(-HANDOVER_EDGE_CHARS);
+  const head = after.slice(0, HANDOVER_EDGE_CHARS);
+  return FAREWELL_RE.test(tail) && GREETING_RE.test(head);
+}
+
+/** Exported for the segmenter, which scores the same two signals across turns
+ *  that this refused to merge. One definition, two readers. */
+export const HANDOVER_PATTERNS = { FAREWELL_RE, GREETING_RE } as const;
+
 export function mergeAdjacentTurns(turns: Turn[], maxGapSeconds = 30, maxWords = 120): Turn[] {
   const out: Turn[] = [];
   // Track lengths alongside, so a long run of merges stays linear rather than
@@ -274,7 +305,19 @@ export function mergeAdjacentTurns(turns: Turn[], maxGapSeconds = 30, maxWords =
       prev &&
       prev.speaker === t.speaker &&
       gap <= maxGapSeconds &&
-      lengths[lengths.length - 1] + words <= maxWords
+      lengths[lengths.length - 1] + words <= maxWords &&
+      // Never merge across a session handover.
+      //
+      // This is the one place where two turns under the same label are NOT one
+      // utterance: in a back-to-back recording the practitioner says goodbye to
+      // one client and hello to the next without anyone else speaking, and
+      // merging fuses the seam into a single turn. The damage is not cosmetic —
+      // a boundary is a turn index, so once the farewell and the greeting are
+      // the same turn there is no index that separates them, and the incoming
+      // client's greeting (a direct address, the strongest identity signal we
+      // have) lands inside the OUTGOING client's segment. Measured on a
+      // two-appointment recording that swapped both clients outright.
+      !looksLikeHandover(prev.text, t.text)
     ) {
       prev.text = `${prev.text} ${t.text}`;
       lengths[lengths.length - 1] += words;

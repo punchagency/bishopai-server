@@ -1,6 +1,6 @@
 import { logEvent } from '../observability/logger';
 import { generateStructured } from '../llm/providers';
-import { estimateTokens, prepareTurns, type Role } from './transcript';
+import { HANDOVER_PATTERNS, estimateTokens, prepareTurns, type Role } from './transcript';
 import { scoreNameMatch, nameSignalRank } from '../correlation/nameMatch';
 import { z } from 'zod';
 
@@ -190,9 +190,12 @@ export async function detectSessionBoundaries(
     ];
   }
 
-  // Tighter farewell & greeting regexes anchored to transitional phrasing
-  const GREETING_REGEX = /\b(hi|hello|welcome|introduce yourself|good to see you|how are you|hey|come on in|have a seat|what brings you|next patient)\b/i;
-  const FAREWELL_REGEX = /\b(all right.*see you|see you|bye|take care|have a good day|goodbye)\b/i;
+  // The same two patterns mergeAdjacentTurns refuses to fuse across. Imported
+  // rather than restated: when these were defined here and the merge had no
+  // notion of them at all, the merge fused every handover the practitioner spoke
+  // both halves of, and this scorer spent its time looking for a seam that had
+  // already been erased.
+  const { FAREWELL_RE: FAREWELL_REGEX, GREETING_RE: GREETING_REGEX } = HANDOVER_PATTERNS;
 
   // `parseTurns` already resolved a majority role per speaker; this only layers
   // the two things it cannot know — who the practitioner is by name, and who is
@@ -281,7 +284,10 @@ export async function detectSessionBoundaries(
   for (const [turnIdx] of sortedScoredTurns) {
     if (boundaryTurns.length >= MAX_SESSIONS) break;
     const isFarEnoughFromPrior = boundaryTurns.every((b) => Math.abs(b - turnIdx) >= MIN_SEGMENT_TURNS);
-    const isFarEnoughFromEnd = turns.length - turnIdx >= MIN_SEGMENT_TURNS;
+    // `+ 1` because a segment running from `turnIdx` to the last turn holds
+    // `length - turnIdx + 1` turns, not `length - turnIdx`. Without it a 12-turn
+    // minimum quietly demanded 13.
+    const isFarEnoughFromEnd = turns.length - turnIdx + 1 >= MIN_SEGMENT_TURNS;
     if (isFarEnoughFromPrior && isFarEnoughFromEnd && turnIdx > 1) {
       boundaryTurns.push(turnIdx);
     }
@@ -322,7 +328,7 @@ ${turnSummaryLines.join('\n')}`;
       const llmPromise = generateStructured({
         system: systemPrompt,
         user: userPrompt,
-        zodSchema: z.object({ boundary_turns: z.array(z.number()) }),
+        zodSchema: z.object({ boundary_turns: z.array(z.number().int()) }),
         jsonSchema: {
           type: 'object',
           properties: {
@@ -342,11 +348,18 @@ ${turnSummaryLines.join('\n')}`;
       if (res && 'parsed' in res) {
         const parsed = res.parsed as { boundary_turns?: number[] };
         if (parsed?.boundary_turns && Array.isArray(parsed.boundary_turns)) {
-          const sortedLlmTurns = parsed.boundary_turns.sort((a, b) => a - b);
+          // Integers only. The JSON schema asks for them and the zod schema now
+          // enforces them, but a provider that ignores both would otherwise put
+          // a fractional turn into `from_turn`, which the split endpoint then
+          // rejects as a 400 — a confusing failure two screens away from its
+          // cause, instead of a boundary quietly declined here.
+          const sortedLlmTurns = parsed.boundary_turns
+            .filter((n) => Number.isInteger(n))
+            .sort((a, b) => a - b);
           for (const turnNum of sortedLlmTurns) {
             if (boundaryTurns.length >= MAX_SESSIONS) break;
             const isFarEnoughFromPrior = boundaryTurns.every((b) => Math.abs(b - turnNum) >= MIN_SEGMENT_TURNS);
-            const isFarEnoughFromEnd = turns.length - turnNum >= MIN_SEGMENT_TURNS;
+            const isFarEnoughFromEnd = turns.length - turnNum + 1 >= MIN_SEGMENT_TURNS;
             if (isFarEnoughFromPrior && isFarEnoughFromEnd && turnNum > 1) {
               boundaryTurns.push(turnNum);
               turnScores.set(turnNum, 60);
@@ -411,84 +424,141 @@ ${turnSummaryLines.join('\n')}`;
     });
   }
 
-  // Multi-signal appointment assignment.
-  // Combines (1) direct identity evidence from transcript name match (with direct address priority)
-  // and (2) overlap-maximising appointment time window arithmetic.
+  // Assigning segments to appointments.
+  //
+  // Two signals, ranked rather than added together:
+  //
+  //   nameRank  identity evidence from the transcript itself (nameSignalRank:
+  //             0 for nothing, ~1000-3999 for a mention, +5000 for a direct
+  //             address like "Hi Jodi").
+  //   timeScore how much of the recording this segment shares with the
+  //             appointment's calendar window, 0-1000.
+  //
+  // These used to be SUMMED, and that quietly made them the same currency. The
+  // name tiers sit 1000 apart and a full-overlap timeScore is worth exactly
+  // 1000, so time could promote a weaker name match a whole tier and outrank a
+  // stronger one — the opposite of the stated design, where transcript identity
+  // leads and the calendar breaks ties. Comparing them lexicographically is what
+  // actually expresses "name first, then time".
+  const MIN_TIME_SHARE = 0.25;
+
+  interface Pair {
+    si: number;
+    appt: CalendarAppointment;
+    nameRank: number;
+    timeScore: number;
+    overlapMs: number;
+  }
+
   const assignedApptIds = new Set<string>();
   const segmentApptIds: (string | null)[] = rawSegments.map(() => null);
   const segmentDisagreementNotes: (string | null)[] = rawSegments.map(() => null);
 
   const recStartMs = recordingStartMs ?? 0;
   const recEndMs = recordingEndMs ?? 0;
-  const recDurMs = Math.max(1, recEndMs - recStartMs);
+  // A start with no end (or the reverse) gives no usable window at all. Falling
+  // back to Math.max(1, ...) there produced a 1ms recording, against which any
+  // appointment containing that instant scored a perfect 1000 — a confident
+  // answer manufactured from a missing field.
+  const haveWindow = recEndMs > recStartMs && recStartMs > 0;
+  const recDurMs = haveWindow ? recEndMs - recStartMs : 0;
 
   // Only consider appointments with real overlap (>0s) for auto-assignment.
   const assignableAppts = overlappingAppts.slice().sort(
     (a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime(),
   );
 
+  // The time winner per segment, kept for the disagreement note: it is what the
+  // calendar alone would have said, and saying so is only meaningful when the
+  // transcript overruled it.
+  const timeWinnerBySegment: (CalendarAppointment | null)[] = rawSegments.map(() => null);
+
+  const pairs: Pair[] = [];
   for (let si = 0; si < rawSegments.length; si++) {
     const seg = rawSegments[si];
     const segStartMs = recStartMs + Math.round(((seg.fromTurn - 1) / Math.max(1, turns.length)) * recDurMs);
     const segEndMs = recStartMs + Math.round((seg.toTurn / Math.max(1, turns.length)) * recDurMs);
-
-    let bestAppt: CalendarAppointment | null = null;
-    let bestScore = -1;
-    let timeOverlapWinner: CalendarAppointment | null = null;
     let maxOverlapMs = 0;
 
     for (const appt of assignableAppts) {
-      if (assignedApptIds.has(appt.id)) continue;
-
       const apptStartMs = new Date(appt.starts_at).getTime();
       const apptEndMs = new Date(appt.ends_at).getTime();
-      const overlapMs =
-        recStartMs > 0 || recEndMs > 0
-          ? Math.max(0, Math.min(segEndMs, apptEndMs) - Math.max(segStartMs, apptStartMs))
-          : 0;
-
+      const overlapMs = haveWindow
+        ? Math.max(0, Math.min(segEndMs, apptEndMs) - Math.max(segStartMs, apptStartMs))
+        : 0;
       if (overlapMs > maxOverlapMs) {
         maxOverlapMs = overlapMs;
-        timeOverlapWinner = appt;
+        timeWinnerBySegment[si] = appt;
       }
-
-      const nameSig = scoreNameMatch(seg.sliceText, appt.client_name);
-      const nameRank = nameSignalRank(nameSig);
+      const nameRank = nameSignalRank(scoreNameMatch(seg.sliceText, appt.client_name));
       const timeScore = recDurMs > 0 ? (overlapMs / recDurMs) * 1000 : 0;
-      const compositeScore = nameRank + timeScore;
 
-      if (compositeScore > bestScore && compositeScore > 0) {
-        bestScore = compositeScore;
-        bestAppt = appt;
-      }
+      // The floor. A segment used to be assigned to whatever scrap of an
+      // appointment was left over: measured on a two-appointment recording, one
+      // segment was bound to an appointment on a composite of ~17 out of a
+      // possible ~9000 — no name evidence at all and one minute of trailing
+      // overlap — and presented as a suggestion with nothing to say it was a
+      // guess. Either the transcript names this person, or the windows genuinely
+      // coincide. Neither, and we decline to guess.
+      if (nameRank === 0 && timeScore < MIN_TIME_SHARE * 1000) continue;
+      pairs.push({ si, appt, nameRank, timeScore, overlapMs });
+    }
+  }
+
+  // Best match globally, never first match.
+  //
+  // Segments used to claim appointments in order, so segment 0 took its best
+  // guess and segment 1 could not have it however much stronger its evidence
+  // was. evalMatch.ts carries a long comment about being burned by exactly this
+  // — greedy first-past-the-post silently mis-binding pairs that share a signal
+  // — and there it only corrupted a metric. Here it decides whose chart the
+  // clinical content lands on. Sorting every candidate pair and taking them
+  // strongest-first means the best-evidenced claim wins regardless of where its
+  // segment happens to sit in the recording.
+  pairs.sort((a, b) => b.nameRank - a.nameRank || b.timeScore - a.timeScore);
+  for (const pair of pairs) {
+    if (segmentApptIds[pair.si] !== null) continue;
+    if (assignedApptIds.has(pair.appt.id)) continue;
+    segmentApptIds[pair.si] = pair.appt.id;
+    assignedApptIds.add(pair.appt.id);
+  }
+
+  for (let si = 0; si < rawSegments.length; si++) {
+    const seg = rawSegments[si];
+    const apptId = segmentApptIds[si];
+    if (!apptId) continue;
+    const bestAppt = assignableAppts.find((a) => a.id === apptId)!;
+    const timeWinner = timeWinnerBySegment[si];
+
+    // The transcript overruled the calendar. Worth saying, because it is the
+    // case a human should look at — and it must only be said when it is true.
+    // Under the old summed score this note fired on segments whose name
+    // evidence had NOT won, announcing the wrong client with real confidence.
+    if (timeWinner && timeWinner.id !== bestAppt.id && timeWinner.client_name && bestAppt.client_name) {
+      segmentDisagreementNotes[si] =
+        `Transcript evidence points to ${bestAppt.client_name}, but calendar overlap suggested ${timeWinner.client_name}.`;
+      continue;
     }
 
-    if (!bestAppt && timeOverlapWinner) {
-      bestAppt = timeOverlapWinner;
+    // The name the transcript shouts and the name we filed it under are two
+    // different people. Nothing checked this before, so a segment could come
+    // back hinting at one client and suggesting another's appointment with no
+    // sign that the two disagreed.
+    if (seg.clientHint && bestAppt.client_name && seg.clientHint !== bestAppt.client_name) {
+      segmentDisagreementNotes[si] =
+        `This segment reads like ${seg.clientHint}, but it has been matched to ${bestAppt.client_name}'s appointment. Check before splitting.`;
+      continue;
     }
 
-    if (bestAppt) {
-      assignedApptIds.add(bestAppt.id);
-      segmentApptIds[si] = bestAppt.id;
-
-      if (
-        timeOverlapWinner &&
-        timeOverlapWinner.id !== bestAppt.id &&
-        timeOverlapWinner.client_name &&
-        bestAppt.client_name
-      ) {
+    if (recDurMs > 0 && bestAppt.overlap_seconds > 0) {
+      const apptOverlapShare = (bestAppt.overlap_seconds * 1000) / recDurMs;
+      const diff = Math.abs(seg.turnShare - apptOverlapShare);
+      if (diff > 0.25) {
+        const turnPct = Math.round(seg.turnShare * 100);
+        const calPct = Math.round(apptOverlapShare * 100);
         segmentDisagreementNotes[si] =
-          `Transcript evidence strongly points to ${bestAppt.client_name}, but calendar overlap suggested ${timeOverlapWinner.client_name}.`;
-      } else if (recDurMs > 0 && bestAppt.overlap_seconds > 0) {
-        const apptOverlapShare = (bestAppt.overlap_seconds * 1000) / recDurMs;
-        const diff = Math.abs(seg.turnShare - apptOverlapShare);
-        if (diff > 0.25) {
-          const turnPct = Math.round(seg.turnShare * 100);
-          const calPct = Math.round(apptOverlapShare * 100);
-          segmentDisagreementNotes[si] =
-            `Turn share (${turnPct}%) differs from calendar overlap (${calPct}%) by more than 25% — ` +
-            `the boundary may be in the wrong place, or the appointment ran short/long.`;
-        }
+          `Turn share (${turnPct}%) differs from calendar overlap (${calPct}%) by more than 25% — ` +
+          `the boundary may be in the wrong place, or the appointment ran short/long.`;
       }
     }
   }

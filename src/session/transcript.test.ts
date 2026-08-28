@@ -370,3 +370,50 @@ describe('findSessionRestart', () => {
     expect(findSessionRestart(smallTalk)).toBeNull();
   });
 });
+
+describe('mergeAdjacentTurns across a session handover', () => {
+  // In a back-to-back recording the practitioner says goodbye to one client and
+  // hello to the next with nobody speaking in between. Both lines carry her
+  // label, so the merge treated them as one utterance and fused them — and a
+  // boundary is a turn index, so afterwards there was no index that separated
+  // the two consultations.
+  const handover = [
+    'NICOLE: All right Steve, see you next month. Take care.',
+    'NICOLE: Hi Jodi, welcome, have a seat.',
+    'JODI: Hi, thanks.',
+  ].join('\n');
+
+  it('keeps the goodbye and the hello as separate turns', () => {
+    const turns = prepareTurns(handover);
+    expect(turns).toHaveLength(3);
+    expect(turns[0].text).toMatch(/see you next month/);
+    expect(turns[0].text).not.toMatch(/Hi Jodi/);
+    expect(turns[1].text).toMatch(/Hi Jodi/);
+  });
+
+  it('still merges ordinary consecutive turns from the same speaker', () => {
+    // The guard must be narrow. Merging exists to give speaker attribution
+    // richer turns to score, and breaking that to fix handovers would trade one
+    // bug for a worse one.
+    const ordinary = [
+      'NICOLE: So the magnesium is doing its job.',
+      'NICOLE: We will keep it at the same dose.',
+      'STEVE: Sounds good.',
+    ].join('\n');
+    const turns = prepareTurns(ordinary);
+    expect(turns).toHaveLength(2);
+    expect(turns[0].text).toMatch(/magnesium.*same dose/s);
+  });
+
+  it('does not split on a farewell word that is not at the seam', () => {
+    // "take care" as advice, not as a goodbye — and the next turn opens with no
+    // greeting at all. Anchoring the patterns to the edges of each turn is what
+    // keeps this from reading as a handover.
+    const advice = [
+      'NICOLE: Take care with the dose on an empty stomach.',
+      'NICOLE: Otherwise it can be quite harsh.',
+      'STEVE: Understood.',
+    ].join('\n');
+    expect(prepareTurns(advice)).toHaveLength(2);
+  });
+});
