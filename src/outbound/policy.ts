@@ -23,6 +23,16 @@ export type OutboundCategory =
 export type OutboundState = 'pending' | 'approved' | 'rejected' | 'sent' | 'expired' | 'failed';
 
 /**
+ * How fast this email needs a decision.
+ *
+ * 'urgent' is not "more important" — it is "worth less every hour it waits".
+ * The enquiry welcome is the case it exists for: someone has just written in,
+ * and a same-day reply is most of its value. It still requires approval; it
+ * simply asks for one today rather than at the weekly review.
+ */
+export type OutboundPriority = 'urgent' | 'normal';
+
+/**
  * How long an approved-but-unsent item stays valid.
  *
  * A cadence step is written for a moment: "just checking in" three days after an
@@ -32,10 +42,37 @@ export type OutboundState = 'pending' | 'approved' | 'rejected' | 'sent' | 'expi
  */
 export const EXPIRY_DAYS = 7;
 
+/**
+ * Urgent items get one day, not seven.
+ *
+ * The whole claim of the urgent lane is that this email is worth sending today
+ * and not much afterwards. Letting it linger a week would contradict that and
+ * quietly reintroduce the problem the exemption was protecting against — a
+ * welcome arriving days after the enquiry, which reads worse than silence.
+ */
+export const URGENT_EXPIRY_DAYS = 1;
+
 const DAY_MS = 86_400_000;
 
 export function expiryFor(sendAfter: Date, days = EXPIRY_DAYS): Date {
   return new Date(sendAfter.getTime() + days * DAY_MS);
+}
+
+/** How long an item of this priority stays valid. */
+export function expiryDaysFor(priority: OutboundPriority): number {
+  return priority === 'urgent' ? URGENT_EXPIRY_DAYS : EXPIRY_DAYS;
+}
+
+/**
+ * Which cadence steps decay fast enough to need a same-day decision.
+ *
+ * Deliberately a tiny list rather than a per-track rule. Everything here costs
+ * Nicole an interruption, so a step earns its place by being worthless late —
+ * not by being important. A win-back nudge matters a great deal and is still
+ * perfectly good on Friday.
+ */
+export function priorityForStep(step: string): OutboundPriority {
+  return step === 'welcome' ? 'urgent' : 'normal';
 }
 
 /**
@@ -108,6 +145,8 @@ export function isExpired(state: OutboundState, now: Date, expiresAt: Date): boo
 export interface QueuedEmailInput {
   list?: OutboundList;
   category: OutboundCategory;
+  /** Defaults to 'normal'. See OutboundPriority. */
+  priority?: OutboundPriority;
   toEmail: string;
   subject: string;
   body: string;
@@ -123,14 +162,18 @@ export interface QueuedEmailInput {
 export function normalizeQueueInput(
   input: QueuedEmailInput,
   now: Date,
-): Required<Pick<QueuedEmailInput, 'list' | 'sendAfter' | 'expiresAt'>> & {
+): Required<Pick<QueuedEmailInput, 'list' | 'priority' | 'sendAfter' | 'expiresAt'>> & {
   dedupeKey: string;
 } {
   const sendAfter = input.sendAfter ?? now;
+  const priority = input.priority ?? 'normal';
   return {
     list: input.list ?? listForCategory(input.category),
+    priority,
     sendAfter,
-    expiresAt: input.expiresAt ?? expiryFor(sendAfter),
+    // Derived from the priority rather than a fixed week, so an urgent item
+    // cannot be queued with a seven-day window by omission.
+    expiresAt: input.expiresAt ?? expiryFor(sendAfter, expiryDaysFor(priority)),
     dedupeKey: dedupeKeyFor(input.toEmail, input.sourceRef),
   };
 }

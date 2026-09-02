@@ -43,6 +43,49 @@ function resolveProvider(): Provider {
 
 const provider = resolveProvider();
 
+/**
+ * Every API key configured for one provider, in the order they will be tried.
+ *
+ * A daily allowance is not a property of this process — it belongs to the
+ * PROJECT behind the key. So a second key on a second project is a second day's
+ * worth of requests, and stopping at the first spent one throws away capacity
+ * that is already paid for and sitting in the env file. llm/keyring.ts rotates
+ * across whatever this returns.
+ *
+ * Either form works, and they compose:
+ *
+ *   GOOGLE_API_KEY=key-one,key-two
+ *   GOOGLE_API_KEY=key-one
+ *   GOOGLE_API_KEY_2=key-two
+ *
+ * Duplicates are dropped. Two names pointing at one key would otherwise make
+ * the ring look twice as deep as it is, and the extra depth costs a real
+ * request to disprove — the rotation only learns a key is spent by being
+ * refused by it.
+ */
+function apiKeys(...names: string[]): string[] {
+  const keys: string[] = [];
+  const push = (raw: string | undefined) => {
+    for (const part of (raw ?? '').split(/[,\s]+/)) {
+      const key = part.trim();
+      if (key && !keys.includes(key)) keys.push(key);
+    }
+  };
+  for (const name of names) {
+    push(process.env[name]);
+    // Numbered to 9 rather than scanning for a prefix: a mistyped
+    // GOOGLE_API_KEY_PROD should stay a mistake, not become a silent third key
+    // that the ring reports as capacity it does not have.
+    for (let i = 2; i <= 9; i++) push(process.env[`${name}_${i}`]);
+  }
+  return keys;
+}
+
+const openrouterKeys = apiKeys('OPENROUTER_API_KEY');
+const groqKeys = apiKeys('GROQ_API_KEY');
+const googleKeys = apiKeys('GOOGLE_API_KEY', 'GEMINI_API_KEY');
+const anthropicKeys = apiKeys('ANTHROPIC_API_KEY');
+
 /** Tokens of headroom left for the system prompt and schema on every call. */
 const PROMPT_OVERHEAD_TOKENS = 800;
 
@@ -265,7 +308,11 @@ export const llmConfig = {
   rateLimitRetries: Number(process.env.LLM_RATE_LIMIT_RETRIES ?? (provider === 'groq' ? 6 : 3)),
 
   openrouter: {
-    apiKey: process.env.OPENROUTER_API_KEY ?? '',
+    /** First configured key. The one actually in use is openrouterKeys[n] —
+     *  ask llm/keyring.ts, which rotates when a key's day is spent. */
+    apiKey: openrouterKeys[0] ?? '',
+    /** Every key for this provider, tried in order. */
+    apiKeys: openrouterKeys,
     model: process.env.OPENROUTER_MODEL ?? 'nvidia/nemotron-3-super-120b-a12b:free',
     baseUrl: (process.env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1').replace(/\/+$/, ''),
     /** Same reason as groq's: a reasoning model that thinks past its completion
@@ -287,7 +334,11 @@ export const llmConfig = {
   },
 
   groq: {
-    apiKey: process.env.GROQ_API_KEY ?? '',
+    /** First configured key. The one actually in use is groqKeys[n] —
+     *  ask llm/keyring.ts, which rotates when a key's day is spent. */
+    apiKey: groqKeys[0] ?? '',
+    /** Every key for this provider, tried in order. */
+    apiKeys: groqKeys,
     model: process.env.GROQ_MODEL ?? 'openai/gpt-oss-120b',
     /**
      * Reasoning budget for gpt-oss models. 'low' is not a quality compromise
@@ -308,7 +359,11 @@ export const llmConfig = {
     reasoningEffort: reasoningEffort(process.env.GROQ_REASONING_EFFORT),
   },
   google: {
-    apiKey: process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY ?? '',
+    /** First configured key. The one actually in use is googleKeys[n] —
+     *  ask llm/keyring.ts, which rotates when a key's day is spent. */
+    apiKey: googleKeys[0] ?? '',
+    /** Every key for this provider, tried in order. */
+    apiKeys: googleKeys,
     /**
      * This defaulted to `gemini-2.0-flash`, which Google has since retired — the
      * same decommission trap that took out a pinned Groq model mid-install and
@@ -334,7 +389,11 @@ export const llmConfig = {
     thinkingBudget: Number(process.env.GEMINI_THINKING_BUDGET ?? 4_096),
   },
   anthropic: {
-    apiKey: process.env.ANTHROPIC_API_KEY ?? '',
+    /** First configured key. The one actually in use is anthropicKeys[n] —
+     *  ask llm/keyring.ts, which rotates when a key's day is spent. */
+    apiKey: anthropicKeys[0] ?? '',
+    /** Every key for this provider, tried in order. */
+    apiKeys: anthropicKeys,
     model: process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5',
     effort: (process.env.ANTHROPIC_EFFORT ?? 'low') as Effort,
   },

@@ -210,11 +210,13 @@ async function checkOpenRouter(): Promise<Result> {
 
 async function checkGoogle(): Promise<Result> {
   const cfg = llmConfig.google;
-  if (!cfg.apiKey) return { ok: false, detail: 'GOOGLE_API_KEY (or GEMINI_API_KEY) is not set' };
+  const keys = cfg.apiKeys;
+  if (!keys.length) return { ok: false, detail: 'GOOGLE_API_KEY (or GEMINI_API_KEY) is not set' };
   const base = 'https://generativelanguage.googleapis.com/v1beta';
   const want = cfg.model;
+  const key = keys[0];
 
-  const listRes = await fetch(`${base}/models?key=${cfg.apiKey}`);
+  const listRes = await fetch(`${base}/models?key=${key}`);
   if (!listRes.ok) {
     return { ok: false, detail: `could not list models: ${listRes.status} ${await listRes.text()}` };
   }
@@ -244,7 +246,7 @@ async function checkGoogle(): Promise<Result> {
     `${(found.outputTokenLimit ?? 0).toLocaleString()} out`);
 
   const t0 = Date.now();
-  const res = await fetch(`${base}/models/${want}:generateContent?key=${cfg.apiKey}`, {
+  const res = await fetch(`${base}/models/${want}:generateContent?key=${key}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -255,6 +257,40 @@ async function checkGoogle(): Promise<Result> {
   const body = await res.text();
   if (!res.ok) return { ok: false, detail: `completion failed: ${res.status} ${body}` };
   console.log(`  test completion  : ok (${Date.now() - t0}ms)`);
+
+  // Spare keys. llm/keyring.ts rotates onto these the moment the primary answers
+  // "per-day quota exhausted", which is the worst possible time to discover that
+  // a spare was revoked, mistyped, or never enabled for this API. One request
+  // each, spent deliberately here rather than mid-extraction.
+  if (keys.length > 1) {
+    console.log(`\n  failover keys    : ${keys.length - 1} spare`);
+    for (let i = 1; i < keys.length; i++) {
+      const spare = keys[i];
+      const label = `key ${i + 1} of ${keys.length} (…${spare.slice(-4)})`;
+      const probe = await fetch(`${base}/models/${want}:generateContent?key=${spare}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: 'Reply with JSON: {"ok":true}' }] }],
+          generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 64 },
+        }),
+      });
+      if (probe.ok) {
+        console.log(`    ${label}: ok`);
+      } else {
+        const detail = (await probe.text()).replace(/\s+/g, ' ').slice(0, 180);
+        console.log(`    ${label}: FAILED ${probe.status} ${detail}`);
+        return {
+          ok: false,
+          detail: `failover ${label} does not work — it will not save an exhausted primary`,
+        };
+      }
+    }
+    // Worth stating plainly: the free-tier per-day cap is scoped to the Google
+    // Cloud PROJECT, not to the key. Two keys minted in one project share one
+    // allowance, so the rotation would move onto a key that is already spent.
+    console.log(`    note: a spare adds allowance only if it is in a DIFFERENT Google Cloud project`);
+  }
 
   console.log(`\n  extraction budget (llm/config.ts):`);
   console.log(`    maxTokens (completion): ${llmConfig.maxTokens}`);

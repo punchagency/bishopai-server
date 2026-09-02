@@ -41,14 +41,15 @@ export async function queueEmail(input: QueuedEmailInput, now: Date = new Date()
   try {
     const { rows } = await pool.query<{ id: string }>(
       `INSERT INTO outbound_emails
-         (list, category, lead_id, client_id, to_email, subject, body,
+         (list, category, priority, lead_id, client_id, to_email, subject, body,
           send_after, expires_at, source_ref, dedupe_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (dedupe_key) WHERE state IN ('pending','approved') DO NOTHING
        RETURNING id`,
       [
         norm.list,
         input.category,
+        norm.priority,
         input.leadId ?? null,
         input.clientId ?? null,
         input.toEmail,
@@ -64,6 +65,7 @@ export async function queueEmail(input: QueuedEmailInput, now: Date = new Date()
     logEvent('info', 'outbound.queue', 'email held for approval', {
       id: rows[0].id,
       list: norm.list,
+      priority: norm.priority,
       category: input.category,
       to: input.toEmail,
       source: input.sourceRef,
@@ -223,13 +225,15 @@ export async function expireStale(now: Date = new Date()): Promise<number> {
 
 export async function listPending(list?: OutboundList): Promise<unknown[]> {
   const { rows } = await pool.query(
-    `SELECT o.id, o.list, o.category, o.lead_id, o.client_id, o.to_email, o.subject, o.body,
-            o.send_after, o.expires_at, o.source_ref, o.created_at,
+    `SELECT o.id, o.list, o.category, o.priority, o.lead_id, o.client_id, o.to_email, o.subject,
+            o.body, o.send_after, o.expires_at, o.source_ref, o.created_at,
             l.status AS lead_status
        FROM outbound_emails o
        LEFT JOIN leads l ON l.id = o.lead_id
       WHERE o.state = 'pending' ${list ? 'AND o.list = $1' : ''}
-      ORDER BY o.send_after ASC, o.created_at ASC`,
+      -- Urgent first: these expire in a day, so a review that starts at the top
+      -- of the list starts with the ones that will be gone tomorrow.
+      ORDER BY (o.priority = 'urgent') DESC, o.send_after ASC, o.created_at ASC`,
     list ? [list] : [],
   );
   return rows;
@@ -238,27 +242,45 @@ export async function listPending(list?: OutboundList): Promise<unknown[]> {
 /** Counts for the dashboard alert: how much is waiting, and how long it has waited. */
 export async function pendingSummary(): Promise<{
   total: number;
+  /** Waiting AND time-critical — what the dashboard alert leads with. */
+  urgent: number;
   byList: Record<string, number>;
   byCategory: Record<string, number>;
   oldestSendAfter: string | null;
+  /** When the soonest item stops being sendable. Drives "expires in Nh". */
+  nextExpiresAt: string | null;
 }> {
-  const { rows } = await pool.query<{ list: string; category: string; n: string; oldest: string }>(
-    `SELECT list, category, count(*)::text AS n, min(send_after)::text AS oldest
+  const { rows } = await pool.query<{
+    list: string;
+    category: string;
+    priority: string;
+    n: string;
+    oldest: string;
+    soonest_expiry: string;
+  }>(
+    `SELECT list, category, priority, count(*)::text AS n,
+            min(send_after)::text AS oldest, min(expires_at)::text AS soonest_expiry
        FROM outbound_emails WHERE state = 'pending'
-      GROUP BY list, category`,
+      GROUP BY list, category, priority`,
   );
   const byList: Record<string, number> = {};
   const byCategory: Record<string, number> = {};
   let total = 0;
+  let urgent = 0;
   let oldest: string | null = null;
+  let nextExpiry: string | null = null;
   for (const r of rows) {
     const n = Number(r.n);
     total += n;
+    if (r.priority === 'urgent') urgent += n;
     byList[r.list] = (byList[r.list] ?? 0) + n;
     byCategory[r.category] = (byCategory[r.category] ?? 0) + n;
     if (r.oldest && (!oldest || r.oldest < oldest)) oldest = r.oldest;
+    if (r.soonest_expiry && (!nextExpiry || r.soonest_expiry < nextExpiry)) {
+      nextExpiry = r.soonest_expiry;
+    }
   }
-  return { total, byList, byCategory, oldestSendAfter: oldest };
+  return { total, urgent, byList, byCategory, oldestSendAfter: oldest, nextExpiresAt: nextExpiry };
 }
 
 export async function approve(ids: string[], by: string): Promise<number> {

@@ -5,6 +5,7 @@ import Groq from 'groq-sdk';
 import type { z } from 'zod';
 import { llmConfig } from './config';
 import { assertAllowance, noteProviderError } from './allowance';
+import { currentKey, keyCount, retireCurrentKey } from './keyring';
 import { llmLimiter } from './rateLimiter';
 import {
   ProviderError,
@@ -58,30 +59,65 @@ export async function generateStructured(req: StructuredRequest): Promise<Struct
   // Groq's free tier bills against the TPM ceiling.
   const estimatedCost =
     Math.ceil((req.system.length + req.user.length) / 4) + (req.maxTokens ?? llmConfig.maxTokens);
-  await llmLimiter.acquire(estimatedCost);
 
-  // Every provider funnels its failures through here, so one catch closes the
-  // gate for all four rather than each of them having to remember to.
-  try {
-    switch (llmConfig.provider) {
-      case 'openrouter':
-        return await openrouterExtract(req);
-      case 'anthropic':
-        return await anthropicExtract(req);
-      case 'google':
-        return await googleExtract(req);
-      case 'groq':
-        return await groqExtract(req);
-      default:
-        throw new Error(`unknown LLM_PROVIDER: ${llmConfig.provider}`);
+  // One attempt per configured key.
+  //
+  // A key that answers "you have used today's allowance" has said something
+  // about its own project and nothing about the next key's, so the same request
+  // is re-sent on the spare rather than failed — see llm/keyring.ts. Every other
+  // failure leaves on the first pass, unchanged.
+  //
+  // Bounded by the ring's depth rather than looping until it gives up: the ring
+  // already terminates (each rotation retires a key, and there are finitely
+  // many), but a bound means a bug in the ring cannot become an infinite retry
+  // against a metered API.
+  const attempts = Math.max(1, keyCount(llmConfig.provider));
+  let lastErr: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    // Re-paced per attempt: a rotation sends a second real request, and the
+    // limiter exists to keep those inside the per-minute budget.
+    await llmLimiter.acquire(estimatedCost);
+
+    // Every provider funnels its failures through here, so one catch closes the
+    // gate for all four rather than each of them having to remember to.
+    try {
+      switch (llmConfig.provider) {
+        case 'openrouter':
+          return await openrouterExtract(req);
+        case 'anthropic':
+          return await anthropicExtract(req);
+        case 'google':
+          return await googleExtract(req);
+        case 'groq':
+          return await groqExtract(req);
+        default:
+          throw new Error(`unknown LLM_PROVIDER: ${llmConfig.provider}`);
+      }
+    } catch (err) {
+      // `await` above rather than bare `return` is what makes this reachable:
+      // returning the promise unawaited would settle it in the caller's frame and
+      // this catch would never see a rejection.
+      lastErr = err;
+      if (isSpentKey(err) && retireCurrentKey(llmConfig.provider, messageOf(err))) continue;
+      // Nothing left to rotate onto: this really is the day's allowance.
+      noteProviderError(err);
+      throw err;
     }
-  } catch (err) {
-    // `await` above rather than bare `return` is what makes this reachable:
-    // returning the promise unawaited would settle it in the caller's frame and
-    // this catch would never see a rejection.
-    noteProviderError(err);
-    throw err;
   }
+
+  noteProviderError(lastErr);
+  throw lastErr;
+}
+
+/** Did this refusal spend the KEY's daily allowance (as opposed to pacing it)? */
+function isSpentKey(err: unknown): boolean {
+  if (err instanceof RateLimitError) return err.exhausted;
+  return err instanceof Error && isQuotaExhausted(err);
+}
+
+function messageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** Providers signal an over-budget response with these; every one means the JSON
@@ -144,10 +180,15 @@ function looksTruncated(text: string): boolean {
 }
 
 // --- Anthropic (zod structured outputs) --------------------------------------
-let anthropic: Anthropic | null = null;
+// Cached against the key it was built with: a rotation has to reach the SDK
+// client, and a bare `??=` would pin the first key for the life of the process.
+let anthropic: { key: string; client: Anthropic } | null = null;
 function getAnthropic(): Anthropic {
-  anthropic ??= new Anthropic({ apiKey: llmConfig.anthropic.apiKey || undefined });
-  return anthropic;
+  const key = currentKey('anthropic');
+  if (!anthropic || anthropic.key !== key) {
+    anthropic = { key, client: new Anthropic({ apiKey: key || undefined }) };
+  }
+  return anthropic.client;
 }
 
 async function anthropicExtract(req: StructuredRequest): Promise<StructuredResponse> {
@@ -202,10 +243,13 @@ async function anthropicExtract(req: StructuredRequest): Promise<StructuredRespo
 }
 
 // --- Google Gemini (JSON-schema structured output) ---------------------------
-let google: GoogleGenAI | null = null;
+let google: { key: string; client: GoogleGenAI } | null = null;
 function getGoogle(): GoogleGenAI {
-  google ??= new GoogleGenAI({ apiKey: llmConfig.google.apiKey });
-  return google;
+  const key = currentKey('google');
+  if (!google || google.key !== key) {
+    google = { key, client: new GoogleGenAI({ apiKey: key }) };
+  }
+  return google.client;
 }
 
 function extractGoogleRetryAfterMs(err: unknown): number | null {
@@ -276,10 +320,13 @@ async function googleExtract(req: StructuredRequest): Promise<StructuredResponse
 }
 
 // --- Groq (OpenAI-compatible, JSON mode) -------------------------------------
-let groq: Groq | null = null;
+let groq: { key: string; client: Groq } | null = null;
 function getGroq(): Groq {
-  groq ??= new Groq({ apiKey: llmConfig.groq.apiKey });
-  return groq;
+  const key = currentKey('groq');
+  if (!groq || groq.key !== key) {
+    groq = { key, client: new Groq({ apiKey: key }) };
+  }
+  return groq.client;
 }
 
 /** Which Groq models accept `reasoning_effort`. Sending it to one that doesn't
@@ -320,7 +367,10 @@ function isJsonValidateFailed(err: unknown): boolean {
  */
 async function openrouterExtract(req: StructuredRequest): Promise<StructuredResponse> {
   const cfg = llmConfig.openrouter;
-  if (!cfg.apiKey) {
+  // The active key, not cfg.apiKey: that is only ever the first one, and this
+  // request may be the retry that follows a rotation.
+  const apiKey = currentKey('openrouter');
+  if (!apiKey) {
     throw new ProviderError('OpenRouter not configured — set OPENROUTER_API_KEY', {
       provider: 'openrouter',
     });
@@ -332,7 +382,7 @@ async function openrouterExtract(req: StructuredRequest): Promise<StructuredResp
     res = await fetch(`${cfg.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
-        authorization: `Bearer ${cfg.apiKey}`,
+        authorization: `Bearer ${apiKey}`,
         'content-type': 'application/json',
         // Attribution only — OpenRouter shows these on the account's activity page.
         'HTTP-Referer': cfg.appUrl,

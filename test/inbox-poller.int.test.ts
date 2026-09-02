@@ -29,6 +29,9 @@ const msg = (from: string, subject: string, receivedDateTime: string): InboundMe
 suite('inbox poller — reply detection + guarded intake (integration)', () => {
   let leadId = '';
   const cleanup = async () => {
+    // Queued mail outlives its lead (outbound_emails.lead_id is ON DELETE SET
+    // NULL), so clear it by address or it leaks into the next run.
+    await pool.query(`DELETE FROM outbound_emails WHERE lower(to_email) = ANY($1)`, [ALL_EMAILS]).catch(() => {});
     await pool.query(`DELETE FROM leads WHERE lower(email) = ANY($1)`, [ALL_EMAILS]).catch(() => {});
     await pool.query(`DELETE FROM integration_state WHERE key = $1`, [CURSOR_KEY]).catch(() => {});
   };
@@ -82,15 +85,30 @@ suite('inbox poller — reply detection + guarded intake (integration)', () => {
     expect(replyAct.rowCount).toBe(1);
     expect(replyAct.rows[0].detail).toContain('Re: your consult');
 
-    // Intake: new lead created from the clean sender + automated first response.
-    const created = await pool.query<{ status: string; source: string; sequence_state: { sent?: string[] } }>(
+    // Intake: new lead created from the clean sender, and its welcome HELD for
+    // approval rather than sent. The lead stays 'new' precisely because nothing
+    // has gone out yet — status tracks what the client has received.
+    const created = await pool.query<{
+      status: string;
+      source: string;
+      sequence_state: { sent?: string[]; queued?: string[] };
+    }>(
       `SELECT status, source, sequence_state FROM leads WHERE lower(email) = lower($1)`,
       [NEW_SENDER],
     );
     expect(created.rowCount).toBe(1);
     expect(created.rows[0].source).toBe('outlook');
-    expect(created.rows[0].status).toBe('contacted'); // welcome sent
-    expect(created.rows[0].sequence_state.sent).toContain('welcome');
+    expect(created.rows[0].status).toBe('new');
+    expect(created.rows[0].sequence_state.queued).toContain('welcome');
+    expect(created.rows[0].sequence_state.sent ?? []).not.toContain('welcome');
+
+    // Waiting in the urgent lane — a reply owed today, still reviewed first.
+    const held = await pool.query<{ state: string; priority: string }>(
+      `SELECT state, priority FROM outbound_emails WHERE lower(to_email) = lower($1)`,
+      [NEW_SENDER],
+    );
+    expect(held.rows).toHaveLength(1);
+    expect(held.rows[0]).toMatchObject({ state: 'pending', priority: 'urgent' });
 
     // Guards: no lead created for the no-reply or auto-reply senders.
     for (const skipped of [NOREPLY, OOO]) {

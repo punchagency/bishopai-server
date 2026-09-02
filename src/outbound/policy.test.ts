@@ -1,13 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import {
   EXPIRY_DAYS,
+  URGENT_EXPIRY_DAYS,
   categoryForTrack,
   dedupeKeyFor,
+  expiryDaysFor,
   expiryFor,
   isExpired,
   isSendable,
   listForTrack,
   normalizeQueueInput,
+  priorityForStep,
 } from './policy';
 
 const at = (iso: string) => new Date(iso);
@@ -105,5 +108,64 @@ describe('approval policy', () => {
     expect(n.list).toBe('normal');
     expect(n.sendAfter).toEqual(DUE);
     expect(n.expiresAt).toEqual(expiryFor(DUE));
+  });
+
+  describe('the urgent lane', () => {
+    it('marks the enquiry welcome urgent and nothing else', () => {
+      // The welcome is the one step that was worth bypassing approval for, so it
+      // is the one step that gets a same-day lane instead. Every other step is
+      // still perfectly good at the weekly review.
+      expect(priorityForStep('welcome')).toBe('urgent');
+      for (const step of ['nudge_3d', 'nudge_7d', 'first_appt_7d', 'winback_14d', 'manual_email']) {
+        expect(priorityForStep(step)).toBe('normal');
+      }
+    });
+
+    it('gives an urgent item one day, not a week', () => {
+      // If an urgent item could linger a week it would contradict its own
+      // claim — a welcome arriving days late reads worse than silence.
+      expect(URGENT_EXPIRY_DAYS).toBe(1);
+      expect(expiryDaysFor('urgent')).toBe(URGENT_EXPIRY_DAYS);
+      expect(expiryDaysFor('normal')).toBe(EXPIRY_DAYS);
+    });
+
+    it('derives the window from the priority, so it cannot be set by omission', () => {
+      const urgent = normalizeQueueInput(
+        {
+          category: 'enquiry',
+          priority: 'urgent',
+          toEmail: 'a@b.com',
+          subject: 'Hi',
+          body: 'x',
+          sourceRef: 'cadence:inquiry:welcome',
+        },
+        DUE,
+      );
+      expect(urgent.expiresAt).toEqual(expiryFor(DUE, URGENT_EXPIRY_DAYS));
+
+      // Unstated priority stays 'normal' — the safe default is the slow lane,
+      // not the fast one.
+      const plain = normalizeQueueInput(
+        { category: 'enquiry', toEmail: 'a@b.com', subject: 'Hi', body: 'x', sourceRef: 'cadence:inquiry:nudge_3d' },
+        DUE,
+      );
+      expect(plain.priority).toBe('normal');
+      expect(plain.expiresAt).toEqual(expiryFor(DUE, EXPIRY_DAYS));
+    });
+
+    it('still requires approval — urgent is a faster queue, not a bypass', () => {
+      const expires = expiryFor(DUE, URGENT_EXPIRY_DAYS);
+      const later = at('2026-08-19T15:00:00Z');
+      // The entire point: 'urgent' changes WHEN it is reviewed, never WHETHER.
+      expect(isSendable('pending', later, DUE, expires)).toBe(false);
+      expect(isSendable('approved', later, DUE, expires)).toBe(true);
+    });
+
+    it('drops an unapproved urgent item after its day', () => {
+      const expires = expiryFor(DUE, URGENT_EXPIRY_DAYS);
+      const twoDaysOn = at('2026-08-21T09:00:00Z');
+      expect(isExpired('pending', twoDaysOn, expires)).toBe(true);
+      expect(isSendable('approved', twoDaysOn, DUE, expires)).toBe(false);
+    });
   });
 });

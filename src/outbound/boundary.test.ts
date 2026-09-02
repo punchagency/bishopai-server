@@ -27,7 +27,7 @@ const ALLOWED = new Map([
   ],
   [
     'reengagement/runner.ts',
-    'the enquiry welcome (exempt: a reply owed now) and Nicole pressing send on one lead',
+    'only Nicole pressing send on one lead — the cadence itself queues every step, welcome included',
   ],
   [
     'session/publishTemplates.ts',
@@ -70,6 +70,21 @@ describe('outbound send boundary', () => {
         'Automated client email must call queueEmail() from src/outbound/queue.ts. ' +
         'If this send genuinely should bypass review, add it to ALLOWED with the reason.',
     ).toEqual([]);
+  });
+
+  it('keeps the cadence runner off the automated send path', () => {
+    // runner.ts stays allowlisted for the one manual path (Nicole pressing send
+    // on a single lead), but the AUTOMATED pass must not reach the mailer. If
+    // processLead ever calls sendEmail again, the queue is no longer the only
+    // way an unattended email reaches a client — which is the whole guarantee.
+    const src = readFileSync(join(SRC, 'reengagement/runner.ts'), 'utf8');
+    const processLead = src.slice(
+      src.indexOf('async function processLead'),
+      src.indexOf('export async function runReengagement'),
+    );
+    expect(processLead.length).toBeGreaterThan(200); // the slice actually found it
+    expect(processLead).not.toMatch(/\bsendEmail\b/);
+    expect(processLead).toMatch(/\bqueueEmail\b/);
   });
 
   it('states a reason for every exemption', () => {

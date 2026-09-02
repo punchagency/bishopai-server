@@ -3,6 +3,7 @@ import { logEvent, logError } from '../observability/logger';
 import { sendEmail } from '../integrations/outlook';
 import { nextCadenceAction, FIXED_TRACK_STATUSES, trackNameFor, resolveTemplate, type LeadState } from './cadence';
 import { queueEmail } from '../outbound/queue';
+import { priorityForStep } from '../outbound/policy';
 import { categoryForTrack } from '../outbound/policy';
 
 // WF3 cadence pass (run by the scheduler): evaluate every active lead, send the
@@ -49,17 +50,18 @@ const LEAD_COLUMNS = `id, email, status, sequence_state, last_touch, created_at,
 type LeadOutcome = 'sent' | 'queued' | 'deactivated' | 'skipped' | 'none';
 
 /**
- * The one automated email that does not wait for approval.
+ * The enquiry welcome used to send without approval.
  *
- * Someone who has just written in is owed a reply now; holding the welcome until
- * the weekly review would answer a Tuesday enquiry on Friday, and the value of
- * "thanks for reaching out" decays to nothing in a day. Every other step — every
- * nudge, every win-back, every dose reminder — goes to the queue.
+ * The reasoning was sound and is preserved: someone who has just written in is
+ * owed a reply now, and holding the welcome for the weekly review answers a
+ * Tuesday enquiry on Friday. But that is an argument about LATENCY, not about
+ * whether a person should see it — so it is now served by a faster lane through
+ * the queue (outbound/policy.ts: priorityForStep) rather than by a way around
+ * it. The welcome is queued 'urgent': reviewed today, dropped after a day.
  *
- * Scoped to the step, not to the caller: the immediate path is also used when a
- * webhook enrols a lead, and only the enquiry welcome is exempt there too.
+ * Nothing automated sends email any more. The only sends left in this file are
+ * Nicole pressing send on one lead, which is an approval by definition.
  */
-const EXEMPT_STEP = 'welcome';
 
 /**
  * Evaluate and action a single lead: send the due cadence step (dry-run until
@@ -96,82 +98,34 @@ async function processLead(row: LeadRow, now: Date): Promise<LeadOutcome> {
       const body = await appendSlotSuggestions(tpl.body, row.id);
       const subject = tpl.subject;
 
-      // Everything except the enquiry welcome is held for approval. The step is
-      // recorded as queued so the next assembly moves on rather than re-offering
-      // it, and it stays consumed if the item is later rejected or expires — a
-      // nudge nobody approved is a nudge that should not keep coming back.
-      if (action.step !== EXEMPT_STEP) {
-        const res = await queueEmail(
-          {
-            category: categoryForTrack(trackName),
-            toEmail: row.email,
-            subject,
-            body,
-            sourceRef: `cadence:${trackName}:${action.step}`,
-            leadId: row.id,
-          },
-          now,
-        );
-        if (!res.queued) return res.duplicate ? 'none' : 'skipped';
-        await pool.query(
-          `UPDATE leads
-              SET sequence_state = jsonb_set(
-                    coalesce(sequence_state, '{}'::jsonb), '{queued}',
-                    coalesce(sequence_state->'queued', '[]'::jsonb) || to_jsonb($2::text)
-                  )
-            WHERE id = $1`,
-          [row.id, action.step],
-        );
-        return 'queued';
-      }
-
-      let result: import('../integrations/outlook').EmailResult;
-      try {
-        result = await sendEmail({ to: row.email, subject, body });
-      } catch (sendErr) {
-        logError('reengagement.send', 'sendEmail threw unexpectedly', sendErr, { lead_id: row.id, step: action.step });
-        return 'none';
-      }
-      // Append-only send log (dry-run or live, success or failure).
-      await pool.query(
-        `INSERT INTO email_send_log (lead_id, track, step, to_email, subject, body, dry_run, ok, error)
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [row.id, trackName, action.step, row.email, subject, body,
-          result.dryRun ?? false, result.ok, result.error ?? null],
-      ).catch((e) => logError('reengagement.send_log', 'failed to write send log', e, { lead_id: row.id }));
-      // Only advance sequence state and record in messages if the send succeeded
-      // (or was an ok dry-run). A failed live send doesn't count as "sent".
-      if (!result.ok) {
-        logError('reengagement.send', 'sendEmail returned ok=false', result.error, { lead_id: row.id, step: action.step });
-        return 'none';
-      }
-      await pool.query(
-        `INSERT INTO messages (lead_id, channel, body, sent_at, status)
-              VALUES ($1, 'email', $2, now(), 'sent')`,
-        [row.id, `${subject}\n\n${body}`],
+      // Every cadence step is held for approval — there is no longer an
+      // exception. The step is recorded as queued so the next assembly moves on
+      // rather than re-offering it, and it stays consumed if the item is later
+      // rejected or expires: a nudge nobody approved is a nudge that should not
+      // keep coming back.
+      const res = await queueEmail(
+        {
+          category: categoryForTrack(trackName),
+          priority: priorityForStep(action.step),
+          toEmail: row.email,
+          subject,
+          body,
+          sourceRef: `cadence:${trackName}:${action.step}`,
+          leadId: row.id,
+        },
+        now,
       );
-      // Advance sequence state + status, and stamp last_touch. Fixed-track
-      // leads (cancelled/maintenance) keep their status so they stay on that
-      // track; inquiry leads progress new → contacted → nurturing.
-      const nextStatus = FIXED_TRACK_STATUSES.has(row.status)
-        ? row.status
-        : row.status === 'new'
-          ? 'contacted'
-          : 'nurturing';
+      if (!res.queued) return res.duplicate ? 'none' : 'skipped';
       await pool.query(
         `UPDATE leads
-            SET sequence_state = (
-                  jsonb_set(
-                    coalesce(sequence_state, '{}'::jsonb), '{sent}',
-                    coalesce(sequence_state->'sent', '[]'::jsonb) || to_jsonb($2::text)
-                  ) #- ARRAY['drafts', $2::text]
-                ),
-                last_touch = now(),
-                status = $3
+            SET sequence_state = jsonb_set(
+                  coalesce(sequence_state, '{}'::jsonb), '{queued}',
+                  coalesce(sequence_state->'queued', '[]'::jsonb) || to_jsonb($2::text)
+                )
           WHERE id = $1`,
-        [row.id, action.step, nextStatus],
+        [row.id, action.step],
       );
-      return 'sent';
+      return 'queued';
     }
     return 'none';
   } catch (err) {
