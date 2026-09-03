@@ -273,6 +273,81 @@ export async function sendIndividualLeadEmail(
 
 const BOOKING_KEYWORDS = /\b(book|reschedule|find a time|schedule|appointment|session|visit|consult)\b/i;
 
+/**
+ * The marker on the injected block.
+ *
+ * The desktop editor splits an approval body on this to let Nicole edit her
+ * message while the buttons ride along untouched (renderer/src/lib/emailBody.ts),
+ * and stripSlotBlock uses it to make re-injection idempotent. Renaming it breaks
+ * both, and orphans every row already queued.
+ */
+export const SLOT_BLOCK_MARKER = 'data-innerlume="booking-slots"';
+
+// Bodies injected before the marker existed. Matched on the heading text, since
+// the styles have already changed.
+const LEGACY_BLOCK = /\n?<div style="margin-top: 1\.5rem;[^"]*"\s*>\s*<p[^>]*>Some available times[\s\S]*$/i;
+
+/** Remove any previously injected block, so the body can be re-rendered. */
+export function stripSlotBlock(body: string): string {
+  const marked = body.indexOf(`<div ${SLOT_BLOCK_MARKER}`);
+  if (marked !== -1) return body.slice(0, marked).replace(/\n$/, '');
+  return body.replace(LEGACY_BLOCK, '');
+}
+
+// Colours are light-first and taken from the LIGHT theme tokens. The block is
+// appended to a plain-text body and sent as HTML with no wrapper (the Outlook
+// integration auto-detects HTML), so it lands on the recipient's own background
+// — white in almost every client. The original palette was copied from the app's
+// DARK theme (#f3e9e2 text, a #c79b84→#aa7660 accent gradient), which is why the
+// heading arrived invisible and the buttons arrived as bare text in Outlook.
+// Measured on white: heading 17.3:1, hint 6.6:1, button 8.9:1. The palette they
+// replace measured 1.2:1 and 2.4:1.
+const INK = '#211913';        // --text
+const INK_SOFT = '#6b5a50';   // --text-muted
+const RULE = '#e7dcd4';       // --border
+const BRAND = '#7f3111';      // --accent-active; 8.9:1 with white text
+const FONT = "'Source Sans 3', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+
+/**
+ * One booking button.
+ *
+ * Table-based rather than a styled <a>: Outlook on Windows drops border-radius,
+ * linear-gradient and box-shadow, so the old gradient button rendered as dark
+ * text on no background at all. A td with a bgcolor attribute is the one thing
+ * every client honours; the radius is left as progressive enhancement.
+ */
+function slotButton(href: string, label: string): string {
+  return `
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin: 0 0 10px;">
+        <tr>
+          <td bgcolor="${BRAND}" style="border-radius: 6px;">
+            <a href="${href}" style="display: block; padding: 13px 24px; font-family: ${FONT}; font-size: 15px; font-weight: 600; line-height: 1; color: #ffffff; text-decoration: none; border-radius: 6px;">${label}</a>
+          </td>
+        </tr>
+      </table>`;
+}
+
+/**
+ * The whole appended block, from ready-made links.
+ *
+ * Takes hrefs rather than building them, so the same renderer serves both the
+ * runner (fresh links, freshly signed) and scripts/refresh-slot-blocks.mts,
+ * which re-renders queued mail and must carry each existing href through
+ * untouched — its token is an HMAC bound to that exact slot, and re-signing it
+ * anywhere without BOOKING_LINK_SECRET would silently strip it.
+ */
+export function renderSlotBlock(links: { href: string; label: string }[]): string {
+  const buttons = links.map((l) => slotButton(l.href, l.label)).join('');
+
+  return `<div ${SLOT_BLOCK_MARKER} style="margin-top: 28px; padding-top: 20px; border-top: 1px solid ${RULE}; font-family: ${FONT};">
+  <p style="margin: 0 0 14px; font-family: ${FONT}; font-size: 16px; font-weight: 700; line-height: 1.4; color: ${INK};">Some available times that work for me</p>
+${buttons}
+  <p style="margin: 14px 0 0; font-family: ${FONT}; font-size: 14px; line-height: 1.5; color: ${INK_SOFT};">
+    Tap a time to confirm it, or just reply with what suits you and I'll get you booked in.
+  </p>
+</div>`;
+}
+
 async function appendSlotSuggestions(body: string, leadId: string): Promise<string> {
   if (!BOOKING_KEYWORDS.test(body)) return body;
   try {
@@ -285,30 +360,22 @@ async function appendSlotSuggestions(body: string, leadId: string): Promise<stri
 
     const { signBookingToken } = await import('./bookingToken');
     const baseUrl = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
-    const slotButtons = slots
-      .map((s) => {
-        const token = signBookingToken(leadId, s.starts_at);
-        const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
-        const bookUrl = `${baseUrl}/webhooks/appointments/book?leadId=${leadId}&slot=${encodeURIComponent(s.starts_at)}${tokenParam}`;
-        return `
-          <div style="margin-bottom: 8px;">
-            <a href="${bookUrl}" style="display: inline-block; background: linear-gradient(135deg, #c79b84 0%, #aa7660 100%); color: #1a120e; text-decoration: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; font-size: 14px; font-family: 'Source Sans 3', -apple-system, sans-serif; box-shadow: 0 3px 10px rgba(170, 118, 96, 0.35);">
-              📅 Confirm &amp; Book ${s.label}
-            </a>
-          </div>`;
-      })
-      .join('');
 
-    const formattedBody = body.replace(/\n/g, '<br/>');
+    const links = slots.map((s) => {
+      const token = signBookingToken(leadId, s.starts_at);
+      const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+      return {
+        href: `${baseUrl}/webhooks/appointments/book?leadId=${leadId}&slot=${encodeURIComponent(s.starts_at)}${tokenParam}`,
+        label: s.label,
+      };
+    });
 
-    return `${formattedBody}
-<div style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #3b2b23; font-family: 'Source Sans 3', -apple-system, sans-serif;">
-  <p style="font-weight: 600; color: #f3e9e2; margin-bottom: 0.75rem;">Some available times that work for me:</p>
-  ${slotButtons}
-  <p style="font-size: 0.875rem; color: #b8a296; margin-top: 0.75rem;">
-    Click a button above to confirm your booking, or reply with your preferred slot and I'll get you booked in!
-  </p>
-</div>`;
+    // Strip first: a body that already carries a block (a re-render, or a
+    // refreshed queue row) must not end up with two.
+    const message = stripSlotBlock(body);
+    const formattedBody = message.replace(/\n/g, '<br/>');
+
+    return `${formattedBody}\n${renderSlotBlock(links)}`;
   } catch (err) {
     logError('reengagement.slots', 'slot injection failed — sending without slots', err);
     return body;

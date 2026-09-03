@@ -343,7 +343,13 @@ function formatSlotLabel(d: Date, tz: string): string {
       weekday: 'long',
       hour: 'numeric',
       minute: '2-digit',
-      hour12: true,
+      // NOT hour12: true. Under en-GB that resolves to the h11 cycle on the ICU
+      // shipped with node:20-alpine, which prints noon as "0:00 pm" — the label
+      // that went out on real booking buttons. Newer ICU (node 22) resolves the
+      // same options to h12, so this only ever reproduced in production.
+      // hourCycle is explicit and version-independent; the two must not be given
+      // together, because hour12 wins when both are present.
+      hourCycle: 'h12',
     }).format(d);
   } catch {
     return d.toISOString();

@@ -227,6 +227,77 @@ engagementRouter.delete('/leads/:id/draft/:step', async (req, res) => {
 
 // POST /engagement/run — run the cadence pass now (the scheduler runs it on a
 // cron; this lets Nicole/dev trigger it on demand).
+// GET /engagement/leads/:id/slots — times currently offerable to this lead.
+//
+// Signing happens here, not in the desktop app: the HMAC is keyed by
+// BOOKING_LINK_SECRET, which only the server holds. The renderer picks times;
+// the server is what makes a link clickable.
+engagementRouter.get('/leads/:id/slots', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  try {
+    const { fetchUpcoming, deriveAvailableSlots, loadOfficeHours } = await import('./appointments');
+    const oh = await loadOfficeHours();
+    const booked = await fetchUpcoming(oh);
+    // Ask for a generous window: this is a menu to choose from, not the three
+    // that would go out automatically.
+    const slots = deriveAvailableSlots(booked, { ...oh, max_slots: Math.max(oh.max_slots, 12) });
+    return res.json({
+      slots: slots.map((s) => ({ starts_at: s.starts_at, label: s.label })),
+      timezone: oh.timezone,
+    });
+  } catch (err) {
+    logError('engagement.slots', 'listing offerable slots failed', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+const slotBlockPayload = z.object({ slots: z.array(z.string()).max(12) });
+
+// POST /engagement/leads/:id/slot-block — render a booking block for the chosen
+// times. An empty list renders nothing, which is how the editor removes the
+// block entirely.
+engagementRouter.post('/leads/:id/slot-block', async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  const parsed = slotBlockPayload.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'invalid payload', details: parsed.error.flatten() });
+  }
+  const chosen = parsed.data.slots;
+  if (chosen.length === 0) return res.json({ html: '' });
+
+  try {
+    const { fetchUpcoming, deriveAvailableSlots, loadOfficeHours } = await import('./appointments');
+    const { renderSlotBlock } = await import('../reengagement/runner');
+    const { signBookingToken } = await import('../reengagement/bookingToken');
+
+    const oh = await loadOfficeHours();
+    const booked = await fetchUpcoming(oh);
+    const offerable = deriveAvailableSlots(booked, { ...oh, max_slots: 100 });
+    const byStart = new Map(offerable.map((s) => [s.starts_at, s.label]));
+
+    // Only offer what is genuinely still free. A time that has been booked since
+    // the editor loaded is dropped rather than sent — the alternative is mailing
+    // a link that fails when the client clicks it.
+    const usable = chosen.filter((iso) => byStart.has(iso));
+    if (usable.length === 0) return res.json({ html: '', dropped: chosen.length });
+
+    const baseUrl = process.env.PUBLIC_BASE_URL || 'http://localhost:3000';
+    const links = usable.map((iso) => {
+      const token = signBookingToken(req.params.id, iso);
+      const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+      return {
+        href: `${baseUrl}/webhooks/appointments/book?leadId=${req.params.id}&slot=${encodeURIComponent(iso)}${tokenParam}`,
+        label: byStart.get(iso)!,
+      };
+    });
+
+    return res.json({ html: renderSlotBlock(links), dropped: chosen.length - usable.length });
+  } catch (err) {
+    logError('engagement.slot_block', 'rendering slot block failed', err, { id: req.params.id });
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
 engagementRouter.post('/run', async (_req, res) => {
   try {
     const result = await runReengagement();

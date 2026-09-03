@@ -145,6 +145,31 @@ describe('deriveAvailableSlots (unit)', () => {
     }
   });
 
+  // Regression: labels are baked into the booking buttons that go out to
+  // clients, and "Friday 0:00 pm" shipped. The cause was `hour12: true`, which
+  // en-GB resolves to the h11 cycle on the ICU in node:20-alpine (production)
+  // while newer ICU resolves it to h12 — so it never reproduced in dev. The
+  // formatter now asks for hourCycle 'h12' explicitly.
+  it('labels noon as 12:00 pm, never 0:00 pm', () => {
+    // 11:00 UTC start puts a 12:00 slot in the middle of the returned window.
+    const beforeNoon = new Date('2026-07-13T10:30:00.000Z');
+    const slots = deriveAvailableSlots([], OH, beforeNoon);
+    const labels = slots.map((s) => s.label);
+
+    expect(labels).toContain('Monday 12:00 pm');
+    for (const label of labels) {
+      expect(label).not.toMatch(/\b0:\d{2}\s*(am|pm)/i);
+    }
+  });
+
+  it('labels midnight as 12:00 am when office hours reach it', () => {
+    const overnight: OfficeHours = { ...OH, start_hour: 0, end_hour: 23, days: [0, 1, 2, 3, 4, 5, 6] };
+    const beforeMidnight = new Date('2026-07-12T23:30:00.000Z');
+    const slots = deriveAvailableSlots([], overnight, beforeMidnight);
+
+    expect(slots[0].label).toBe('Monday 12:00 am');
+  });
+
   it('respects custom session_duration_min — 90-min slots do not exceed end_hour', () => {
     const oh90: OfficeHours = { ...OH, session_duration_min: 90, max_slots: 10 };
     const slots = deriveAvailableSlots([], oh90, MON_9AM_UTC);
