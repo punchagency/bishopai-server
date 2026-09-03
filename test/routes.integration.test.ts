@@ -85,4 +85,28 @@ describe.skipIf(!dbUp)('routes (integration)', () => {
     const res = await post('/checkout/detect', { appointment_id: '00000000-0000-0000-0000-000000000000' });
     expect(res.status).toBe(404);
   });
+
+  // The welcome guide reads this to decide which setup steps show as connected.
+  // It used to hardcode four of them as "in progress", which went stale the
+  // moment they went live.
+  describe('GET /integrations/status', () => {
+    it('reports a boolean for every integration the guide lists', async () => {
+      const res = await get('/integrations/status');
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as Record<string, unknown>;
+      for (const key of ['practice_better', 'google_drive', 'outlook', 'quickbooks']) {
+        expect(typeof body[key], `${key} must be a boolean`).toBe('boolean');
+      }
+    });
+
+    it('never reports outlook connected without a mailbox', async () => {
+      const res = await get('/integrations/status');
+      const body = (await res.json()) as { outlook: boolean };
+      const conn = await fetch(`${base}/auth/outlook/status`).then((r) => r.json() as Promise<{ connected: boolean }>);
+      // Configured-but-not-connected must read as false: it is the difference
+      // between mail that sends and mail that silently dry-runs.
+      expect(body.outlook).toBe(!!conn.connected);
+    });
+  });
+
 });

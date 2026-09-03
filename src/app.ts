@@ -4,6 +4,7 @@ import { webhooksRouter } from './routes/webhooks';
 import { reviewRouter } from './routes/review';
 import { refillsRouter } from './routes/refills';
 import { engagementRouter } from './routes/engagement';
+import { integrationsRouter } from './routes/integrations';
 import { checkoutRouter } from './routes/checkout';
 import { auditRouter } from './routes/audit';
 import { dashboardRouter } from './routes/dashboard';
@@ -65,6 +66,7 @@ export function createApp(): express.Express {
   app.use('/clients', requireAuth, clientsRouter);
   app.use('/audit', requireAuth, auditRouter);
   app.use('/pocket', requireAuth, pocketRouter);
+  app.use('/integrations', requireAuth, integrationsRouter);
   app.use('/templates', requireAuth, templatesRouter);
 
   return app;
