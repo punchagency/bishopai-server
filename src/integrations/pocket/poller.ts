@@ -1,6 +1,7 @@
 import { ingestConversation, type ConversationInput, type IngestResult } from '../../conversations/ingest';
 import { existingWithTranscript } from '../../conversations/known';
 import { enqueueExtraction } from '../../session/queue';
+import { enqueueSegmentation } from '../../session/segmentationQueue';
 import { logError, logEvent, logWarn } from '../../observability/logger';
 import { getRecording, listRecordings } from './client';
 import { isPocketConfigured, pocketPollConfig } from './config';
@@ -38,6 +39,8 @@ export interface PollDeps {
    *  see the call site for why this is no longer allowed to be the extraction
    *  itself. */
   enqueue: (conversationId: string) => void;
+  /** Hand a held multi-client recording to the segmentation queue. */
+  enqueueSegmentation: (conversationId: string) => void;
 }
 
 const defaultDeps: PollDeps = {
@@ -46,6 +49,7 @@ const defaultDeps: PollDeps = {
   existingWithTranscript,
   ingest: ingestConversation,
   enqueue: enqueueExtraction,
+  enqueueSegmentation,
 };
 
 /** `YYYY-MM-DD` in UTC — the format Pocket's date filters expect. */
@@ -102,8 +106,13 @@ export async function pollPocketRecordings(
         continue;
       }
 
-      const { conversationId, correlation } = await deps.ingest(input);
+      const { conversationId, correlation, segmentationQueued } = await deps.ingest(input);
       result.ingested++;
+      if (segmentationQueued) {
+        // A held multi-client recording — pre-compute its split proposal off
+        // the sweep loop, same as extraction below.
+        deps.enqueueSegmentation(conversationId);
+      }
       if (correlation.status === 'matched') {
         result.matched++;
         // Queued, not extracted here.

@@ -271,10 +271,11 @@ export async function listUnprocessed(): Promise<UnprocessedSession[]> {
        LEFT JOIN appointment_sheets s ON s.appointment_id = c.appointment_id
       WHERE c.appointment_id IS NOT NULL
         AND c.transcript IS NOT NULL
-        -- The same two exclusions processConversation claims on. A held or
-        -- split recording is not waiting to be extracted, it is waiting on a
-        -- decision about whose it is, and it already has a queue of its own.
-        AND c.correlation_status NOT IN ('needs_review', 'split')
+        -- The same exclusions processConversation claims on. A held or split
+        -- recording is not waiting to be extracted, it is waiting on a decision
+        -- about whose it is, and it already has a queue of its own; a discarded
+        -- one is a short clip with no speech and nothing to extract.
+        AND c.correlation_status NOT IN ('needs_review', 'split', 'discarded')
         -- An approved note is finished clinical content. If it were ever thin,
         -- that was read and signed off, and re-opening it here would invite a
         -- re-extract that the approve path refuses anyway.

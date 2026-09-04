@@ -4,6 +4,7 @@ import { logEvent, logError } from '../../observability/logger';
 import { correlateConversation, listOverlapCandidates } from '../../correlation/correlate';
 import { assessMultiSessionRisk } from '../../correlation/multiSession';
 import { enqueueExtraction } from '../../session/queue';
+import { enqueueSegmentation } from '../../session/segmentationQueue';
 
 // Periodic catch-all for unmatched conversations that now have a matching
 // appointment.
@@ -92,14 +93,17 @@ export const correlationSweepJob: Job = {
               : null,
           });
           if (risk.hold) {
-            await db.query(
+            const heldRow = await db.query(
               `UPDATE conversations
                   SET correlation_status = 'needs_review',
                       correlation_hold_reason = $2,
+                      -- Pre-stage the split proposal, unless one already ran.
+                      segmentation_status = COALESCE(segmentation_status, 'pending'),
                       updated_at = now()
                 WHERE id = $1 AND correlation_status = 'unmatched'`,
               [conv.id, risk.reasons.join('; ')],
             );
+            if ((heldRow.rowCount ?? 0) > 0) enqueueSegmentation(conv.id);
             held++;
             logEvent('warn', 'correlation.sweep', 'sweep declined to match — held for review', {
               conversation_id: conv.id,
@@ -220,6 +224,8 @@ export const correlationSweepJob: Job = {
                       extraction_status = 'pending',
                       extraction_error = NULL,
                       extraction_leased_at = NULL,
+                      -- And pre-stage the split proposal for that human.
+                      segmentation_status = COALESCE(segmentation_status, 'pending'),
                       updated_at = now()
                 WHERE c.id = $1
                   AND c.correlation_status = 'matched'
@@ -253,6 +259,7 @@ export const correlationSweepJob: Job = {
 
           if (demotedRows > 0) {
             held++;
+            enqueueSegmentation(conv.id);
             logEvent('warn', 'correlation.sweep', 'existing match demoted — may span more than one client', {
               conversation_id: conv.id,
               was_filed_under: conv.client_name,

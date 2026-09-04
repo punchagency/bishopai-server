@@ -32,7 +32,10 @@ pocketRouter.get('/status', async (_req, res) => {
     }>(
       `SELECT max(created_at)                                         AS last_recording_at,
               count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS last_24h,
-              count(*) FILTER (WHERE appointment_id IS NULL)          AS unmatched
+              count(*) FILTER (
+                WHERE appointment_id IS NULL
+                  AND coalesce(correlation_status, '') NOT IN ('split', 'discarded')
+              )                                                       AS unmatched
          FROM conversations
         WHERE source = 'pocket'`,
     );

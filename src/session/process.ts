@@ -61,11 +61,12 @@ export async function processConversation(conversationId: string): Promise<void>
       WHERE c.id = $1
         AND c.appointment_id IS NOT NULL
         AND c.transcript IS NOT NULL
-        -- Belt and braces. A held recording has no appointment_id, so the line
-        -- above already blocks it; this states the rule the reader needs anyway,
-        -- because "must never reach a chart" is the whole reason that state
-        -- exists and it should not depend on a NULL two lines up staying NULL.
-        AND c.correlation_status NOT IN ('needs_review', 'split')
+        -- Belt and braces. A held, split or discarded recording has no
+        -- appointment_id, so the line above already blocks it; this states the
+        -- rule the reader needs anyway, because "must never reach a chart" is
+        -- the whole reason those states exist and it should not depend on a NULL
+        -- two lines up staying NULL.
+        AND c.correlation_status NOT IN ('needs_review', 'split', 'discarded')
         AND c.extraction_status IN ('pending', 'failed')
       RETURNING c.appointment_id, c.client_id, c.transcript,
                 (SELECT name FROM clients WHERE id = c.client_id) AS client_name,

@@ -244,9 +244,11 @@ describe('recorrelateOverlappingConversations', () => {
     expect(normalised).toMatch(
       /NOT EXISTS \( SELECT 1 FROM conversations child WHERE child\.parent_conversation_id = conversations\.id \)/,
     );
-    // Status guard: a split parent has appointment_id NULL, so without this it
-    // slips through the `appointment_id IS NULL` branch and becomes matchable.
-    expect(normalised).toContain("correlation_status <> 'split'");
+    // Status guard: a split parent (and a discarded noise clip) has
+    // appointment_id NULL, so without this it slips through the `appointment_id
+    // IS NULL` branch — a parent becomes matchable, a noise clip gets
+    // re-examined on every sweep.
+    expect(normalised).toContain("correlation_status NOT IN ('split', 'discarded')");
   });
 
   it('queues extraction after a successful re-match', async () => {

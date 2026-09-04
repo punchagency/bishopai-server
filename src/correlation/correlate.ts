@@ -291,10 +291,11 @@ export async function recorrelateOverlappingConversations(
               SELECT 1 FROM conversations child
                WHERE child.parent_conversation_id = conversations.id
             )
-        -- 'split' is terminal. Without this line a parent slips through on the
-        -- appointment_id IS NULL branch below, which is exactly how one gets
-        -- matched to the client booked in the neighbouring slot.
-        AND correlation_status <> 'split'
+        -- 'split' and 'discarded' are terminal. Without this line one slips
+        -- through on the appointment_id IS NULL branch below — a split parent
+        -- gets matched to the client booked in the neighbouring slot, and a
+        -- discarded noise clip is re-examined on every sweep for no reason.
+        AND correlation_status NOT IN ('split', 'discarded')
         AND (appointment_id IS NULL OR correlation_status = 'unmatched')`,
     [startsAt, endsAt],
   );

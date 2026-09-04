@@ -188,6 +188,45 @@ suite('session assignment (integration, real Postgres)', () => {
     expect((await r.json()).error).toMatch(/cancelled/i);
   });
 
+  // A split parent and a discarded noise clip both carry appointment_id NULL,
+  // which is the only guard these write paths share. They are not reachable from
+  // the UI, but a direct API call must not resurrect them.
+  it('refuses to match, assign or split a discarded recording', async () => {
+    const conv = await makeConversation('[click]', at(23, 0), at(23, 1));
+    await pool.query(`UPDATE conversations SET correlation_status = 'discarded' WHERE id = $1`, [conv]);
+    const appt = await makeAppt(martaId, 'asgn-discard-appt', at(23, 0), at(23, 45));
+
+    const matched = await post(`/review/unmatched/${conv}/match`, { appointment_id: appt });
+    expect(matched.status).toBe(409);
+    expect((await matched.json()).error).toMatch(/discard/i);
+
+    const assigned = await post(`/review/unmatched/${conv}/assign-client`, { client_id: danaId });
+    expect(assigned.status).toBe(409);
+    expect((await assigned.json()).error).toMatch(/discard/i);
+
+    const splitRes = await post(`/review/unmatched/${conv}/split`, {
+      segments: [{ from_turn: 1, to_turn: 1 }],
+    });
+    expect(splitRes.status).toBe(409);
+
+    // Untouched: still discarded, still no appointment.
+    const after = await pool.query<{ correlation_status: string; appointment_id: string | null }>(
+      `SELECT correlation_status, appointment_id FROM conversations WHERE id = $1`,
+      [conv],
+    );
+    expect(after.rows[0]).toMatchObject({ correlation_status: 'discarded', appointment_id: null });
+  });
+
+  it('refuses to re-split a split parent', async () => {
+    const conv = await makeConversation('Nicole: one. Client: two. Nicole: three.', at(9, 0), at(10, 0));
+    await pool.query(`UPDATE conversations SET correlation_status = 'split' WHERE id = $1`, [conv]);
+    const r = await post(`/review/unmatched/${conv}/split`, {
+      segments: [{ from_turn: 1, to_turn: 2 }],
+    });
+    expect(r.status).toBe(409);
+    expect((await r.json()).error).toMatch(/split/i);
+  });
+
   it('assigns a walk-in to a client, creating the appointment from the recording', async () => {
     const convId = await makeConversation(
       'Nicole: no booking for this one, just a quick check.',

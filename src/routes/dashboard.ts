@@ -19,7 +19,7 @@ dashboardRouter.get('/overview', async (_req, res) => {
                             WHERE s.appointment_id = a.id AND s.status IN ('draft','in_review'))
                 OR EXISTS (SELECT 1 FROM protocols p
                             WHERE p.appointment_id = a.id AND p.status IN ('draft','in_review'))) AS awaiting_review,
-           (SELECT count(*) FROM conversations WHERE appointment_id IS NULL AND coalesce(correlation_status, '') <> 'split') AS unmatched,
+           (SELECT count(*) FROM conversations WHERE appointment_id IS NULL AND coalesce(correlation_status, '') NOT IN ('split', 'discarded')) AS unmatched,
            (SELECT count(*) FROM conversations
              WHERE appointment_id IS NOT NULL
                AND extraction_status IN ('pending','processing','failed'))                AS processing,

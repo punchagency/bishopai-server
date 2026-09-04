@@ -27,13 +27,44 @@ import {
   amendSession,
   appointmentForItem,
 } from '../session/sessionService';
-import { detectSessionBoundaries, parseTurns, sliceTranscriptByTurnRange } from '../session/segmenter';
+import { parseTurns, sliceTranscriptByTurnRange } from '../session/segmenter';
+import { computeSegmentation, type SegmentationResult } from '../session/segmentation';
 import { listUnprocessed } from '../session/unprocessed';
 
 // Nicole's review queue: the draft Appointment Sheets + Protocols produced by
 // session extraction, with edit + approve. (No auth yet — approved_by is a
 // placeholder until login lands; the approve action is audited via approvals.)
 export const reviewRouter = Router();
+
+/**
+ * The 409 body for a manual review action aimed at a recording that is past
+ * being acted on, or `null` when the status is still actionable.
+ *
+ * `split` and `discarded` both carry `appointment_id IS NULL`, which is the only
+ * guard the /match, /assign-client and /split handlers share — so without an
+ * explicit status check a split parent could be re-filed under a neighbouring
+ * booking, and a discarded noise clip could be pulled back into the pipeline, by
+ * a direct API call. Neither is reachable from the UI (the unmatched list and
+ * detail endpoint already exclude them), but the write guard should not depend
+ * on that.
+ */
+function terminalCorrelationConflict(
+  status: string,
+): { error: string; detail: string } | null {
+  if (status === 'split') {
+    return {
+      error: 'already split',
+      detail: 'This recording was split into separate sessions. Open those instead.',
+    };
+  }
+  if (status === 'discarded') {
+    return {
+      error: 'discarded',
+      detail: 'This recording was a short clip with no speech in it — there is nothing to attach.',
+    };
+  }
+  return null;
+}
 
 const statusEnum = z.enum(['draft', 'in_review', 'approved']);
 
@@ -203,13 +234,22 @@ reviewRouter.get('/unmatched', async (_req, res) => {
       // identical.
       `SELECT id, source_id, source, starts_at, ends_at, correlation_status,
               correlation_hold_reason,
-              left(coalesce(transcript, ''), 240) AS transcript_preview
+              left(coalesce(transcript, ''), 240) AS transcript_preview,
+              -- The split proposal's state, so a held row can say "2 sessions
+              -- detected — review the split" (done) or "working out the split…"
+              -- (pending/processing) instead of only the raw hold reason.
+              segmentation_status,
+              CASE WHEN segmentation_status = 'done'
+                THEN jsonb_array_length(coalesce(proposed_segments->'segments', '[]'::jsonb))
+                ELSE NULL END AS segment_count
          FROM conversations
         WHERE appointment_id IS NULL
-          -- A split parent also has no appointment_id, but it is finished, not
-          -- waiting — its segments are already filed. Without this it sits here
-          -- forever looking exactly like a recording that needs identifying.
-          AND correlation_status <> 'split'
+          -- Both are terminal states with no appointment_id, and neither is
+          -- waiting on Nicole. A 'split' parent's segments are already filed; a
+          -- 'discarded' recording is a short clip with no speech in it. Without
+          -- this exclusion each sits here forever, indistinguishable from a
+          -- recording that genuinely needs identifying.
+          AND correlation_status NOT IN ('split', 'discarded')
      ORDER BY starts_at DESC`,
     );
     res.json({ conversations: r.rows });
@@ -236,12 +276,14 @@ reviewRouter.get('/unmatched/:id', async (req, res) => {
       ends_at: string;
       correlation_status: string;
       correlation_hold_reason: string | null;
+      segmentation_status: string | null;
       extraction_status: string;
       appointment_id: string | null;
       transcript: string | null;
     }>(
       `SELECT id, source_id, source, starts_at, ends_at, correlation_status,
-              correlation_hold_reason, extraction_status, appointment_id, transcript
+              correlation_hold_reason, segmentation_status, extraction_status,
+              appointment_id, transcript
          FROM conversations
         WHERE id = $1`,
       [req.params.id],
@@ -255,6 +297,14 @@ reviewRouter.get('/unmatched/:id', async (req, res) => {
       return res.status(409).json({
         error: 'already split',
         detail: 'This recording was split into separate sessions. Open those instead.',
+      });
+    }
+    if (r.rows[0].correlation_status === 'discarded') {
+      return res.status(409).json({
+        error: 'discarded',
+        detail:
+          r.rows[0].correlation_hold_reason ??
+          'This recording was a short clip with no speech in it, so there is nothing to identify.',
       });
     }
     const { appointment_id: _drop, ...conv } = r.rows[0];
@@ -414,6 +464,14 @@ reviewRouter.post('/unmatched/:id/match', async (req, res) => {
     return res.status(400).json({ error: 'invalid payload' });
   }
   try {
+    const conv = await pool.query<{ correlation_status: string }>(
+      `SELECT correlation_status FROM conversations WHERE id = $1`,
+      [req.params.id],
+    );
+    if (conv.rowCount === 0) return res.status(404).json({ error: 'not found' });
+    const terminal = terminalCorrelationConflict(conv.rows[0].correlation_status);
+    if (terminal) return res.status(409).json(terminal);
+
     const appt = await pool.query<{ client_id: string | null; status: string }>(
       `SELECT client_id, status FROM appointments WHERE id = $1`,
       [parsed.data.appointment_id],
@@ -458,6 +516,10 @@ reviewRouter.post('/unmatched/:id/match', async (req, res) => {
       `UPDATE conversations
           SET appointment_id = $2, client_id = $3, correlation_status = 'matched'
         WHERE id = $1 AND appointment_id IS NULL
+          -- Races the pre-check above: a concurrent split could land between the
+          -- two, and a split parent has appointment_id NULL so the line above
+          -- would not stop it.
+          AND correlation_status NOT IN ('split', 'discarded')
     RETURNING id, transcript`,
       [req.params.id, parsed.data.appointment_id, appt.rows[0].client_id],
     );
@@ -511,14 +573,27 @@ reviewRouter.post('/unmatched/:id/assign-client', async (req, res) => {
   const db = await pool.connect();
   try {
     await db.query('BEGIN');
-    const conv = await db.query<{ starts_at: string; ends_at: string; transcript: string | null }>(
-      `SELECT starts_at, ends_at, transcript FROM conversations
+    const conv = await db.query<{
+      starts_at: string;
+      ends_at: string;
+      transcript: string | null;
+      correlation_status: string;
+    }>(
+      `SELECT starts_at, ends_at, transcript, correlation_status FROM conversations
         WHERE id = $1 AND appointment_id IS NULL FOR UPDATE`,
       [req.params.id],
     );
     if (conv.rowCount === 0) {
       await db.query('ROLLBACK');
       return res.status(409).json({ error: 'already matched or not found' });
+    }
+    // A split parent or a discarded noise clip also has appointment_id NULL, so
+    // the guard above lets it through. The row is locked FOR UPDATE, so this
+    // check is race-safe for the rest of the transaction.
+    const terminal = terminalCorrelationConflict(conv.rows[0].correlation_status);
+    if (terminal) {
+      await db.query('ROLLBACK');
+      return res.status(409).json(terminal);
     }
     const client = await db.query(`SELECT 1 FROM clients WHERE id = $1`, [parsed.data.client_id]);
     if (client.rowCount === 0) {
@@ -574,85 +649,74 @@ reviewRouter.post('/unmatched/:id/assign-client', async (req, res) => {
   }
 });
 
-// GET /review/unmatched/:id/segments — detect multi-session boundaries for a recording.
+// GET /review/unmatched/:id/segments — the proposed split for a recording.
+//
+// Served from `proposed_segments` when the background drain has already computed
+// it (the common case for a held recording — instant, no model call). Falls back
+// to computing live when the proposal is still in flight, failed, or `?refresh=1`
+// asks for a fresh pass; a live result is written back so the next open is fast.
 reviewRouter.get('/unmatched/:id/segments', async (req, res) => {
   if (!isUuid(req.params.id)) return res.status(404).json({ error: 'not found' });
+  const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
   try {
-    const conv = await pool.query<{ starts_at: string; ends_at: string; transcript: string | null }>(
-      `SELECT starts_at, ends_at, transcript FROM conversations WHERE id = $1`,
+    const conv = await pool.query<{
+      starts_at: string;
+      ends_at: string;
+      transcript: string | null;
+      correlation_status: string;
+      segmentation_status: string | null;
+      proposed_segments: SegmentationResult | null;
+    }>(
+      `SELECT starts_at, ends_at, transcript, correlation_status,
+              segmentation_status, proposed_segments
+         FROM conversations WHERE id = $1`,
       [req.params.id],
     );
     if (conv.rowCount === 0) return res.status(404).json({ error: 'not found' });
-    const { starts_at: cs, ends_at: ce, transcript } = conv.rows[0];
-    const transcriptText = transcript ?? '';
+    const row = conv.rows[0];
 
-    const candRes = await pool.query<{
-      id: string;
-      starts_at: string;
-      ends_at: string;
-      client_id: string | null;
-      client_name: string | null;
-    }>(
-      `SELECT a.id, a.starts_at, a.ends_at, a.client_id, c.name AS client_name
-         FROM appointments a
-    LEFT JOIN clients c ON c.id = a.client_id
-        WHERE a.status <> 'cancelled'
-          AND NOT EXISTS (SELECT 1 FROM conversations cv WHERE cv.appointment_id = a.id)
-          AND a.starts_at <= ($2::timestamptz + INTERVAL '2 hours')
-          AND a.ends_at >= ($1::timestamptz - INTERVAL '2 hours')
-     ORDER BY abs(extract(epoch FROM (a.starts_at - $1::timestamptz)))
-        LIMIT 12`,
-      [cs, ce],
-    );
+    if (!refresh && row.segmentation_status === 'done' && row.proposed_segments) {
+      const p = row.proposed_segments;
+      return res.json({
+        conversation_id: req.params.id,
+        segments: p.segments,
+        candidates: p.candidates,
+        turns: p.turns,
+        computed_at: p.computed_at,
+        source: 'cached',
+      });
+    }
 
-    const candidates = candRes.rows.map((a) => {
-      const name = scoreNameMatch(transcriptText, a.client_name);
-      return {
-        id: a.id,
-        starts_at: a.starts_at,
-        ends_at: a.ends_at,
-        client_id: a.client_id,
-        client_name: a.client_name,
-        name_mentions: name.mentions,
-        name_matched_on: name.matchedOn,
-        overlap_seconds: overlapSeconds(cs, ce, a.starts_at, a.ends_at),
-      };
+    const result = await computeSegmentation({
+      id: req.params.id,
+      starts_at: row.starts_at,
+      ends_at: row.ends_at,
+      transcript: row.transcript,
     });
+    // Cache the fresh result on a held recording so a reopen is instant. Scoped
+    // to 'needs_review': a matched or manually-assigned conversation has no
+    // splitter to feed, and a GET should not be leaving `proposed_segments`
+    // behind on rows nothing reads it from.
+    await pool
+      .query(
+        `UPDATE conversations
+            SET proposed_segments = $2::jsonb,
+                segmentation_status = 'done',
+                segmentation_error = NULL,
+                updated_at = now()
+          WHERE id = $1 AND correlation_status = 'needs_review'`,
+        [req.params.id, JSON.stringify(result)],
+      )
+      .catch(() => {});
 
-    const candidateNames = candidates
-      .map((c) => c.client_name)
-      .filter((n): n is string => !!n);
-
-    const calendarAppointments = candidates.map((c) => ({
-      id: c.id,
-      starts_at: c.starts_at,
-      ends_at: c.ends_at,
-      client_name: c.client_name,
-      overlap_seconds: c.overlap_seconds,
-    }));
-    const recStartMs = new Date(cs).getTime();
-    const recEndMs = new Date(ce).getTime();
-
-    const segments = await detectSessionBoundaries(
-      transcriptText,
-      candidateNames,
-      calendarAppointments,
-      recStartMs,
-      recEndMs,
-    );
-    // The turns go back with the segments deliberately. The renderer used to
-    // parse the transcript itself to draw the boundary markers, which made a
-    // third turn-numbering scheme — its `turn.index` and the segmenter's
-    // `from_turn` were compared directly and only coincided by luck. Shipping
-    // the list the boundaries were computed from is what makes that comparison
-    // mean something.
-    const turns = parseTurns(transcriptText).map((t) => ({
-      index: t.index,
-      speaker: t.speaker,
-      role: t.role ?? 'UNKNOWN',
-      text: t.text,
-    }));
-    return res.json({ conversation_id: req.params.id, segments, candidates, turns });
+    return res.json({
+      conversation_id: req.params.id,
+      segments: result.segments,
+      candidates: result.candidates,
+      turns: result.turns,
+      computed_at: result.computed_at,
+      source: refresh ? 'refreshed' : 'live',
+    });
   } catch (err) {
     logError('review.segments', 'failed to detect session segments', err, { id: req.params.id });
     return res.status(500).json({ error: 'internal error' });
@@ -684,13 +748,19 @@ async function handleSplitConversation(req: any, res: any) {
       transcript: string | null;
       source: string;
       appointment_id: string | null;
+      correlation_status: string;
     }>(
-      `SELECT source_id, starts_at, ends_at, transcript, source, appointment_id FROM conversations WHERE id = $1`,
+      `SELECT source_id, starts_at, ends_at, transcript, source, appointment_id, correlation_status
+         FROM conversations WHERE id = $1`,
       [req.params.id],
     );
     if (parent.rowCount === 0) return res.status(404).json({ error: 'parent conversation not found' });
     const orig = parent.rows[0];
     if (!orig.transcript) return res.status(400).json({ error: 'conversation has no transcript' });
+    // 'split' here would re-split a parent whose children already exist;
+    // 'discarded' would carve segments out of a clip with no speech in it.
+    const terminal = terminalCorrelationConflict(orig.correlation_status);
+    if (terminal) return res.status(409).json(terminal);
 
     // If parent was matched, unmatch it first and clear any unapproved draft notes for that appointment
     if (orig.appointment_id) {

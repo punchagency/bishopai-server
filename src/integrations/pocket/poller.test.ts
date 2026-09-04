@@ -21,6 +21,7 @@ function deps(over: Partial<PollDeps> = {}): PollDeps {
       correlation: { status: 'unmatched' as const, reason: 'no_candidates' as const, candidateCount: 0 },
     })),
     enqueue: vi.fn(),
+    enqueueSegmentation: vi.fn(),
     ...over,
   };
 }

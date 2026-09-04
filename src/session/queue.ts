@@ -67,7 +67,7 @@ export async function queueOrder(): Promise<string[]> {
     `SELECT id FROM conversations
       WHERE appointment_id IS NOT NULL
         AND transcript IS NOT NULL
-        AND correlation_status NOT IN ('needs_review', 'split')
+        AND correlation_status NOT IN ('needs_review', 'split', 'discarded')
         AND extraction_status IN ('pending', 'failed')
         AND extraction_attempts < $1
         AND (extraction_next_attempt_at IS NULL OR extraction_next_attempt_at <= now())
