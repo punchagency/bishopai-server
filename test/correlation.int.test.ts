@@ -1,6 +1,8 @@
 import { describe, it, expect, afterAll } from 'vitest';
+import type { PoolClient } from 'pg';
 import { pool } from '../src/db/pool';
 import { ingestConversation } from '../src/conversations/ingest';
+import { recorrelateOverlappingConversations } from '../src/correlation/correlate';
 
 // Integration: exercises the real Postgres tstzrange overlap and the
 // idempotent upsert. Skips (not fails) when the dev DB isn't reachable so the
@@ -234,5 +236,49 @@ suite('correlation (integration, real Postgres)', () => {
     );
     expect(rows.rows[0].n).toBe(1);
     expect(await status('it-b-late-tx')).toMatchObject({ correlation_status: 'discarded' });
+  });
+
+  // The 2026-09-03/04 incident, reproduced end to end against real Postgres.
+  // correlationSweepJob's safety-gate audit demotes a matched recording to
+  // 'needs_review' — appointment_id nulled, exactly the shape a fresh
+  // never-matched row has. recorrelateOverlappingConversations (called every
+  // 5 minutes from pbSync) used to re-match anything with a NULL
+  // appointment_id with no risk check of its own, undoing the demotion within
+  // minutes. The sweep then demoted it again on its next tick — 80+ cycles
+  // over 19+ hours on two real recordings, an extraction result dropped
+  // mid-flight, a draft deleted and rebuilt every cycle, never reaching a
+  // human. See correlate.ts's recorrelateOverlappingConversations.
+  it('never re-matches a recording the safety gate is holding for review', async () => {
+    const clientId = await seedAppointment(
+      'it-a-held',
+      'it-c-held',
+      '2027-02-01T15:00:00Z',
+      '2027-02-01T16:00:00Z',
+    );
+    // Held exactly as correlationSweepJob's audit demotion leaves a row:
+    // appointment_id nulled, status 'needs_review', the original match's
+    // window still recorded on the conversation itself.
+    const conv = await pool.query<{ id: string }>(
+      `INSERT INTO conversations
+              (source_id, source, starts_at, ends_at, transcript,
+               correlation_status, correlation_hold_reason)
+            VALUES ('it-b-held', 'pocket', '2027-02-01T15:05:00Z', '2027-02-01T15:50:00Z',
+                    'held pending review', 'needs_review', 'held for test')
+         RETURNING id`,
+    );
+    const convId = conv.rows[0].id;
+
+    await recorrelateOverlappingConversations(
+      pool as unknown as PoolClient,
+      '2027-02-01T15:00:00Z',
+      '2027-02-01T16:00:00Z',
+    );
+
+    const after = await pool.query<{ correlation_status: string; appointment_id: string | null }>(
+      `SELECT correlation_status, appointment_id FROM conversations WHERE id = $1`,
+      [convId],
+    );
+    expect(after.rows[0]).toMatchObject({ correlation_status: 'needs_review', appointment_id: null });
+    void clientId;
   });
 });

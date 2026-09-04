@@ -244,11 +244,40 @@ describe('recorrelateOverlappingConversations', () => {
     expect(normalised).toMatch(
       /NOT EXISTS \( SELECT 1 FROM conversations child WHERE child\.parent_conversation_id = conversations\.id \)/,
     );
-    // Status guard: a split parent (and a discarded noise clip) has
-    // appointment_id NULL, so without this it slips through the `appointment_id
-    // IS NULL` branch — a parent becomes matchable, a noise clip gets
-    // re-examined on every sweep.
-    expect(normalised).toContain("correlation_status NOT IN ('split', 'discarded')");
+    // Status guard: a split parent (a discarded noise clip, a held recording)
+    // all have appointment_id NULL, so without this each slips through the
+    // `appointment_id IS NULL` branch — a parent becomes matchable, a noise
+    // clip gets re-examined on every sweep, and a held recording gets
+    // blindly re-matched by a function that runs no risk check at all.
+    expect(normalised).toContain("correlation_status NOT IN ('split', 'discarded', 'needs_review')");
+  });
+
+  it('never re-matches a recording the safety gate just held for review', async () => {
+    // The 2026-09-03/04 incident: correlationSweepJob's audit demotes a
+    // 'matched' row to 'needs_review' (appointment_id nulled) the instant it
+    // sees a multi-speaker risk signal. That demotion looks EXACTLY like a
+    // fresh unmatched row to the `appointment_id IS NULL` branch below — and
+    // this function runs no risk check of its own, so it re-matched it right
+    // back within minutes. The sweep then re-demoted it on its next tick, and
+    // the two fought every ~15 minutes for over 19 hours (bb6dc0f4, 00a044a7):
+    // ~80 cycles each, an extraction result dropped mid-flight, a draft
+    // deleted and rebuilt every cycle without ever reaching a human.
+    //
+    // Asserted against the SQL, like the split-parent case above: a fake
+    // client returns whatever rows it is given regardless of the WHERE clause,
+    // so the guard has to be in the query text itself.
+    let selectSql = '';
+    const db = {
+      query: vi.fn().mockImplementation(async (sql: string) => {
+        if (!selectSql) selectSql = sql;
+        return { rows: [], rowCount: 0 };
+      }),
+    } as unknown as PoolClient;
+
+    await recorrelateOverlappingConversations(db, START, END);
+
+    const normalised = selectSql.replace(/\s+/g, ' ');
+    expect(normalised).toContain("correlation_status NOT IN ('split', 'discarded', 'needs_review')");
   });
 
   it('queues extraction after a successful re-match', async () => {

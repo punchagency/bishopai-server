@@ -291,11 +291,21 @@ export async function recorrelateOverlappingConversations(
               SELECT 1 FROM conversations child
                WHERE child.parent_conversation_id = conversations.id
             )
-        -- 'split' and 'discarded' are terminal. Without this line one slips
-        -- through on the appointment_id IS NULL branch below — a split parent
-        -- gets matched to the client booked in the neighbouring slot, and a
-        -- discarded noise clip is re-examined on every sweep for no reason.
-        AND correlation_status NOT IN ('split', 'discarded')
+        -- 'split', 'discarded' and 'needs_review' are all terminal-or-held.
+        -- Without this line one slips through on the appointment_id IS NULL
+        -- branch below: a split parent gets matched to the client booked in
+        -- the neighbouring slot, a discarded noise clip is re-examined on every
+        -- sweep for no reason, and — the one that actually bit — a recording
+        -- the safety gate just demoted (appointment_id nulled, exactly like a
+        -- fresh unmatched row) gets blindly re-matched by THIS function, which
+        -- runs no risk check at all. correlationSweepJob's audit pass then
+        -- finds it 'matched' again next tick, demotes it again, and the two
+        -- fought every 15 minutes for 19+ hours on bb6dc0f4 and 00a044a7
+        -- (2026-09-03/04): ~80 cycles each, one extraction result dropped
+        -- mid-flight, a draft note deleted and rebuilt on every cycle instead
+        -- of ever reaching Nicole. 'needs_review' means "a human decides who
+        -- this belongs to" — this function deciding for her is the bug.
+        AND correlation_status NOT IN ('split', 'discarded', 'needs_review')
         AND (appointment_id IS NULL OR correlation_status = 'unmatched')`,
     [startsAt, endsAt],
   );
@@ -313,6 +323,10 @@ export async function recorrelateOverlappingConversations(
               correlation_overlap_seconds = $4,
               updated_at = now()
         WHERE id = $1
+          -- Belt and braces with the SELECT above: this only ever sees rows the
+          -- SELECT already filtered, but the guard should say the true rule on
+          -- its own rather than trust an upstream filter silently.
+          AND correlation_status NOT IN ('split', 'discarded', 'needs_review')
           AND (appointment_id IS NULL OR correlation_status = 'unmatched')
         RETURNING id`,
       [conv.id, res.appointmentId, res.clientId, res.overlapSeconds],
