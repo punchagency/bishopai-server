@@ -1,0 +1,98 @@
+# Render blueprint for the Innerlume backend.
+#
+# Replaces the Railway deploy (dead 2026-09-04). Apply from the Render
+# dashboard: New → Blueprint → point at this repo. Render prompts for every
+# `sync: false` secret ON FIRST CREATION ONLY — it ignores them on later
+# blueprint updates, so fill them all in at that prompt or set them by hand
+# in the service's Environment tab afterwards.
+#
+# After the first deploy, see DEPLOY.md for the post-deploy checklist:
+# restoring the database, re-registering webhooks, and repointing the desktop
+# app at the new host.
+
+databases:
+  - name: innerlume-db
+    databaseName: bishopai
+    user: bishop
+    plan: basic-256mb
+    postgresMajorVersion: "16"
+    region: oregon
+
+services:
+  - type: web
+    name: innerlume-api
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: pocket-integration
+    buildCommand: npm ci && npm run build
+    # Applies migrations/*.sql in order, idempotently, before the new instance
+    # takes traffic — the same contract as the Procfile's `release:` phase.
+    preDeployCommand: npm run migrate:prod
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      # ── Platform ──────────────────────────────────────────────────────────
+      - key: DATABASE_URL
+        fromDatabase:
+          name: innerlume-db
+          property: connectionString
+      - key: NODE_VERSION
+        value: "20"
+      - key: NODE_ENV
+        value: production
+      # src/db/pool.ts turns SSL on for any non-localhost DATABASE_URL. Render's
+      # private-network host (dpg-…) is non-local, so this needs no help — but
+      # if the private connection ever rejects TLS, set DATABASE_SSL=false here.
+
+      # ── Self-reference: must match the service's real URL ─────────────────
+      # Render appends a suffix if `innerlume-api` is already taken globally.
+      # Check the actual URL after the first deploy and correct these two if so.
+      - key: PUBLIC_BASE_URL
+        value: https://innerlume-api.onrender.com
+      # OUTLOOK_REDIRECT_URI is deliberately unset: outlook/config.ts derives it
+      # as `${PUBLIC_BASE_URL}/auth/outlook/callback`, so it stays correct on its
+      # own. That exact URL must be registered in the Entra app registration.
+      # QB_REDIRECT_URI is not read by the server — it belongs to scripts/qb-auth.mjs.
+
+      # ── Behaviour ─────────────────────────────────────────────────────────
+      # WF3/WF4 crons + the 7am prep digest run in-process via node-cron. They
+      # only fire while the instance is awake, which is why this service is on
+      # `starter` rather than `free` — free spins down after ~15min idle.
+      - key: SCHEDULER_ENABLED
+        value: "true"
+      - key: LLM_PROVIDER
+        value: openrouter
+      - key: QB_ENV
+        value: production
+      - key: FLOW_SHEET_AS_XLSX
+        value: "true"
+      - key: PG_POOL_MAX
+        value: "10"
+
+      # ── Secrets: Render prompts for these on blueprint creation ────────────
+      - { key: OPENROUTER_API_KEY,   sync: false }
+      - { key: ANTHROPIC_API_KEY,    sync: false }
+      - { key: GROQ_API_KEY,         sync: false }
+      - { key: POCKET_API_KEY,       sync: false }
+      - { key: POCKET_WEBHOOK_SECRET, sync: false }   # regenerate; old one died with Railway
+      - { key: PB_CLIENT_ID,         sync: false }
+      - { key: PB_CLIENT_SECRET,     sync: false }
+      - { key: PB_SIGNING_SECRET,    sync: false }
+      - { key: PB_WEBHOOK_SECRET,    sync: false }    # regenerate; old one died with Railway
+      - { key: GOOGLE_CLIENT_ID,     sync: false }
+      - { key: GOOGLE_CLIENT_SECRET, sync: false }
+      - { key: GOOGLE_REFRESH_TOKEN, sync: false }
+      - { key: GOOGLE_API_KEY,       sync: false }
+      - { key: GDRIVE_ROOT_FOLDER_ID, sync: false }   # read off Drive; was not in local .env
+      - { key: MS_CLIENT_ID,         sync: false }
+      - { key: MS_CLIENT_SECRET,     sync: false }
+      - { key: MS_TENANT_ID,         sync: false }
+      - { key: QB_CLIENT_ID,         sync: false }
+      - { key: QB_CLIENT_SECRET,     sync: false }
+      - { key: QB_REALM_ID,          sync: false }
+      - { key: QB_REFRESH_TOKEN,     sync: false }
+      - { key: FULLSCRIPT_DISPENSARY_URL, sync: false }
+      - { key: BOOKING_LINK_SECRET,  generateValue: true }
+      - { key: ALLOWED_ORIGINS,      sync: false }
