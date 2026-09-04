@@ -14,13 +14,13 @@ databases:
   - name: innerlume-db
     databaseName: bishopai
     user: bishop
-    plan: basic-256mb
+    plan: 0.1c-256mb  # Render's cheapest paid tier; `free` is DELETED after 30 days
     postgresMajorVersion: "16"
     region: oregon
 
 services:
   - type: web
-    name: innerlume-api
+    name: bishopai-server
     runtime: node
     plan: starter
     region: oregon
@@ -47,10 +47,11 @@ services:
       # if the private connection ever rejects TLS, set DATABASE_SSL=false here.
 
       # ── Self-reference: must match the service's real URL ─────────────────
-      # Render appends a suffix if `innerlume-api` is already taken globally.
-      # Check the actual URL after the first deploy and correct these two if so.
+      # Matches the service created on 2026-09-04. If the service is ever
+      # recreated under a different name, this must follow it — the Outlook
+      # redirect URI is derived from it.
       - key: PUBLIC_BASE_URL
-        value: https://innerlume-api.onrender.com
+        value: https://bishopai-server.onrender.com
       # OUTLOOK_REDIRECT_URI is deliberately unset: outlook/config.ts derives it
       # as `${PUBLIC_BASE_URL}/auth/outlook/callback`, so it stays correct on its
       # own. That exact URL must be registered in the Entra app registration.
